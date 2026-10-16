@@ -1,5 +1,8 @@
-# 构建与运行产生的中间产物
+# 构建产物（体积大，按需重新生成，不进版本库）
+# 手表安装包：scripts/build.ps1
 dist/*.apk
+# 中继独立程序：scripts/pack-relay.ps1（含 Node 运行时，单文件近 90MB）
+dist/DSH中继/
 build/
 *.class
 *.dex
