@@ -123,15 +123,23 @@ public class MainActivity extends Activity {
             lastInteractionAt = System.currentTimeMillis();
         }
         // 操作菜单已打开时不做手势判定，避免与面板内的点击冲突。
-        if (!menuOpen && gesture != null && gesture.onTouch(currentPage, event)) {
-            // 横向手势已消费本次事件：补一个取消事件给子视图，避免它们停在按下态。
-            MotionEvent cancel = MotionEvent.obtain(event);
-            cancel.setAction(MotionEvent.ACTION_CANCEL);
-            super.dispatchTouchEvent(cancel);
-            cancel.recycle();
-            return true;
+        if (!menuOpen && gesture != null && currentPage != null) {
+            boolean consumed = gesture.onTouch(currentPage, event);
+            if (consumed) {
+                // 横向手势已消费本次事件：补一个取消事件给子视图，避免它们停在按下态。
+                MotionEvent cancel = MotionEvent.obtain(event);
+                cancel.setAction(MotionEvent.ACTION_CANCEL);
+                super.dispatchTouchEvent(cancel);
+                cancel.recycle();
+                return true;
+            }
         }
         return super.dispatchTouchEvent(event);
+    }
+
+    /** 诊断用：把手势判定过程写入 logcat（tag=dshwatch）。 */
+    private void debugLog(String message) {
+        android.util.Log.d("dshwatch", message);
     }
 
     /** 手势识别器（与设备密度相关，延迟初始化）。 */
@@ -160,7 +168,13 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 读取 host/port/code 形式的启动参数并预填。 */
+    /**
+     * 读取启动参数并预填设置页。
+     *
+     * 支持 `--es host <地址>`（可含端口或 https://）、`--ei port <端口>`、
+     * `--es code <配对码>`，便于从电脑上用一条 adb 命令把配对信息送到手表，
+     * 省去在小键盘上输入。
+     */
     private void applyIntentExtras(Intent intent) {
         if (intent == null) return;
         String host = intent.getStringExtra("host");
@@ -168,14 +182,23 @@ public class MainActivity extends Activity {
         int port = intent.getIntExtra("port", 0);
         if (host != null && !host.trim().isEmpty()) {
             pendingHost = host.trim();
+            // 只给了主机名而另给了端口时，合成 host:port 再交给统一解析。
+            if (port > 0 && port <= 65535 && pendingHost.indexOf(':') < 0 && !pendingHost.contains("://")) {
+                pendingHost = pendingHost + ":" + port;
+            }
             pendingCode = code == null ? "" : code.trim();
-            if (port > 0 && port <= 65535) pendingPort = port;
         }
     }
 
     private String pendingHost = "";
     private String pendingCode = "";
-    private int pendingPort = 0;
+
+    /** 读 JSON 字符串字段，缺失或为 null 时给空串。 */
+    private static String textOf(JSONObject object, String key) {
+        if (object == null) return "";
+        String value = object.optString(key, "");
+        return value == null ? "" : value;
+    }
 
     @Override
     protected void onDestroy() {
@@ -242,16 +265,41 @@ public class MainActivity extends Activity {
         return 0;
     }
 
-    // ---------------------------------------------------------------- 连接页
+    // ---------------------------------------------------------- 设置 / 连接页
 
+    /** 默认的局域网中继端口。 */
+    private static final int DEFAULT_RELAY_PORT = 19390;
+
+    /** 当前配置对应的请求根地址（形如 http://192.168.1.121:19390 或 https://host）。 */
+    private String baseUrl() {
+        Store.Endpoint endpoint = Store.parse(store.base(), DEFAULT_RELAY_PORT);
+        if (endpoint == null) return "";
+        // url("") 会拼出以 / 结尾的根地址，供 Api 直接拼接路径。
+        return endpoint.url("/").replaceAll("/$", "");
+    }
+
+    /**
+     * 设置页：配置要连接的设备（局域网或公网）。
+     *
+     * 从会话页左滑菜单的「设置」进入，未配对时也作为首次连接页使用。
+     */
     private void showConnect() {
         onSessionPage = false;
         WatchUi.Page page = ui.page();
-        ui.heading(page, "连接电脑", "在同一局域网内运行中继");
+        ui.heading(page, "设置", store.paired() ? "当前已连接" : "填写电脑地址与配对码");
+
+        if (store.paired()) {
+            LinearLayout current = ui.card();
+            current.addView(ui.text("当前连接", 11, WatchUi.ACCENT));
+            TextView address = ui.text(store.base(), 12, WatchUi.FG);
+            address.setPadding(0, ui.dp(5), 0, 0);
+            current.addView(address);
+            ui.add(page, current, 0, 10);
+        }
 
         final EditText hostField = new EditText(this);
-        hostField.setHint("电脑地址，如 192.168.1.121");
-        hostField.setText(pendingHost.isEmpty() ? store.host() : pendingHost);
+        hostField.setHint("地址，如 192.168.1.121 或 https://xxx.com");
+        hostField.setText(pendingHost.isEmpty() ? store.base() : pendingHost);
         hostField.setTextSize(13);
         hostField.setTextColor(WatchUi.FG);
         hostField.setHintTextColor(WatchUi.MUTED);
@@ -276,29 +324,30 @@ public class MainActivity extends Activity {
         status.setPadding(ui.dp(4), ui.dp(4), ui.dp(4), ui.dp(4));
         ui.add(page, status, 0, 8);
 
-        ui.add(page, ui.button("自动查找", false, () -> {
+        ui.add(page, ui.button("自动查找局域网", false, () -> {
             status.setTextColor(WatchUi.MUTED);
             status.setText("正在查找…请保持电脑上的中继运行");
             discovery.listen(found -> {
                 if (destroyed) return;
                 if (found.isEmpty()) {
                     status.setTextColor(WatchUi.WARN);
-                    status.setText("没找到，请确认手表和电脑连的是同一个 WiFi，或手动填写地址");
+                    status.setText("没找到，请确认手表和电脑连的是同一个 WiFi，或手填地址");
                     return;
                 }
                 Discovery.Found first = found.get(0);
-                hostField.setText(first.host);
+                // 广播里带端口，直接写成 host:port 存进统一地址字段。
+                hostField.setText(first.host + ":" + first.port);
                 status.setTextColor(WatchUi.OK);
                 status.setText("找到中继：" + first.host + "（如不对可手动修改）");
             });
         }), 0, 8);
 
         ui.add(page, ui.button("配对并连接", true, () -> {
-            String host = hostField.getText().toString().trim();
+            String address = hostField.getText().toString().trim();
             String code = codeField.getText().toString().trim();
-            if (host.isEmpty()) {
+            if (address.isEmpty()) {
                 status.setTextColor(WatchUi.WARN);
-                status.setText("请先填写电脑地址");
+                status.setText("请先填写地址");
                 return;
             }
             if (code.isEmpty()) {
@@ -306,38 +355,51 @@ public class MainActivity extends Activity {
                 status.setText("请填写电脑上显示的 6 位配对码");
                 return;
             }
+            Store.Endpoint endpoint = Store.parse(address, DEFAULT_RELAY_PORT);
+            if (endpoint == null) {
+                status.setTextColor(WatchUi.DANGER);
+                status.setText("地址格式不对，示例：192.168.1.121 或 https://abc.com");
+                return;
+            }
             status.setTextColor(WatchUi.MUTED);
             status.setText("正在配对…");
-            int port = pendingPort > 0 ? pendingPort : store.port();
-            tryPair(host, port, code, status);
+            tryPair(endpoint, code, status);
         }), 0, 8);
 
-        ui.add(page, ui.text("配对码由电脑端中继在启动时显示，每次配对成功后会更换。", 11, WatchUi.MUTED), 0, 0);
+        if (store.paired()) {
+            ui.add(page, ui.button("断开连接", false, this::disconnect), 0, 8);
+            ui.add(page, ui.button("返回会话", false, () -> {
+                if (currentSessionId.isEmpty()) showSessionList();
+                else showSession(currentSessionId);
+            }), 0, 0);
+        }
+        ui.add(page, ui.text("地址可填局域网 IP，也可填公网中转地址（https://…）。配对码由电脑端中继启动时显示，每次配对后会更换。", 11, WatchUi.MUTED), 0, 0);
         render(page);
         hostField.requestFocus();
     }
 
-    private void tryPair(String host, int port, String code, TextView status) {
+    /** 用给定地址与配对码完成配对。 */
+    private void tryPair(Store.Endpoint endpoint, String code, TextView status) {
         JSONObject body = new JSONObject();
         try {
             body.put("code", code);
         } catch (Exception ignored) {
             // 仅数字内容，不会失败
         }
-        api.post(host, port, "/api/pair", "", body, result -> {
+        String root = endpoint.url("/").replaceAll("/$", "");
+        api.post(root, "/api/pair", "", body, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 status.setTextColor(WatchUi.DANGER);
                 status.setText(result.error);
                 return;
             }
-            String token = result.value.optString("token", "");
-            if (token.isEmpty()) {
+            String token = textOf(result.value, "token");            if (token.isEmpty()) {
                 status.setTextColor(WatchUi.DANGER);
                 status.setText("配对响应缺少令牌");
                 return;
             }
-            store.setServer(host, port);
+            store.setBase(endpoint.display());
             store.setToken(token);
             status.setTextColor(WatchUi.OK);
             status.setText("配对成功，正在载入会话…");
@@ -507,7 +569,7 @@ public class MainActivity extends Activity {
         // 只有首次加载才显示「正在刷新…」；定时刷新时不要改副标题，
         // 否则文案在「正在刷新…」与正常描述之间来回跳，屏幕看起来就在抽动。
         if (!silent) loadingSession = true;
-        api.get(store.host(), store.port(), "/api/sessions", store.token(), result -> {
+        api.get(baseUrl(), "/api/sessions", store.token(), result -> {
             loadingSession = false;
             if (destroyed || onSessionPage) return;
             if (!result.ok) {
@@ -560,7 +622,7 @@ public class MainActivity extends Activity {
         WatchUi.Page page = ui.page();
         ui.heading(page, "连不上电脑", "");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
-        ui.add(page, ui.text("电脑地址：" + store.host() + ":" + store.port(), 11, WatchUi.MUTED), 0, 12);
+        ui.add(page, ui.text("地址：" + store.base(), 11, WatchUi.MUTED), 0, 12);
         ui.add(page, ui.button("重试", true, this::showSessionList), 0, 8);
         ui.add(page, ui.button("重新配对", false, () -> {
             store.clearToken();
@@ -575,7 +637,7 @@ public class MainActivity extends Activity {
         ui.heading(page, "新建会话", "");
         ui.add(page, ui.text("正在创建…", 13, WatchUi.MUTED), 0, 0);
         render(page);
-        api.post(store.host(), store.port(), "/api/create", store.token(), new JSONObject(), result -> {
+        api.post(baseUrl(), "/api/create", store.token(), new JSONObject(), result -> {
             if (destroyed) return;
             if (!result.ok) {
                 WatchUi.Page failed = ui.page();
@@ -608,7 +670,7 @@ public class MainActivity extends Activity {
     private void showSession(String sessionId) {
         currentSessionId = sessionId;
         currentSessionTitle = titleOf(sessionId);
-        store.setLastSession(sessionId);
+        store.setLastSession(sessionId, currentSessionTitle);
         onSessionPage = true;
         editing = false;
         messages.clear();
@@ -631,7 +693,7 @@ public class MainActivity extends Activity {
 
     private void loadSession(String sessionId, boolean silent) {
         if (!store.paired() || sessionId.isEmpty()) return;
-        api.get(store.host(), store.port(), "/api/session?id=" + Api.urlEncode(sessionId), store.token(), result -> {
+        api.get(baseUrl(), "/api/session?id=" + Api.urlEncode(sessionId), store.token(), result -> {
             if (destroyed || !onSessionPage || !sessionId.equals(currentSessionId)) return;
             // 请求在途时用户可能已经进入输入页；此时绝不能重建整屏。
             if (editing) return;
@@ -838,6 +900,7 @@ public class MainActivity extends Activity {
             scrollToBottomAfterRender();
             renderSession("");
         }));
+        items.add(new MenuItem("设置", "连接地址与配对", this::showConnect));
         items.add(new MenuItem("返回项目", "回到会话列表", this::backToList));
         return items;
     }
@@ -861,6 +924,7 @@ public class MainActivity extends Activity {
         items.add(new MenuItem("刷新", "重新拉取列表", () -> {
             showSessionList();
         }));
+        items.add(new MenuItem("设置", "连接地址与配对", this::showConnect));
         items.add(new MenuItem("断开连接", "清除配对，重新配一次", this::disconnect));
         return items;
     }
@@ -868,8 +932,10 @@ public class MainActivity extends Activity {
     /**
      * 操作菜单。
      *
-     * 从左侧滑入：整块面板做位移 + 淡入，遮罩同步淡入。手表性能有限，
-     * 用 ViewPropertyAnimator 做短时（180ms）过渡即可，不做复杂转场。
+     * 手势方向与面板位置必须一致：手指向左滑，是从右侧把面板拉出来（面板贴右边、从右滑入）。
+     * 早期版本把面板放在左侧，手感上是「往左滑却从左边冒出来」，与直觉相反。
+     *
+     * 入场为短时过渡（面板位移 + 遮罩淡入，共约 180ms），手表性能有限，不做复杂转场。
      */
     private void showActionMenu(List<MenuItem> items) {
         if (isFinishing() || destroyed || menuOpen) return;
@@ -904,10 +970,10 @@ public class MainActivity extends Activity {
         scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
         panel.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
 
-        // 面板占屏幕左侧约 78%，留出一点背景提示可以点外面关闭。
-        int panelWidth = Math.round(getResources().getDisplayMetrics().widthPixels * 0.78f);
-        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(panelWidth, -1, Gravity.START);
-        panelParams.setMargins(ui.dp(6), ui.dp(6), 0, ui.dp(6));
+        // 面板占屏幕右侧约 82%，贴右边缘；左侧留出的窄条可点击关闭。
+        int panelWidth = Math.round(getResources().getDisplayMetrics().widthPixels * 0.82f);
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(panelWidth, -1, Gravity.END);
+        panelParams.setMargins(0, ui.dp(6), ui.dp(6), ui.dp(6));
         overlay.addView(panel, panelParams);
         overlay.setOnClickListener(v -> dismissMenu(overlay, panel));
 
@@ -917,21 +983,21 @@ public class MainActivity extends Activity {
                     new android.view.ViewGroup.LayoutParams(-1, -1));
         }
 
-        // 入场：面板从左外侧滑入，遮罩淡入。
-        panel.setTranslationX(-panelWidth);
+        // 入场：面板从右外侧滑入，遮罩淡入。
+        panel.setTranslationX(panelWidth);
         panel.setAlpha(0.6f);
         overlay.setAlpha(0f);
         overlay.animate().alpha(1f).setDuration(140).start();
         panel.animate().translationX(0f).alpha(1f).setDuration(180).start();
     }
 
-    /** 关闭菜单：面板滑出、遮罩淡出，结束后移除视图。 */
+    /** 关闭菜单：面板滑出右侧、遮罩淡出，结束后移除视图。 */
     private void dismissMenu(final View overlay, final View panel) {
         if (overlay.getParent() == null) {
             menuOpen = false;
             return;
         }
-        panel.animate().translationX(-panel.getWidth()).alpha(0.6f).setDuration(150).start();
+        panel.animate().translationX(panel.getWidth()).alpha(0.6f).setDuration(150).start();
         overlay.animate().alpha(0f).setDuration(150).withEndAction(() -> {
             android.view.ViewGroup parent = (android.view.ViewGroup) overlay.getParent();
             if (parent != null) parent.removeView(overlay);
@@ -1184,11 +1250,9 @@ public class MainActivity extends Activity {
         return box;
     }
 
-    /** 往任意容器里加视图（ui.add 只支持整页，这里给列表局部更新用）。 */
+    /** 往任意容器里加视图（走 WatchUi 以保证圆屏四角安全）。 */
     private void addTo(LinearLayout container, View view, int top, int bottom) {
-        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-        params.setMargins(0, ui.dp(top), 0, ui.dp(bottom));
-        container.addView(view, params);
+        ui.addTo(container, view, top, bottom);
     }
 
     /** 步骤小标题：区分「你」和「AI」，并标出步号。 */
@@ -1307,7 +1371,7 @@ public class MainActivity extends Activity {
         }
         long through = currentBeforeSeq - 1;
         renderSession("正在读取更早的内容…");
-        api.get(store.host(), store.port(),
+        api.get(baseUrl(),
                 "/api/session?id=" + Api.urlEncode(currentSessionId) + "&through=" + through,
                 store.token(), result -> {
                     if (destroyed || !onSessionPage) return;
@@ -1340,7 +1404,7 @@ public class MainActivity extends Activity {
         returningFromSession = true;
         lastContentSignature = 0;
         refresh.removeCallbacks(sessionTicker);
-        store.setLastSession("");
+        store.setLastSession("", "");
         showSessionList();
     }
 
@@ -1448,7 +1512,7 @@ public class MainActivity extends Activity {
         editing = true;
         modelProviders.clear();
         renderModelLoading();
-        api.get(store.host(), store.port(), "/api/models", store.token(), result -> {
+        api.get(baseUrl(), "/api/models", store.token(), result -> {
             if (destroyed) return;
             if (!result.ok) {
                 renderModelError(result.error);
@@ -1550,7 +1614,7 @@ public class MainActivity extends Activity {
             // 都是字符串，不会失败
         }
 
-        api.post(store.host(), store.port(), "/api/model", store.token(), body, result -> {
+        api.post(baseUrl(), "/api/model", store.token(), body, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 WatchUi.Page failed = ui.page();
@@ -1583,7 +1647,7 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
             // 不会失败
         }
-        api.post(store.host(), store.port(), "/api/cancel", store.token(), body, result -> {
+        api.post(baseUrl(), "/api/cancel", store.token(), body, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 renderSession("停止失败：" + result.error);
@@ -1643,7 +1707,7 @@ public class MainActivity extends Activity {
             // 字符串不会失败
         }
         renderSession("正在发送…");
-        api.post(store.host(), store.port(), "/api/send", store.token(), body, result -> {
+        api.post(baseUrl(), "/api/send", store.token(), body, result -> {
             if (destroyed || !onSessionPage) return;
             if (!result.ok) {
                 renderSession("发送失败：" + result.error);
@@ -1837,7 +1901,7 @@ public class MainActivity extends Activity {
         ui.add(page, ui.text("正在把回答发回电脑", 12, WatchUi.MUTED), 0, 0);
         render(page);
 
-        api.post(store.host(), store.port(), "/api/answer", store.token(), body, result -> {
+        api.post(baseUrl(), "/api/answer", store.token(), body, result -> {
             if (destroyed) return;
             if (!result.ok) {
                 renderQuestionPage(ask, 0, chosen, "提交失败：" + result.error);

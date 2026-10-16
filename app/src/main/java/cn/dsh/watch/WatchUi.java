@@ -20,11 +20,18 @@ import android.widget.TextView;
 /**
  * 圆屏适配的界面构件。
  *
- * 安全边距按圆形内接矩形推导：屏幕宽高记为 1，页面上/下各留 16% 时，
- * 距圆心 0.34 处的可用半宽为 sqrt(0.25-0.34^2)≈0.3666，即整宽 73.3%；
- * 左右各留 13.5% 恰好等于该宽度，因此首尾内容不会被圆角切掉。
+ * 滚动区是一个矩形，而屏幕是圆：矩形四角必须落在圆内，内容才不会被圆弧切掉。
+ * 设屏幕宽高为 1、圆心在 (0.5,0.5)、半径 0.5，左右边距 h、上下边距 v，
+ * 则四角到圆心的距离是 sqrt((0.5-h)^2 + (0.5-v)^2)，必须 ≤ 半径。
+ *
+ * 取 h=0.15、v=0.18 时该距离约 0.474，比半径小 0.026（约 12px），四角留有可见余量。
+ * 这是本文件的硬约束：**任何改动都不得让四角跑出圆外**，否则卡片边缘会被圆弧啃掉。
  */
 final class WatchUi {
+    /** 圆屏左右安全边距（屏宽的 15%）。 */
+    private static final float SIDE_RATIO = 0.15f;
+    /** 圆屏上下安全边距（屏高的 18%）。 */
+    private static final float VERTICAL_RATIO = 0.18f;
     static final int BG = Color.rgb(9, 12, 18);
     static final int SURFACE = Color.rgb(23, 29, 40);
     static final int SURFACE_HI = Color.rgb(35, 44, 58);
@@ -35,9 +42,6 @@ final class WatchUi {
     static final int WARN = Color.rgb(250, 184, 96);
     static final int OK = Color.rgb(126, 217, 160);
     static final int DANGER = Color.rgb(248, 132, 132);
-
-    private static final float SIDE_RATIO = 0.135f;
-    private static final float VERTICAL_RATIO = 0.16f;
 
     final Activity activity;
 
@@ -147,13 +151,15 @@ final class WatchUi {
      * 否则手表上最常用的上下翻页会被误判成菜单手势。
      */
     static final class HorizontalGesture {
-        private static final int TRIGGER_DP = 60;
-        private static final int SLOP_DP = 24;
+        private static final int TRIGGER_DP = 44;
+        private static final int SLOP_DP = 36;
 
         private final float triggerPx;
         private final float slopPx;
         private float startX;
         private float startY;
+        private float maxDx;
+        private float maxDy;
         private boolean triggered;
 
         HorizontalGesture(float density) {
@@ -161,26 +167,24 @@ final class WatchUi {
             this.slopPx = SLOP_DP * density;
         }
 
-        /**
-         * 喂入一个触摸事件。
-         * @param page 当前页面（提供左右滑回调）
-         * @return true 表示本次手势已被横向滑动消费
-         */
         boolean onTouch(WatchUi.Page page, MotionEvent event) {
             if (page == null) return false;
             switch (event.getActionMasked()) {
                 case MotionEvent.ACTION_DOWN:
                     startX = event.getX();
                     startY = event.getY();
+                    maxDx = 0f;
+                    maxDy = 0f;
                     triggered = false;
                     return false;
                 case MotionEvent.ACTION_MOVE: {
                     if (triggered) return true;
                     float dx = event.getX() - startX;
                     float dy = event.getY() - startY;
-                    // 纵向一旦明显超过阈值就认定是滚动，本次不再判定横滑。
-                    if (Math.abs(dy) > slopPx && Math.abs(dy) > Math.abs(dx)) return false;
-                    if (Math.abs(dx) >= triggerPx && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                    // 记录本次手势的最远位移，抬手时按它判定（避免逐帧抖动导致漏判）。
+                    if (Math.abs(dx) > Math.abs(maxDx)) maxDx = dx;
+                    if (Math.abs(dy) > Math.abs(maxDy)) maxDy = dy;
+                    if (Math.abs(dx) >= triggerPx && Math.abs(dx) > Math.abs(dy) * 1.2f) {
                         triggered = true;
                         if (dx > 0) page.fireSwipeRight();
                         else page.fireSwipeLeft();
@@ -194,11 +198,10 @@ final class WatchUi {
                         triggered = false;
                         return true;
                     }
-                    // 快速轻扫可能移动步数少，抬手时补一次判定。
-                    float dx = event.getX() - startX;
-                    float dy = event.getY() - startY;
-                    if (Math.abs(dx) >= triggerPx && Math.abs(dx) > Math.abs(dy) * 1.5f) {
-                        if (dx > 0) page.fireSwipeRight();
+                    // 用整个手势期间的最大位移判定：注入的滑动往往被拆成很多小步，
+                    // 只看抬手那一帧的位移会漏判。
+                    if (Math.abs(maxDx) >= triggerPx && Math.abs(maxDx) > Math.abs(maxDy) * 1.2f) {
+                        if (maxDx > 0) page.fireSwipeRight();
                         else page.fireSwipeLeft();
                         return true;
                     }
@@ -248,10 +251,22 @@ final class WatchUi {
         return view;
     }
 
+    /**
+     * 把视图加进页面。
+     *
+     * 边距由 {@link #page()} 的圆屏安全区统一负责，这里不再逐块调整——
+     * 曾经按控件自身位置反推边距，结果形成布局反馈环：算边距 → 控件变窄 →
+     * 文字折行 → 位置变化 → 再算出不同边距，最终把按钮压成窄条且无法拉伸。
+     */
     void add(Page page, View view, int top, int bottom) {
+        addTo(page.content, view, top, bottom);
+    }
+
+    /** 往任意容器里加视图（满宽 + 上下间距）。 */
+    void addTo(LinearLayout container, View view, int top, int bottom) {
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
         params.setMargins(0, dp(top), 0, dp(bottom));
-        page.content.addView(view, params);
+        container.addView(view, params);
     }
 
     void space(Page page, int height) {
@@ -268,19 +283,26 @@ final class WatchUi {
         page.content.addView(line, params);
     }
 
-    Button button(String label, boolean primary, Runnable action) {
-        Button button = new Button(activity);
-        button.setText(label);
-        button.setTextSize(14);
-        button.setTextColor(primary ? ON_ACCENT : ACCENT);
-        button.setAllCaps(false);
+    /**
+     * 一个通栏按钮。
+     *
+     * 用 TextView 而不是 Button：Button 的默认样式带 9-patch 背景与最小宽度约束，
+     * 在窄圆屏上会被固有宽度顶住、无法撑满整行（曾出现同排两个按钮宽度不一致、
+     * 标题折成两行）。这里自己画背景，宽度完全交给父容器决定。
+     */
+    TextView button(String label, boolean primary, Runnable action) {
+        TextView button = text(label, 14, primary ? ON_ACCENT : ACCENT);
         button.setGravity(Gravity.CENTER);
+        button.setMaxLines(1);
+        button.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        // 至少要有一个规范要求的最小点击高度。
         button.setMinHeight(dp(48));
-        button.setMinimumHeight(dp(48));
-        button.setMinWidth(0);
-        button.setPadding(dp(8), dp(8), dp(8), dp(8));
-        button.setStateListAnimator(null);
+        // 关掉 TextView 默认的额外字体留白，让高度完全由 padding 决定。
+        button.setIncludeFontPadding(false);
+        button.setPadding(dp(10), dp(14), dp(10), dp(14));
         button.setBackground(surface(primary ? ACCENT : SURFACE, 16));
+        button.setClickable(true);
+        button.setFocusable(true);
         button.setOnClickListener(v -> action.run());
         return button;
     }

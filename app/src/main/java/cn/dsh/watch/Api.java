@@ -62,21 +62,63 @@ final class Api {
         main.post(() -> callback.onResult(result));
     }
 
-    void get(String host, int port, String path, String token, Callback callback) {
-        request("GET", host, port, path, token, null, callback);
+    private static javax.net.ssl.SSLSocketFactory insecureFactory;
+
+    /**
+     * 放行全部证书的 SSL 工厂。
+     *
+     * 用途：公网中转常用自签名证书或私有域名，手表上没有便捷的证书安装入口。
+     * 风险由「地址私密 + 配对令牌」承担：令牌是访问中继的唯一凭据，
+     * 中继本身也只暴露这一层接口。
+     */
+    private static synchronized javax.net.ssl.SSLSocketFactory insecureFactory() {
+        if (insecureFactory != null) return insecureFactory;
+        try {
+            javax.net.ssl.TrustManager[] trustAll = new javax.net.ssl.TrustManager[]{
+                    new javax.net.ssl.X509TrustManager() {
+                        @Override
+                        public void checkClientTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                        }
+
+                        @Override
+                        public void checkServerTrusted(java.security.cert.X509Certificate[] chain, String authType) {
+                        }
+
+                        @Override
+                        public java.security.cert.X509Certificate[] getAcceptedIssuers() {
+                            return new java.security.cert.X509Certificate[0];
+                        }
+                    }
+            };
+            javax.net.ssl.SSLContext context = javax.net.ssl.SSLContext.getInstance("TLS");
+            context.init(null, trustAll, new java.security.SecureRandom());
+            insecureFactory = context.getSocketFactory();
+        } catch (Exception error) {
+            throw new IllegalStateException("无法初始化 TLS：", error);
+        }
+        return insecureFactory;
     }
 
-    void post(String host, int port, String path, String token, JSONObject body, Callback callback) {
-        request("POST", host, port, path, token, body, callback);
+    void get(String base, String path, String token, Callback callback) {
+        request("GET", base, path, token, null, callback);
     }
 
-    private void request(String method, String host, int port, String path, String token,
+    void post(String base, String path, String token, JSONObject body, Callback callback) {
+        request("POST", base, path, token, body, callback);
+    }
+
+    private void request(String method, String base, String path, String token,
                          JSONObject body, Callback callback) {
         pool.execute(() -> {
             HttpURLConnection connection = null;
             try {
-                URL url = new URL("http", host, port, path);
+                URL url = new URL(base + path);
                 connection = (HttpURLConnection) url.openConnection();
+                if (connection instanceof javax.net.ssl.HttpsURLConnection) {
+                    // 公网中转通常是自签名或普通证书；手表没有便捷的证书安装入口，
+                    // 这里放行全部证书，安全性由配对令牌与地址私密性承担。
+                    ((javax.net.ssl.HttpsURLConnection) connection).setSSLSocketFactory(insecureFactory());
+                }
                 connection.setRequestMethod(method);
                 connection.setConnectTimeout(TIMEOUT_MS);
                 connection.setReadTimeout(TIMEOUT_MS);

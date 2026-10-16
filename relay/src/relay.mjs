@@ -12,9 +12,29 @@
 import { createServer } from 'node:http'
 import { createSocket } from 'node:dgram'
 import { networkInterfaces } from 'node:os'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
+import { moduleDirectory } from './paths.mjs'
 import { MAX_MESSAGES, groupByProject, normalizeMessages, normalizeModelCatalog, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession } from './state.mjs'
+
+/**
+ * 控制面板静态文件所在目录。
+ *
+ * 开发时是 relay/public/；打包成单文件后，面板被放在可执行文件同级的 public/，
+ * 因此两个位置都要探一次。
+ */
+const PANEL_DIR = (() => {
+  const here = moduleDirectory()
+  const candidates = [join(here, '..', 'public'), join(here, 'public')]
+  for (const candidate of candidates) {
+    try {
+      if (existsSync(join(candidate, 'index.html'))) return candidate
+    } catch { /* 目录不可读时试下一个 */ }
+  }
+  return candidates[0]
+})()
 
 const DISCOVERY_PORT = 19391
 const DISCOVERY_INTERVAL_MS = 2_000
@@ -109,6 +129,8 @@ export class RelayServer {
     /** callId → {eventId, at}：用于优先走 waterfall 前台应答通道。 */
     this.pendingEvents = new Map()
     this.lastReconcileAt = 0
+    /** 公网地址（由入口在隧道就绪后注入），用于状态接口与打印。 */
+    this.publicBaseUrl = undefined
     this.server = undefined
     this.beacon = undefined
     this.beaconSocket = undefined
@@ -145,6 +167,33 @@ export class RelayServer {
     } catch (error) {
       this.log(`保存配对状态失败：${String(error.message)}`)
     }
+  }
+
+  /** 设置公网地址（隧道就绪后由入口调用）。 */
+  setPublicBaseUrl(url) {
+    this.publicBaseUrl = typeof url === 'string' && url !== '' ? url : undefined
+  }
+
+  /** 请求是否来自本机（控制面板只对本机开放）。 */
+  isLoopback(req) {
+    const address = req.socket?.remoteAddress ?? ''
+    return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
+  }
+
+  /** 把控制面板页面发给浏览器。 */
+  servePanel(res) {
+    const file = join(PANEL_DIR, 'index.html')
+    readFile(file, 'utf8').then((html) => {
+      const body = Buffer.from(html, 'utf8')
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'content-length': body.length,
+        'cache-control': 'no-store',
+      })
+      res.end(body)
+    }).catch(() => {
+      json(res, 500, { ok: false, error: '控制面板文件缺失，请确认 relay/public/index.html 存在' })
+    })
   }
 
   /** 局域网 IPv4 地址列表，用于打印提示。 */
@@ -343,14 +392,41 @@ export class RelayServer {
 
   async route(req, res, url) {
     const path = url.pathname
+
+    // 控制面板：只在 loopback 上提供，方便用户在本机浏览器里看配对码与地址。
+    if (path === '/' || path === '/index.html') {
+      if (!this.isLoopback(req)) {
+        json(res, 403, { ok: false, error: '控制面板只在本机可访问' })
+        return
+      }
+      this.servePanel(res)
+      return
+    }
+
+    if (path === '/local/state' && req.method === 'GET') {
+      if (!this.isLoopback(req)) {
+        json(res, 403, { ok: false, error: '控制面板只在本机可访问' })
+        return
+      }
+      json(res, 200, {
+        ok: true,
+        pairingCode: this.pairingCode,
+        lanAddresses: this.addresses().map((address) => `http://${address}:${String(this.port)}`),
+        publicUrl: this.publicBaseUrl,
+        pairedDevices: this.tokens.size,
+      })
+      return
+    }
+
     // 无需鉴权：手表用它确认「这是不是 DSH 中继」。
     if (path === '/api/status' && req.method === 'GET') {
       json(res, 200, {
         service: SERVICE_TAG,
         name: 'DSH 手表中继',
-        version: 1,
+        version: 2,
         needsPairing: true,
         uptimeMs: Date.now() - this.startedAt,
+        ...(this.publicBaseUrl === undefined ? {} : { publicUrl: this.publicBaseUrl }),
       })
       return
     }

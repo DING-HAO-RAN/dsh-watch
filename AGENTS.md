@@ -2,8 +2,27 @@
 
 ## 构成
 
-- 两个部件：[电脑端中继](<relay/>)（Node，无第三方依赖）与[手表端应用](<app/>)（原生 Java，无第三方运行库）。中继负责 DSH 鉴权与数据裁剪，手表只调用中继自己的简单接口。
+- 两个部件：[电脑端中继](<relay/>)（Node，无第三方运行依赖）与[手表端应用](<app/>)（原生 Java，无第三方运行库）。中继负责 DSH 鉴权与数据裁剪，手表只调用中继自己的简单接口。
 - 中继**不修改 DSH 配置、不依赖任何 DSH 插件**，这是需求方明确要求的前提，改动方案时不得破坏。
+- 中继支持三种分发形态，改动时三者都要兼顾：开发时直接跑 `relay/src/server.mjs`；[start-relay.cmd](<relay/start-relay.cmd>) 双击启动；[scripts/pack-relay.ps1](<scripts/pack-relay.ps1>) 打成单文件 exe（目标机无需 Node）。
+- 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**。
+
+## 中继打包（SEA）
+
+- 打包链路：`scripts/pack-relay.ps1` → `scripts/bundle-relay.mjs` → Node SEA → postject 注入。
+- `bundle-relay.mjs` 的四条硬规则，改动时不要违反（每条都对应一个真实故障）：
+  1. **保留内置模块导入**并提到文件顶部统一声明，否则运行时报 `join is not defined`；
+  2. **`import path from 'node:path'` 这类默认导入要整体引入**（`const path = require(...)`），拆成 `default: path` 解构会得到 undefined，随后 `path.join` 报错；
+  3. **不要给模块套块级作用域**，否则跨模块使用的函数（如 `moduleDirectory`）不可见；
+  4. **CJS 不允许顶层 await**，入口整体包一层 `async main()`。
+- `import.meta` 在 CJS 里是**语法错误**（不是运行时未定义），所以取目录的逻辑集中在 [paths.mjs](<relay/src/paths.mjs>)，由打包脚本把 `fileURLToPath(import.meta.url)` 改写成 `__filename`；**不要在别处再写 import.meta**。
+- postject 只在打包时需要，本机缓存在 `%LOCALAPPDATA%\dsh-relay-pack`；`npx postject` 在本机 shell 下解析不到包名，必须直接调用它的 `dist/cli.js`。
+- 控制面板只在 loopback 上提供（`/` 与 `/local/state`），面板文件随分发包放在 `public/`，**开发时与打包后的相对位置不同**，`PANEL_DIR` 会依次探测两处。
+
+## 公网中转
+
+- `--tunnel` 会拉起 cloudflared 生成一条临时 `*.trycloudflare.com` 地址；可执行文件按 `relay/bin/` → 分发包 `bin/` → DSH 插件目录 → PATH 的顺序查找。
+- 手表端走 HTTPS 时放行全部证书（`Api.insecureFactory`）——手表上没有便捷的证书安装入口，访问控制由配对令牌承担。
 
 ## DSH 协议（实测结论，改动前先复核）
 
@@ -25,9 +44,12 @@
 
 ## 界面
 
-- 圆屏安全边距由 `WatchUi.page()` 统一处理（左右 13.5%、上下 16%），页面不要自己再加边距。
+- 圆屏安全区由 [WatchUi](<app/src/main/java/cn/dsh/watch/WatchUi.java>) 的 `page()` 一处负责：按圆的内接矩形留边（左右 15%、上下 18%）。四角到圆心约 0.474 < 半径 0.5（余量约 12px），**整个滚动区都在圆内，可见内容天然安全**，页面不要自己再加边距。
+- **绝不要按控件自身的屏幕位置去动态调边距**。曾经这样做过（`applyRoundInsets`）：它形成布局反馈环——算边距 → 控件变窄 → 文字折行 → 位置变化 → 再算出不同边距，最终把同排按钮压成宽窄不一的窄条且无法拉伸。基础安全区已经足够。
+- 按钮用 `TextView` + 自绘背景实现（`WatchUi.button`），**不用 `android.widget.Button`**：后者带 9-patch 背景与固有最小宽度，在窄圆屏上会被顶住而撑不满整行。按钮必须单行显示，宽度交给父容器（`LayoutParams(-1, -2)`）。
+- 同排两个按钮用 `weighted()`（`weight=1` 平分）；**之后不要再改它们的 layoutParams 或加 margin**，那会破坏 weight 分配。
 - 可点区域不低于 48dp；**操作入口尽量收进左滑菜单**，页面上只留最常用的两个按钮，把高度让给内容。
-- 标题必须是单行（`WatchUi.headingView` 已设 `setSingleLine`）并预先截短。圆屏可视高度只有三百多像素，标题一旦折成两三行，按钮和内容区就被挤出屏幕、整页也滚不动。
+- 标题必须单行（`WatchUi.headingView` 已设 `setSingleLine`）。圆屏可视高度只有三百多像素，标题一旦折成两三行，按钮和内容区就被挤出屏幕、整页也滚不动。截断用 `clipLine`（只加省略号），**不要用 `cut`**（它会插入换行，等于把标题变成两行）。
 - **绝不能让「渲染 → 发请求 → 回调再渲染」形成环**。列表页曾经如此：`showSessionList()` 里发请求，回调又调 `showSessionList()`，屏幕每轮都重建、持续上下抽动。现在的分工是：`showSessionList()` 只在进入页面时调用一次，回调一律走 `renderSessionListPage()`（只重绘、不发请求）。
 - 界面用「重建整屏」的方式刷新，因此**滚动位置由 `render()` 统一保留**，换页时才调 `resetScroll()` 回顶部。会话页（4 秒）与会话列表（10 秒）都会定时刷新，不做这件事用户就翻不动列表和长对话。
 - 刷新前先比对**内容指纹**，没变化就直接返回。定时刷新还额外受两道闸约束：用户刚触摸过（2.5 秒静默期）、或正在编辑时跳过。
@@ -37,10 +59,11 @@
 ## 手势与操作菜单
 
 - 横向手势在 `MainActivity.dispatchTouchEvent` 里判定，**不能**挂在页面根容器上——子层 `ScrollView` 会先消费触摸，左滑会被当成纵向滚动。
-- 判定门槛：横向位移 ≥60dp 且大于纵向的 1.5 倍；纵向超过 24dp 且比横向大就当作滚动放行。手表上上下翻页远比横滑频繁，误判代价很高。
-- 约定：**右滑返回上一级，左滑打开操作菜单**。菜单从左侧滑入（180ms 位移 + 淡入），遮罩同步淡入；关闭用 150ms 反向动画，动画结束才移除视图并允许下一次打开。
+- 判定要用**整个手势期间的最大位移**，不能只看抬手那一帧：注入的滑动常被拆成很多小步，逐帧看会漏判。门槛为横向 ≥44dp 且大于纵向的 1.2 倍。
+- 约定：**右滑返回上一级，左滑打开操作菜单**。方向必须一致——左滑是「把右侧的内容拉出来」，因此菜单面板**贴右边缘、从右滑入**（180ms 位移 + 淡入）；面板放左边会让人觉得手势反了。关闭用 150ms 反向动画，动画结束才移除视图并允许下一次打开。
 - 正文与工具结果都经 [Markdown](<app/src/main/java/cn/dsh/watch/Markdown.java>) 渲染：标题放大加粗、列表带圆点、行内代码等宽加底色、引用变灰、表格压成一行、代码块整体等宽。工具读出的 .md 文本因此能直接可读。
 - 工具调用默认折叠成一行（工具名 + 状态 + 参数摘要）；连续多个合并成一组，点卡片整组展开，展开/收起用 110–140ms 的 alpha 动画。
+- 长路径会占满圆屏，展示前一律经 `shortenPaths` / `shortPath` 压成末两段。
 
 ## 测试
 

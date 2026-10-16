@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>DSH 中继</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    background: #0b0e14; color: #e8eef8;
+    font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  main { width: min(680px, 92vw); padding: 32px 0; }
+  h1 { font-size: 24px; margin: 0 0 4px; }
+  .sub { color: #7f8ea6; margin-bottom: 24px; }
+  .card { background: #161b24; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; color: #7abeff; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; }
+  .row .k { color: #8a99b0; }
+  .row .v { font-family: ui-monospace, Consolas, monospace; text-align: right; word-break: break-all; }
+  .code { font-size: 30px; letter-spacing: 8px; color: #fab860; font-family: ui-monospace, Consolas, monospace; }
+  ol { margin: 0; padding-left: 20px; }
+  ol li { margin: 6px 0; }
+  code { background: #222a36; padding: 1px 6px; border-radius: 4px; font-family: ui-monospace, Consolas, monospace; }
+  .ok { color: #7ed9a0; } .warn { color: #fab860; }
+</style>
+</head>
+<body>
+<main>
+  <h1>DSH 中继</h1>
+  <div class="sub">把本机 DSH 桌面版桥接给手表</div>
+
+  <div class="card">
+    <h2>状态</h2>
+    <div class="row"><span class="k">服务</span><span class="v" id="state">读取中…</span></div>
+    <div class="row"><span class="k">已运行</span><span class="v" id="uptime">—</span></div>
+    <div class="row"><span class="k">公网地址</span><span class="v" id="public">—</span></div>
+  </div>
+
+  <div class="card">
+    <h2>手表怎么连</h2>
+    <div class="row"><span class="k">局域网地址</span><span class="v" id="lan">—</span></div>
+    <div class="row"><span class="k">配对码</span><span class="v code" id="code">——————</span></div>
+    <ol>
+      <li>手表上打开「DSH 手表」→ 左滑 →「设置」</li>
+      <li>地址填上面这个（同一 WiFi 用局域网地址，否则用公网地址）</li>
+      <li>配对码填上面的 6 位数字，点「配对并连接」</li>
+    </ol>
+  </div>
+
+  <div class="card">
+    <h2>说明</h2>
+    <div class="row"><span class="k">配对码</span><span class="v">每次配对成功后会更换</span></div>
+    <div class="row"><span class="k">关闭窗口</span><span class="v">中继停止，手表即断开</span></div>
+  </div>
+</main>
+<script>
+  // 每秒刷新一次状态：这里读的是本机 loopback，页面本身不对外暴露。
+  async function refresh() {
+    try {
+      const status = await (await fetch('/api/status')).json();
+      const local = await (await fetch('/local/state')).json();
+      document.getElementById('state').textContent = '运行中';
+      document.getElementById('state').className = 'v ok';
+      document.getElementById('uptime').textContent = fmt(status.uptimeMs);
+      document.getElementById('code').textContent = local.pairingCode ?? '——————';
+      document.getElementById('lan').textContent = local.lanAddresses?.[0] ?? '—';
+      const pub = status.publicUrl;
+      document.getElementById('public').textContent = pub ?? '未开启（加 --tunnel 可开）';
+      document.getElementById('public').className = pub ? 'v ok' : 'v warn';
+    } catch (error) {
+      document.getElementById('state').textContent = '已停止';
+      document.getElementById('state').className = 'v warn';
+    }
+  }
+  function fmt(ms) {
+    if (!ms) return '—';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + ' 秒';
+    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+    return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
+  }
+  refresh();
+  setInterval(refresh, 1000);
+</script>
+</body>
+</html>
