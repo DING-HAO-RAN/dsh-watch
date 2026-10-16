@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- 局域网中继是明文 HTTP：手表与电脑处于同一受控网络，这里显式放行。 -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

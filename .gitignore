@@ -1,0 +1,14 @@
+# 构建与运行产生的中间产物
+dist/*.apk
+build/
+*.class
+*.dex
+
+# 本地环境
+.env
+.vscode/
+.idea/
+
+# 系统
+.DS_Store
+Thumbs.db
