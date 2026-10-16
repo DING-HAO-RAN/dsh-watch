@@ -99,12 +99,28 @@ if (token === '') {
     expect(Array.isArray(json.sessions), 'sessions 不是数组')
     expect(json.sessions.length > 0, '会话列表为空')
     expect(Array.isArray(json.pending), 'pending 不是数组')
-    const first = json.sessions[0]
-    sessionId = String(first.id)
-    sessionTitle = String(first.title)
     const hasSubagent = json.sessions.some((item) => item.subagent === true)
     expect(hasSubagent === false, '默认不应包含子代理会话')
-    return `${String(json.sessions.length)} 个会话，首个=${sessionTitle}`
+
+    // 样本要挑「有对话内容且当前空闲」的会话：
+    // - 列表首项可能是刚建的空会话，拿它验证正文会误报失败；
+    // - 正在运行（running）的会话收到新消息会先进队列，不会立刻写入历史，
+    //   用它会误判「发送失败」。
+    for (const candidate of json.sessions.slice(0, 20)) {
+      if (candidate.running === true) continue
+      const { json: detail } = await call('GET', `/api/session?id=${encodeURIComponent(String(candidate.id))}`)
+      if (!detail.ok) continue
+      const messages = Array.isArray(detail.messages) ? detail.messages : []
+      if (messages.some((message) => String(message.text ?? '').trim() !== '')) {
+        sessionId = String(candidate.id)
+        sessionTitle = String(candidate.title)
+        break
+      }
+    }
+    expect(sessionId !== '', '前 20 个会话里没有空闲且有正文的对话，无法验证消息内容')
+
+    const projectCount = Array.isArray(json.projects) ? json.projects.length : 0
+    return `${String(json.sessions.length)} 个会话 / ${String(projectCount)} 个项目，样本=${sessionTitle}`
   })
 
   await check('读取会话消息', async () => {
@@ -117,14 +133,9 @@ if (token === '') {
       expect(typeof message.text === 'string', 'text 不是字符串')
       expect(Array.isArray(message.tools), 'tools 不是数组')
     }
-    return `${String(json.messages.length)} 条消息，hasMore=${String(json.hasMore)}`
-  })
-
-  await check('会话消息随内容变化（非空正文）', async () => {
-    const { json } = await call('GET', `/api/session?id=${encodeURIComponent(sessionId)}`)
     const withText = json.messages.filter((message) => message.text.trim() !== '')
     expect(withText.length > 0, '没有任何带正文的消息')
-    return `最早一条：${String(withText[0].text.slice(0, 24))}…`
+    return `${String(json.messages.length)} 条消息（${String(withText.length)} 条有正文），首条：${String(withText[0].text.slice(0, 20))}…`
   })
 
   await check('创建新会话', async () => {
@@ -137,17 +148,27 @@ if (token === '') {
   })
 
   await check('发送消息并确认进入 DSH', async () => {
+    // 用一个专门的空白会话来发：它必定空闲，新消息会直接入档。
+    // 若拿既有会话发，对方可能正在运行，消息会先进队列而不写历史。
+    const created = await call('POST', '/api/create', {})
+    expect(created.json.ok === true, `创建发送用会话失败：${JSON.stringify(created.json)}`)
+    const target = String(created.json.sessionId)
+
     const marker = `手表端验收-${Date.now().toString(36)}`
-    const { status, json } = await call('POST', '/api/send', { sessionId, text: marker })
+    const { status, json } = await call('POST', '/api/send', { sessionId: target, text: marker })
     expect(status === 200 && json.ok === true, `发送失败：${JSON.stringify(json)}`)
+
     // 稍等片刻让 DSH 完成入档，再从会话历史里找这条消息。
     let found = false
-    for (let attempt = 0; attempt < 12 && !found; attempt += 1) {
+    let lastCount = 0
+    for (let attempt = 0; attempt < 15 && !found; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 1000))
-      const { json: page } = await call('GET', `/api/session?id=${encodeURIComponent(sessionId)}`)
-      found = page.messages.some((message) => message.role === 'user' && message.text.includes(marker))
+      const { json: page } = await call('GET', `/api/session?id=${encodeURIComponent(target)}`)
+      const messages = Array.isArray(page.messages) ? page.messages : []
+      lastCount = messages.length
+      found = messages.some((message) => message.role === 'user' && message.text.includes(marker))
     }
-    expect(found, '发送后未在会话历史里找到该消息')
+    expect(found, `发送后未在会话历史里找到该消息（当前 ${String(lastCount)} 条）`)
     return `已确认入档：${marker}`
   })
 
