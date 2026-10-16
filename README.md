@@ -38,7 +38,11 @@
 
 **方式 A：桌面程序（推荐）**
 
-到 [Releases](../../releases/latest) 下载 `DSH中继.exe`，双击即可。
+到 [Releases](https://github.com/DING-HAO-RAN/dsh-watch/releases/latest) 下载 `DSH-Relay.exe`，双击即可。也可以直接点：
+
+```
+https://github.com/DING-HAO-RAN/dsh-watch/releases/latest/download/DSH-Relay.exe
+```
 
 这是主推形态：一个文件，拷到任何 Windows 10/11 上都能跑，**目标电脑不需要装 .NET、Node.js 或任何其它东西**。程序会自动找到本机正在运行的 DSH，并在窗口里显示配对码和地址。
 
@@ -61,7 +65,7 @@ node relay/src/server.mjs --tunnel   # 同时开一条公网地址
 
 ### 2. 手表端
 
-到 [Releases](../../releases/latest) 下载 `DSH手表.apk`，然后：
+到 [Releases](https://github.com/DING-HAO-RAN/dsh-watch/releases/latest) 下载 `DSH-Watch.apk`（直接下载地址：`https://github.com/DING-HAO-RAN/dsh-watch/releases/latest/download/DSH-Watch.apk`），然后：
 
 1. 手表开启「开发者选项」与「USB 调试」（通常在「关于手表」里连点版本号）；
 2. 用数据线连接电脑，在手表上允许调试授权；
@@ -74,7 +78,7 @@ adb devices    # 状态应为 device，而不是 unauthorized
 4. 安装：
 
 ```powershell
-adb install -r "DSH手表.apk"
+adb install -r "DSH-Watch.apk"
 ```
 
 也可以直接用启动参数预填地址与配对码，省去在手表上输入：
