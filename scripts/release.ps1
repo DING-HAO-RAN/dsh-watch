@@ -42,8 +42,11 @@ function Invoke-GitHub {
     param([string]$Method, [string]$Uri, [object]$Body)
     $params = @{ Method = $Method; Uri = $Uri; Headers = $headers; TimeoutSec = 300 }
     if ($Body -ne $null) {
-        $params.Body = ($Body | ConvertTo-Json -Depth 6 -Compress)
-        $params.ContentType = 'application/json'
+        # 必须显式用 UTF-8 编码字节再发：直接用 ConvertTo-Json 的字符串，
+        # 中文在部分环境下会被替换成 `?`（实测发布说明整段变成问号）。
+        $jsonText = $Body | ConvertTo-Json -Depth 6 -Compress
+        $params.Body = [Text.UTF8Encoding]::new($false).GetBytes($jsonText)
+        $params.ContentType = 'application/json; charset=utf-8'
     }
     return Invoke-RestMethod @params
 }
