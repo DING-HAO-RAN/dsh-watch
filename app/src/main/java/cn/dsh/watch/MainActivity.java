@@ -188,10 +188,56 @@ public class MainActivity extends Activity {
             }
             pendingCode = code == null ? "" : code.trim();
         }
+        // autopair：带上就免去再点一次「配对并连接」，便于用 adb 一次性配好。
+        if (intent.getBooleanExtra("autopair", false) && !pendingHost.isEmpty() && !pendingCode.isEmpty()) {
+            autoPair = true;
+        }
+    }
+
+    /**
+     * 校验两个输入框并开始配对。
+     *
+     * 抽成方法是为了让「配对并连接」按钮与 autopair 启动参数走同一条路径——
+     * 两处各写一遍校验迟早会不一致。
+     */
+    private void pairNow(EditText hostField, EditText codeField, TextView status) {
+        String address = hostField.getText().toString().trim();
+        String code = codeField.getText().toString().trim();
+        if (address.isEmpty()) {
+            status.setTextColor(WatchUi.WARN);
+            status.setText("请先填写地址");
+            return;
+        }
+        if (code.isEmpty()) {
+            status.setTextColor(WatchUi.WARN);
+            status.setText("请填写电脑上显示的 6 位配对码");
+            return;
+        }
+        Store.Endpoint endpoint = Store.parse(address, DEFAULT_RELAY_PORT);
+        if (endpoint == null) {
+            status.setTextColor(WatchUi.DANGER);
+            status.setText("地址格式不对，示例：192.168.1.121 或 https://abc.com");
+            return;
+        }
+        status.setTextColor(WatchUi.MUTED);
+        status.setText("正在配对…");
+        tryPair(endpoint, code, status);
+    }
+
+    /** 延迟执行（配对需要等界面挂上以后再发请求）。 */
+    private void postDelayed(final Runnable action, long delayMs) {
+        new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (!destroyed) action.run();
+            }
+        }, delayMs);
     }
 
     private String pendingHost = "";
     private String pendingCode = "";
+    /** 启动参数要求直接配对（见 applyIntentExtras）。 */
+    private boolean autoPair = false;
 
     /** 读 JSON 字符串字段，缺失或为 null 时给空串。 */
     private static String textOf(JSONObject object, String key) {
@@ -343,28 +389,16 @@ public class MainActivity extends Activity {
         }), 0, 8);
 
         ui.add(page, ui.button("配对并连接", true, () -> {
-            String address = hostField.getText().toString().trim();
-            String code = codeField.getText().toString().trim();
-            if (address.isEmpty()) {
-                status.setTextColor(WatchUi.WARN);
-                status.setText("请先填写地址");
-                return;
-            }
-            if (code.isEmpty()) {
-                status.setTextColor(WatchUi.WARN);
-                status.setText("请填写电脑上显示的 6 位配对码");
-                return;
-            }
-            Store.Endpoint endpoint = Store.parse(address, DEFAULT_RELAY_PORT);
-            if (endpoint == null) {
-                status.setTextColor(WatchUi.DANGER);
-                status.setText("地址格式不对，示例：192.168.1.121 或 https://abc.com");
-                return;
-            }
-            status.setTextColor(WatchUi.MUTED);
-            status.setText("正在配对…");
-            tryPair(endpoint, code, status);
+            pairNow(hostField, codeField, status);
         }), 0, 8);
+
+        // 带 autopair 启动时直接连线，免去在手表上再点一次。
+        if (autoPair) {
+            autoPair = false;
+            status.setTextColor(WatchUi.MUTED);
+            status.setText("正在按启动参数配对…");
+            postDelayed(() -> pairNow(hostField, codeField, status), 300);
+        }
 
         if (store.paired()) {
             ui.add(page, ui.button("断开连接", false, this::disconnect), 0, 8);
