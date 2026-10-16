@@ -182,6 +182,10 @@ namespace DshRelay
             state.DeviceCount = relay == null ? 0 : relay.PairedDevices;
             state.UptimeMs = relay == null ? 0L : (long)(DateTime.Now - relay.StartedAt).TotalMilliseconds;
             state.DshPort = dsh == null ? 0 : dsh.Port;
+            if (relay != null)
+            {
+                foreach (TokenInfo info in relay.IssuedTokens()) state.Tokens.Add(info.Token);
+            }
             return state;
         }
 
@@ -398,6 +402,19 @@ namespace DshRelay
             state["uptimeMs"] = relay == null ? 0L : (long)(DateTime.Now - relay.StartedAt).TotalMilliseconds;
             state["dshPort"] = dsh == null ? 0 : dsh.Port;
             state["tunnelBusy"] = TunnelBusy;
+            // 令牌一并给出：用户可以直接用 curl 等客户端连中继，不必依赖手表。
+            var tokens = new List<object>();
+            if (relay != null)
+            {
+                foreach (TokenInfo info in relay.IssuedTokens())
+                {
+                    var entry = new Dictionary<string, object>();
+                    entry["token"] = info.Token;
+                    entry["issuedAt"] = info.IssuedAt;
+                    tokens.Add(entry);
+                }
+            }
+            state["tokens"] = tokens;
             return Http.Json(200, state);
         }
 

@@ -11,6 +11,14 @@ using System.Web.Script.Serialization;
 
 namespace DshRelay
 {
+    /// <summary>一个已发放的配对令牌（供控制台展示）。</summary>
+    public class TokenInfo
+    {
+        public string Token;
+        /// <summary>发放时间（Unix 毫秒）。</summary>
+        public long IssuedAt;
+    }
+
     /// <summary>
     /// 面向手表的 HTTP 服务：把 DSH 的复杂协议翻译成手表能用的简单接口，
     /// 并做数据裁剪与配对保护。
@@ -279,6 +287,34 @@ namespace DshRelay
         private static long NowMs()
         {
             return (long)(DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+        }
+
+        /// <summary>
+        /// 已发放且仍有效的配对令牌，按发放时间倒序。
+        ///
+        /// 供本机控制台显示：用户拿到链接与令牌后，可以用 curl 或别的客户端
+        /// 直接连中继，不必依赖手表。只在 loopback 上暴露。
+        /// </summary>
+        public List<TokenInfo> IssuedTokens()
+        {
+            var list = new List<TokenInfo>();
+            lock (gate)
+            {
+                long now = NowMs();
+                var stale = new List<string>();
+                foreach (var pair in tokens)
+                {
+                    if (now - pair.Value > TokenTtlMs) { stale.Add(pair.Key); continue; }
+                    var info = new TokenInfo();
+                    info.Token = pair.Key;
+                    info.IssuedAt = pair.Value;
+                    list.Add(info);
+                }
+                // 顺手清掉过期令牌，避免越积越多。
+                foreach (string key in stale) tokens.Remove(key);
+            }
+            list.Sort(delegate (TokenInfo a, TokenInfo b) { return b.IssuedAt.CompareTo(a.IssuedAt); });
+            return list;
         }
 
         // ---------------------------------------------------------------- 接口实现

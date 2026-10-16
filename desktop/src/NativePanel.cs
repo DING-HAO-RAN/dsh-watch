@@ -239,6 +239,17 @@ namespace DshRelay
                 builder.AppendLine();
                 builder.AppendLine("DSH 端口：" + state.DshPort);
                 builder.AppendLine("中继端口：" + state.Port);
+                if (state.Tokens.Count > 0)
+                {
+                    builder.AppendLine();
+                    builder.AppendLine("已发放的令牌（可直接用于其它客户端）：");
+                    foreach (string token in state.Tokens) builder.AppendLine(token);
+                }
+                else
+                {
+                    builder.AppendLine();
+                    builder.AppendLine("令牌：手表配对成功后在这里显示");
+                }
                 details.Text = builder.ToString();
             }
             catch (Exception error)
@@ -348,5 +359,7 @@ namespace DshRelay
         public int DeviceCount;
         public long UptimeMs;
         public int DshPort;
+        /// <summary>已发放且仍有效的配对令牌。</summary>
+        public List<string> Tokens = new List<string>();
     }
 }

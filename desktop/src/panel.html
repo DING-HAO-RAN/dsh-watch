@@ -107,6 +107,14 @@
       </div>
     </div>
 
+    <div class="card wide">
+      <h2>令牌</h2>
+      <div id="tokens"></div>
+      <div class="meta">
+        <span class="hint">手表配对成功后会在这里出现。可直接用 curl 等客户端带此令牌访问上面的地址。</span>
+      </div>
+    </div>
+
     <div class="card">
       <h2>手表怎么连</h2>
       <ol>
@@ -176,6 +184,24 @@
     $('stopTunnel').disabled = !state.publicUrl;
     $('addTunnel').disabled = !!state.publicUrl;
     $('addTunnel').textContent = state.tunnelBusy ? '正在开启…' : '开启公网访问';
+
+    const tokenList = $('tokens');
+    tokenList.innerHTML = '';
+    const tokens = state.tokens || [];
+    if (tokens.length === 0) {
+      tokenList.innerHTML = '<div class="empty">还没有设备配对。手表配对成功后，令牌会显示在这里。</div>';
+    }
+    tokens.forEach((item) => {
+      const row = document.createElement('div');
+      row.className = 'addr';
+      const when = item.issuedAt ? new Date(item.issuedAt).toLocaleTimeString('zh-CN') : '';
+      row.innerHTML = `<span class="tag">${when || '令牌'}</span><span class="text">${item.token}</span>`;
+      const copy = document.createElement('button');
+      copy.textContent = '复制';
+      copy.onclick = () => { navigator.clipboard.writeText(item.token); copy.textContent = '已复制'; setTimeout(() => copy.textContent = '复制', 1200); };
+      row.appendChild(copy);
+      tokenList.appendChild(row);
+    });
   }
 
   async function poll() {
@@ -212,6 +238,7 @@
     const lines = [`DSH 手表连接信息`, `配对码：${state.pairingCode}`];
     (state.lanAddresses || []).forEach((ip, i) => lines.push(`局域网${i === 0 ? '' : i + 1}：http://${ip}:${state.port}`));
     if (state.publicUrl) lines.push(`公网：${state.publicUrl}`);
+    (state.tokens || []).forEach((item) => lines.push(`令牌：${item.token}`));
     navigator.clipboard.writeText(lines.join('\n'));
     $('copyAll').textContent = '已复制';
     setTimeout(() => $('copyAll').textContent = '复制全部信息', 1400);
