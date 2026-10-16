@@ -35,6 +35,15 @@
 - `import.meta` 在 CJS 里是**语法错误**（不是运行时未定义），所以取目录的逻辑集中在 [paths.mjs](<relay/src/paths.mjs>)，由打包脚本把 `fileURLToPath(import.meta.url)` 改写成 `__filename`；**不要在别处再写 import.meta**。
 - postject 只在打包时需要，本机缓存在 `%LOCALAPPDATA%\dsh-relay-pack`；`npx postject` 在本机 shell 下解析不到包名，必须直接调用它的 `dist/cli.js`。
 - 控制面板只在 loopback 上提供（`/` 与 `/local/state`），面板文件随分发包放在 `public/`，**开发时与打包后的相对位置不同**，`PANEL_DIR` 会依次探测两处。
+- **`pack-relay.ps1` 与 `build-app.ps1` 的输出目录必须分开**：前者出 `dist/中继命令行版/`，后者出 `dist/DSH中继/`。两个脚本启动时都会清空自己的输出目录，共用同一个目录时后跑的那个会把先跑的产物删掉。
+
+## 发布
+
+- 仓库：[DING-HAO-RAN/dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（公开）。
+- **GitHub 会剥掉 Release 资产名里的非 ASCII 字符**（`DSH中继.exe` 会变成 `DSH.exe`，label 也会被丢掉），所以发布用的文件名固定为 `DSH-Relay.exe` 与 `DSH-Watch.apk`，README 与实际资产名必须一致。改完要下载回来比对哈希。
+- 上传资产用**只带文件的 POST**，不要把 `--data-urlencode` 与 `--data-binary` 混在同一条 curl 里——两者会拼进同一个请求体，产出的资产比源文件大出一截且内容损坏。
+- 命令行版中继（打包后约 88 MB）**不进 Releases**，公网访问用的 `cloudflared.exe`（约 53 MB）同样不随包提供，缺了它只影响公网功能。
+- **发布产物必须从 `git archive HEAD` 导出的干净副本里构建**，不能直接用工作树：本机常有其它会话正在改这个项目，工作树里的代码未必是已提交的那份。
 
 ## 公网中转
 
@@ -89,6 +98,8 @@
 ## 测试
 
 - 三个只读/半只读自检脚本：`tests/check-protocol.mjs`（端点参数形态）、`tests/check-features.mjs`（项目分组、步骤详情、模型目录、用量、翻页）、`tests/e2e.mjs`（配对、列表、读消息、发消息）。
+- **`check-features.mjs` / `answer-once.mjs` / `send.mjs` 不带 `--token` 时会去读 `~/.dsh-watch-relay.json`**，那是**命令行版中继**的存档；桌面程序的令牌只存在内存里，不落这个文件。因此对着桌面程序跑而不显式传 `--token` 时，会拿到旧令牌或空令牌，**表现为 8 条用例全红**（「列表失败」「缺少样本会话」），容易被误判成功能坏了。稳妥做法是另起一个带 `--state-file` 的命令行中继，配对取新令牌后再跑。
+- **配对码一次性**：配对成功即刻更换，`e2e.mjs` 与前面手动配对不能共用同一个码，一条命令里连跑两次必然失败。每次跑之前重新从 `/local/state` 取当前配对码。
 - **`e2e.mjs` 挑样本会话有两条硬要求**，否则会误报失败：
   1. 必须**有正文**——列表首项常是刚建的空会话；
   2. 必须**空闲**（`running !== true`）——DSH 对运行中的会话会把新消息放进队列而不立即写入历史，此时查历史必然找不到。发送用例因此单独建一个空白会话。
