@@ -40,8 +40,12 @@
 ## 发布
 
 - 仓库：[DING-HAO-RAN/dsh-watch](https://github.com/DING-HAO-RAN/dsh-watch)（公开）。
+- 一键发布：[scripts/release.ps1](<scripts/release.ps1>) 串起「建 release → 传两个资产 → 下载回来比对哈希」。事后要改说明用 [scripts/update-release-notes.mjs](<scripts/update-release-notes.mjs>)。
 - **GitHub 会剥掉 Release 资产名里的非 ASCII 字符**（`DSH中继.exe` 会变成 `DSH.exe`，label 也会被丢掉），所以发布用的文件名固定为 `DSH-Relay.exe` 与 `DSH-Watch.apk`，README 与实际资产名必须一致。改完要下载回来比对哈希。
 - 上传资产用**只带文件的 POST**，不要把 `--data-urlencode` 与 `--data-binary` 混在同一条 curl 里——两者会拼进同一个请求体，产出的资产比源文件大出一截且内容损坏。
+- **发请求体必须显式转成 UTF-8 字节**。`Invoke-RestMethod` 直接接 `ConvertTo-Json` 的字符串时，中文会被替换成 `?`——实测整段发布说明 915 个字符全变问号，而接口返回 200、看不出异常。用 Node 的 `fetch`（字符串天然按 UTF-8 编码）或先 `[Text.UTF8Encoding]::GetBytes(...)` 都可以，**改完必须把内容拉回来校验是否含中文**，不能只看请求成功。
+- **PATCH 更新 release 只能按 release id**，按 tag 打会 404。
+- 凭据复用 `git push` 已存的那份（Windows 凭据管理器，无需额外配置）。取法：`git credential fill` 需要逐行协议文本 + 结尾空行——PowerShell 管道喂进去会报 `credential missing protocol field`，而 PowerShell 又不支持 `<` 重定向，所以走「临时文件 + cmd」或 Node 的 `execFileSync(..., { input })`。
 - 命令行版中继（打包后约 88 MB）**不进 Releases**，公网访问用的 `cloudflared.exe`（约 53 MB）同样不随包提供，缺了它只影响公网功能。
 - **发布产物必须从 `git archive HEAD` 导出的干净副本里构建**，不能直接用工作树：本机常有其它会话正在改这个项目，工作树里的代码未必是已提交的那份。
 
