@@ -103,6 +103,7 @@ try {
     $linkArgs = @('link', '-o', (Join-Path $build 'base.apk'), '-I', $androidJar,
         '--manifest', (Join-Path $main 'AndroidManifest.xml'),
         '--java', (Join-Path $build 'gen'),
+        '--version-code', '1', '--version-name', '1.0.0',
         '--min-sdk-version', '26', '--target-sdk-version', '33') + $flats
     $code = Invoke-Step $aapt2 $linkArgs 'aapt2-link'
     if ($code -ne 0) { Read-Log 'aapt2-link'; throw "aapt2 link 失败（退出码 $code）" }
