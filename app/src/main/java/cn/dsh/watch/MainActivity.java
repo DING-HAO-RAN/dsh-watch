@@ -54,8 +54,10 @@ public class MainActivity extends Activity {
      * 会话页每 4 秒重建一次整屏；若此时用户正在输入，重建会把输入框连同已输入的内容一起丢掉。
      */
     private boolean editing;
-    /** 刷新前记录的滚动位置，用于重建后恢复。 */
-    private int restoreScroll;
+    /** 下次重建整屏时是否回到顶部。 */
+    private boolean resetScrollOnNextRender;
+    /** 标记「刚从会话页返回」，用于让会话列表回顶部。 */
+    private boolean returningFromSession;
 
     private final android.os.Handler refresh = new android.os.Handler(android.os.Looper.getMainLooper());
     private final Runnable sessionTicker = new Runnable() {
@@ -120,37 +122,44 @@ public class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    /** 把新页面装进窗口并启用。 */
+    /**
+     * 把新页面装进窗口并启用。
+     *
+     * 重建整屏会丢掉滚动位置，而会话页与会话列表都会定时自动刷新——不保留的话
+     * 用户根本没法往下翻（列表有几十条，翻一屏就被弹回顶部）。因此这里默认记住
+     * 旧页面的滚动位置并还原；确实需要回到顶部时调用 {@link #resetScroll()}。
+     */
     private void render(WatchUi.Page page) {
+        int restore = resetScrollOnNextRender ? 0 : currentScroll();
+        resetScrollOnNextRender = false;
         setContentView(page.root);
-        int restore = restoreScroll;
-        restoreScroll = 0;
         page.scroll.post(() -> page.scroll.scrollTo(0, restore));
     }
 
-    /**
-     * 静默刷新时保留滚动位置。
-     *
-     * 会话页每 4 秒自动刷新一次；若每次都回到顶部，用户根本没法往下读长对话。
-     */
-    private void preserveScroll() {
+    /** 下一次重建时回到顶部（换页时用，避免带着上一页的偏移）。 */
+    private void resetScroll() {
+        resetScrollOnNextRender = true;
+    }
+
+    /** 读取当前屏幕上那个 ScrollView 的滚动位置。 */
+    private int currentScroll() {
         View root = getWindow().getDecorView().findViewById(android.R.id.content);
         if (root instanceof android.view.ViewGroup) {
             android.view.ViewGroup group = (android.view.ViewGroup) root;
             for (int i = 0; i < group.getChildCount(); i++) {
                 View child = group.getChildAt(i);
-                if (child instanceof android.widget.FrameLayout) {
+                if (child instanceof android.view.ViewGroup) {
                     android.view.ViewGroup frame = (android.view.ViewGroup) child;
                     for (int j = 0; j < frame.getChildCount(); j++) {
                         View inner = frame.getChildAt(j);
                         if (inner instanceof android.widget.ScrollView) {
-                            restoreScroll = ((android.widget.ScrollView) inner).getScrollY();
-                            return;
+                            return ((android.widget.ScrollView) inner).getScrollY();
                         }
                     }
                 }
             }
         }
+        return 0;
     }
 
     // ---------------------------------------------------------------- 连接页
@@ -260,6 +269,11 @@ public class MainActivity extends Activity {
 
     private void showSessionList() {
         onSessionPage = false;
+        // 从会话页返回时回到列表顶部；列表自身的定时刷新则由 render() 保持位置。
+        if (returningFromSession) {
+            resetScroll();
+            returningFromSession = false;
+        }
         refresh.removeCallbacks(listTicker);
         WatchUi.Page page = ui.page();
         ui.heading(page, "DSH 会话", loadingSession ? "正在刷新…" : "点开一个会话继续对话");
@@ -509,13 +523,13 @@ public class MainActivity extends Activity {
         }
 
         ui.add(page, ui.button("返回会话列表", false, this::backToList), 6, 0);
-        preserveScroll();
         render(page);
     }
 
     private void backToList() {
         onSessionPage = false;
         editing = false;
+        returningFromSession = true;
         refresh.removeCallbacks(sessionTicker);
         store.setLastSession("");
         showSessionList();
