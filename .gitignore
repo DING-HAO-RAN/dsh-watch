@@ -23,3 +23,6 @@ WebView2Loader.dll
 # 系统
 .DS_Store
 Thumbs.db
+
+# 浏览器数据（运行时生成，位置随版本变化）
+*.WebView2/

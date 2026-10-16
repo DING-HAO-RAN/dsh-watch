@@ -60,6 +60,47 @@ namespace DshRelay
             }));
         }
 
+        /// <summary>
+        /// 挑一个可写的浏览器数据目录。
+        ///
+        /// 必须**先探测再交给 WebView2**：如果指定了一个不可写的目录，
+        /// WebView2 初始化会直接抛 E_UNEXPECTED（灾难性故障），而不是换个位置重试。
+        /// 探测顺序按「不污染分发目录」与「大概率可写」折中：
+        /// 1. 程序目录下的 webview-data —— 最常见的情况都可写，且随程序一起走；
+        /// 2. 用户缓存目录 —— 程序装在 Program Files 时的退路；
+        /// 3. 系统临时目录 —— 最后的退路。
+        /// 都不可写时返回 null，交给 WebView2 用默认位置（会失败，随后降级到原生界面）。
+        /// </summary>
+        private static string PickWritableDirectory()
+        {
+            var candidates = new System.Collections.Generic.List<string>();
+            try { candidates.Add(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "webview-data")); }
+            catch { }
+            try
+            {
+                candidates.Add(Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "dsh-relay", "webview2"));
+            }
+            catch { }
+            try { candidates.Add(Path.Combine(Path.GetTempPath(), "dsh-relay", "webview2")); }
+            catch { }
+
+            foreach (string candidate in candidates)
+            {
+                try
+                {
+                    Directory.CreateDirectory(candidate);
+                    // 真正写一个文件才算数：目录能建不代表能写（权限可能是只读的）。
+                    string probe = Path.Combine(candidate, ".write-test");
+                    File.WriteAllText(probe, "ok");
+                    File.Delete(probe);
+                    return candidate;
+                }
+                catch { }
+            }
+            return null;
+        }
+
         /// <summary>尝试用 WebView2 显示控制台；失败则保持原生界面。</summary>
         private void TryBrowser()
         {
@@ -70,6 +111,16 @@ namespace DshRelay
                 {
                     webView = new Microsoft.Web.WebView2.WinForms.WebView2();
                     webView.Dock = DockStyle.Fill;
+                    // 只在探测到确实可写时才指定数据目录；否则交给 WebView2 自己决定，
+                    // 指定一个不可写的路径会让它直接初始化失败。
+                    string dataDirectory = PickWritableDirectory();
+                    if (dataDirectory != null)
+                    {
+                        var creation = new Microsoft.Web.WebView2.WinForms.CoreWebView2CreationProperties();
+                        creation.UserDataFolder = dataDirectory;
+                        webView.CreationProperties = creation;
+                        StartupLog.Write("浏览器数据目录：" + dataDirectory);
+                    }
                     webView.CoreWebView2InitializationCompleted += delegate (object sender, Microsoft.Web.WebView2.Core.CoreWebView2InitializationCompletedEventArgs args)
                     {
                         if (!args.IsSuccess)
