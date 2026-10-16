@@ -117,13 +117,26 @@ await check('模型目录', async () => {
 })
 
 await check('历史翻页（beforeSeq）', async () => {
-  const first = await call('GET', `/api/session?id=${encodeURIComponent(sessionId)}`)
-  expect(typeof first.json.beforeSeq === 'number' && first.json.beforeSeq > 0, '缺少 beforeSeq')
-  expect(first.json.hasMore === true, '样本会话没有更多历史，无法验证翻页')
-  const older = await call('GET', `/api/session?id=${encodeURIComponent(sessionId)}&through=${String(first.json.beforeSeq - 1)}`)
+  // 自己找一个「有更多历史」的会话：前面挑的样本可能是刚建的短会话，
+  // 拿它验证翻页必然失败，而那是样本问题、不是翻页功能的问题。
+  let target = ''
+  let first = null
+  const list = await call('GET', '/api/sessions')
+  for (const item of (list.json.sessions ?? []).slice(0, 25)) {
+    const probe = await call('GET', `/api/session?id=${encodeURIComponent(String(item.id))}`)
+    if (probe.json.ok === true && probe.json.hasMore === true && typeof probe.json.beforeSeq === 'number') {
+      target = String(item.id)
+      first = probe.json
+      break
+    }
+  }
+  expect(target !== '', '前 25 个会话都没有更多历史，无法验证翻页')
+
+  expect(first.beforeSeq > 0, '缺少 beforeSeq')
+  const older = await call('GET', `/api/session?id=${encodeURIComponent(target)}&through=${String(first.beforeSeq - 1)}`)
   expect(older.json.ok === true, '翻页失败')
   expect(Array.isArray(older.json.steps), '翻页结果缺少 steps')
-  return `第一批最早 seq=${String(first.json.beforeSeq)}，往前翻得到 ${String(older.json.steps.length)} 个步骤`
+  return `第一批最早 seq=${String(first.beforeSeq)}，往前翻得到 ${String(older.json.steps.length)} 个步骤`
 })
 
 await check('用量统计随会话变化', async () => {

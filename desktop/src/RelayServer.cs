@@ -241,6 +241,8 @@ namespace DshRelay
             }
             catch (Exception error)
             {
+                // 用 ToString()：StackTrace 在部分异常上为 null，而 ToString() 总是带类型与消息。
+                StartupLog.Write("处理 " + path + " 时异常：" + error.ToString());
                 return Http.Json(500, Simple(error.Message));
             }
 
@@ -323,11 +325,23 @@ namespace DshRelay
         {
             var args = new Dictionary<string, object>();
             args["_request"] = new Dictionary<string, object>();
-            var value = dsh.Rpc("session/list", args) as Dictionary<string, object>;
+            object rawValue = dsh.Rpc("session/list", args);
+            var value = rawValue as Dictionary<string, object>;
+
+            // 取不到会话时把实际拿到的形状记下来：DSH 正常应返回 items 数组，
+            // 返回空或类型不对说明参数/鉴权有问题，只看最终的空列表是查不出来的。
+            if (value == null)
+            {
+                StartupLog.Write("session/list 返回了非对象：" + (rawValue == null ? "null" : rawValue.GetType().Name));
+            }
+            else if (!value.ContainsKey("items"))
+            {
+                StartupLog.Write("session/list 返回的字段：" + string.Join(", ", new List<string>(value.Keys).ToArray()));
+            }
 
             var sessions = new List<object>();
             var projects = new Dictionary<string, Dictionary<string, object>>();
-            var items = value != null && value.ContainsKey("items") ? value["items"] as List<object> : null;
+            var items = ListField(value, "items");
 
             if (items != null)
             {
@@ -444,7 +458,7 @@ namespace DshRelay
             pageArgs["request"] = pageRequest;
             var page = dsh.Rpc("session/page", pageArgs) as Dictionary<string, object>;
 
-            List<object> records = page != null && page.ContainsKey("records") ? page["records"] as List<object> : null;
+            List<object> records = ListField(page, "records");
             var values = projection != null && projection.ContainsKey("values") ? projection["values"] as Dictionary<string, object> : null;
 
             var result = new Dictionary<string, object>();
@@ -488,7 +502,9 @@ namespace DshRelay
             payload["clientTimeZone"] = "Asia/Shanghai";
             args["request"] = payload;
             dsh.Rpc("session/prompt", args);
-            return Http.Json(200, Ok());
+            // 注意别写成 Http.Json(200, Ok())：Ok() 已经是一个完整响应，
+            // 再包一层会把它序列化成 {Status,ContentType,Body} 发给客户端。
+            return Ok();
         }
 
         private Http.Response Cancel(Http.Request request)
@@ -500,7 +516,7 @@ namespace DshRelay
             payload["sessionId"] = sessionId;
             args["request"] = payload;
             dsh.Rpc("session/cancel", args);
-            return Http.Json(200, Ok());
+            return Ok();
         }
 
         private Http.Response Create()
@@ -518,14 +534,14 @@ namespace DshRelay
         {
             var value = dsh.Rpc("session/modelCatalog", new Dictionary<string, object>()) as Dictionary<string, object>;
             var routable = new Dictionary<string, bool>();
-            if (value != null && value.ContainsKey("routableProviders"))
+            var routableList = ListField(value, "routableProviders");
+            if (routableList != null)
             {
-                var list = value["routableProviders"] as List<object>;
-                if (list != null) foreach (var item in list) routable[Convert.ToString(item)] = true;
+                foreach (var item in routableList) routable[Convert.ToString(item)] = true;
             }
 
             var groups = new List<object>();
-            var rawGroups = value != null && value.ContainsKey("groups") ? value["groups"] as List<object> : null;
+            var rawGroups = ListField(value, "groups");
             if (rawGroups != null)
             {
                 foreach (var raw in rawGroups)
@@ -536,7 +552,7 @@ namespace DshRelay
                     if (routable.Count > 0 && !routable.ContainsKey(provider)) continue;
 
                     var models = new List<object>();
-                    var rawModels = group.ContainsKey("models") ? group["models"] as List<object> : null;
+                    var rawModels = ListField(group, "models");
                     if (rawModels != null)
                     {
                         foreach (var rawModel in rawModels)
@@ -578,7 +594,7 @@ namespace DshRelay
         {
             var list = new List<object>();
             var reasoning = model.ContainsKey("reasoning") ? model["reasoning"] as Dictionary<string, object> : null;
-            var efforts = reasoning != null && reasoning.ContainsKey("efforts") ? reasoning["efforts"] as List<object> : null;
+            var efforts = ListField(reasoning, "efforts");
             if (efforts != null)
             {
                 foreach (var raw in efforts)
@@ -631,7 +647,7 @@ namespace DshRelay
             if (body == null) return Http.Json(400, Simple("请求体不是合法 JSON"));
             string sessionId = Convert.ToString(body.ContainsKey("sessionId") ? body["sessionId"] : "");
             string callId = Convert.ToString(body.ContainsKey("callId") ? body["callId"] : "");
-            var answers = body.ContainsKey("answers") ? body["answers"] as List<object> : null;
+            var answers = ListField(body, "answers");
             if (string.IsNullOrEmpty(sessionId) || string.IsNullOrEmpty(callId) || answers == null || answers.Count == 0)
             {
                 return Http.Json(400, Simple("缺少 sessionId、callId 或 answers"));
@@ -645,7 +661,7 @@ namespace DshRelay
                 var entry = new Dictionary<string, object>();
                 entry["id"] = Convert.ToString(item.ContainsKey("id") ? item["id"] : "");
                 var selected = new List<object>();
-                var rawSelected = item.ContainsKey("selected") ? item["selected"] as List<object> : null;
+                var rawSelected = ListField(item, "selected");
                 if (rawSelected != null) foreach (var value in rawSelected) selected.Add(Convert.ToString(value));
                 entry["selected"] = selected;
                 if (item.ContainsKey("custom"))
@@ -707,7 +723,7 @@ namespace DshRelay
                     entry["callId"] = GetString(question, "callId");
                     entry["state"] = GetString(question, "state");
                     entry["eventId"] = "";
-                    entry["questions"] = CompactQuestions(question.ContainsKey("questions") ? question["questions"] as List<object> : null);
+                    entry["questions"] = CompactQuestions(ListField(question, "questions"));
                     pending.Add(entry);
                 }
             }
@@ -724,7 +740,7 @@ namespace DshRelay
             entry["callId"] = GetString(first, "callId");
             entry["state"] = GetString(first, "state");
             entry["eventId"] = "";
-            entry["questions"] = CompactQuestions(first.ContainsKey("questions") ? first["questions"] as List<object> : null);
+            entry["questions"] = CompactQuestions(ListField(first, "questions"));
             return entry;
         }
 
@@ -732,8 +748,8 @@ namespace DshRelay
         {
             if (values == null || !values.ContainsKey("userQuestions")) return null;
             var questions = values["userQuestions"] as Dictionary<string, object>;
-            if (questions == null || !questions.ContainsKey("active")) return null;
-            return questions["active"] as List<object>;
+            if (questions == null) return null;
+            return ListField(questions, "active");
         }
 
         private static bool HasActiveQuestion(Dictionary<string, object> values)
@@ -742,7 +758,7 @@ namespace DshRelay
             if (active == null || active.Count == 0) return false;
             var first = active[0] as Dictionary<string, object>;
             if (first == null) return false;
-            var questions = first.ContainsKey("questions") ? first["questions"] as List<object> : null;
+            var questions = ListField(first, "questions");
             return questions != null && questions.Count > 0;
         }
 
@@ -762,7 +778,7 @@ namespace DshRelay
                 entry["multiSelect"] = GetBool(question, "multiSelect");
 
                 var options = new List<object>();
-                var rawOptions = question.ContainsKey("options") ? question["options"] as List<object> : null;
+                var rawOptions = ListField(question, "options");
                 if (rawOptions != null)
                 {
                     foreach (var rawOption in rawOptions)
@@ -785,6 +801,7 @@ namespace DshRelay
 
         // ---------------------------------------------------------------- 小工具
 
+        /// <summary>一个只含 ok:true 的成功响应。</summary>
         private static Http.Response Ok()
         {
             var result = new Dictionary<string, object>();
@@ -833,6 +850,36 @@ namespace DshRelay
                 current = map[key];
             }
             return current as Dictionary<string, object>;
+        }
+
+        /// <summary>
+        /// 把 JSON 数组字段转成 List&lt;object&gt;。
+        ///
+        /// **必须走这里，不能用 `as List&lt;object&gt;`**：JavaScriptSerializer 把 JSON 数组
+        /// 反序列化成 `object[]`（数组），不是 `List&lt;object&gt;`，`as` 转换会静默得到 null，
+        /// 表现为"接口正常但一条数据都没有"。这个坑在 18 处同时存在过，只在会话列表上
+        /// 暴露出来（其余接口碰巧没被直接调用）。
+        /// </summary>
+        public static List<object> AsList(object value)
+        {
+            if (value == null) return null;
+            var list = value as List<object>;
+            if (list != null) return list;
+            var array = value as object[];
+            if (array != null) return new List<object>(array);
+            // 其它可枚举类型（反序列化器换实现时可能出现）也一并接住。
+            var enumerable = value as System.Collections.IEnumerable;
+            if (enumerable == null || value is string) return null;
+            var converted = new List<object>();
+            foreach (object item in enumerable) converted.Add(item);
+            return converted;
+        }
+
+        /// <summary>从字典里取一个数组字段（字段不存在或类型不对时返回 null）。</summary>
+        public static List<object> ListField(Dictionary<string, object> source, string key)
+        {
+            if (source == null || !source.ContainsKey(key)) return null;
+            return AsList(source[key]);
         }
 
         public static string GetString(Dictionary<string, object> source, string key)

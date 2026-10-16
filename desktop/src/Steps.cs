@@ -98,7 +98,14 @@ namespace DshRelay
                         string existing = Convert.ToString(last["text"]);
                         last["text"] = existing.Length == 0 ? text : existing + "\n\n" + text;
                     }
+                    // tools 是本方法自己创建的 List<object>，不是 JSON 反序列化的结果；
+                    // 但 canAppend 时上一条可能来自别处，取不到就补一个，避免空引用。
                     var list = last["tools"] as List<object>;
+                    if (list == null)
+                    {
+                        list = new List<object>();
+                        last["tools"] = list;
+                    }
                     foreach (string tool in calls)
                     {
                         if (!list.Contains(tool)) list.Add(tool);
@@ -159,15 +166,31 @@ namespace DshRelay
                     pendingAssistant["time"] = RelayServer.GetLong(evt, "time");
 
                     var calls = CallBlocks(content);
+                    if (calls.Count == 0) continue;
+
+                    // 先把助手正文收成一条，再把这次的所有工具调用各排一条。
+                    //
+                    // 早先的写法是在工具循环里取一次 pendingAssistant 就置空，循环到第二个
+                    // 工具时拿到的已是 null，随即 NullReferenceException —— 于是「一条助手
+                    // 消息里调了多个工具」的会话全都读不出来。这里改成循环外取一次。
+                    var assistant = pendingAssistant;
+                    pendingAssistant = null;
+                    var labels = assistant["tools"] as List<object>;
+                    if (labels == null)
+                    {
+                        labels = new List<object>();
+                        assistant["tools"] = labels;
+                    }
                     foreach (var call in calls)
                     {
-                        // 每次工具调用单独成条，排在助手正文之后，顺序与电脑上一致。
-                        var assistant = pendingAssistant;
-                        pendingAssistant = null;
                         string label = ToolLabel(Convert.ToString(call["name"]));
-                        var list = assistant["tools"] as List<object>;
-                        if (!list.Contains(label)) list.Add(label);
-                        steps.Add(assistant);
+                        if (!labels.Contains(label)) labels.Add(label);
+                    }
+                    steps.Add(assistant);
+
+                    foreach (var call in calls)
+                    {
+                        string label = ToolLabel(Convert.ToString(call["name"]));
 
                         var tool = new Dictionary<string, object>();
                         tool["kind"] = "tool";
@@ -256,7 +279,8 @@ namespace DshRelay
             if (data == null) return null;
             var message = data.ContainsKey("message") ? data["message"] as Dictionary<string, object> : null;
             if (message == null) message = data;
-            return message.ContainsKey("content") ? message["content"] as List<object> : null;
+            // 走 AsList：JSON 数组到这里是 object[]，直接 as List<object> 会得到 null。
+            return RelayServer.ListField(message, "content");
         }
 
         /// <summary>
@@ -326,7 +350,7 @@ namespace DshRelay
         {
             var list = new List<object>();
             var meta = data != null && data.ContainsKey("meta") ? data["meta"] as Dictionary<string, object> : null;
-            var diffs = meta != null && meta.ContainsKey("diffs") ? meta["diffs"] as List<object> : null;
+            var diffs = RelayServer.ListField(meta, "diffs");
             if (diffs == null) return list;
             foreach (var raw in diffs)
             {

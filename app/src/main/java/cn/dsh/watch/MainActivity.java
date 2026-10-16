@@ -159,6 +159,12 @@ public class MainActivity extends Activity {
         // 允许从外部带入地址与配对码（例如电脑端生成一条命令让手表直接配对），
         // 省去在手表小键盘上输入 IP 的麻烦。
         applyIntentExtras(getIntent());
+        if (hasPendingPairing()) {
+            // 带参数启动时优先去设置页：已配对过也要允许用新参数覆盖，
+            // 否则 adb 命令对一台配过对的手表完全无效。
+            showConnect();
+            return;
+        }
         if (store.paired()) {
             currentSessionId = store.lastSession();
             if (currentSessionId.isEmpty()) showSessionList();
@@ -166,6 +172,25 @@ public class MainActivity extends Activity {
         } else {
             showConnect();
         }
+    }
+
+    /**
+     * Activity 已存在时再次 `am start` 会走这里，而不是 onCreate。
+     *
+     * 不接住它的话，第二次带参数启动会被完全忽略——表现是「命令执行了但手表没反应」，
+     * 因为旧的 Activity 还在，onCreate 不会再执行。
+     */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        applyIntentExtras(intent);
+        if (hasPendingPairing()) showConnect();
+    }
+
+    /** 当前是否有待用的配对参数（地址与配对码都齐）。 */
+    private boolean hasPendingPairing() {
+        return !pendingHost.isEmpty() && !pendingCode.isEmpty();
     }
 
     /**
@@ -428,7 +453,8 @@ public class MainActivity extends Activity {
                 status.setText(result.error);
                 return;
             }
-            String token = textOf(result.value, "token");            if (token.isEmpty()) {
+            String token = textOf(result.value, "token");
+            if (token.isEmpty()) {
                 status.setTextColor(WatchUi.DANGER);
                 status.setText("配对响应缺少令牌");
                 return;
