@@ -14,7 +14,7 @@ import { createSocket } from 'node:dgram'
 import { networkInterfaces } from 'node:os'
 import { readFileSync, writeFileSync } from 'node:fs'
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
-import { MAX_MESSAGES, normalizeMessages, normalizeSessionList, questionOfSession } from './state.mjs'
+import { MAX_MESSAGES, groupByProject, normalizeMessages, normalizeModelCatalog, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession } from './state.mjs'
 
 const DISCOVERY_PORT = 19391
 const DISCOVERY_INTERVAL_MS = 2_000
@@ -66,9 +66,18 @@ export function newPairingCode() {
   return code
 }
 
+/** 这一批事件里最早的 seq，手表拿它继续往前翻页。 */
+function earliestSeqOf(records) {
+  let earliest = 0
+  for (const record of Array.isArray(records) ? records : []) {
+    const seq = Number(record?.event?.seq ?? 0)
+    if (seq > 0 && (earliest === 0 || seq < earliest)) earliest = seq
+  }
+  return earliest
+}
+
 /** 把提问投影压成手表要的结构（与 state.js 的 questions 形状保持一致）。 */
-function compactQuestions(questions) {
-  return (Array.isArray(questions) ? questions : []).map((entry) => ({
+function compactQuestions(questions) {  return (Array.isArray(questions) ? questions : []).map((entry) => ({
     id: String(entry?.id ?? ''),
     header: typeof entry?.header === 'string' ? entry.header : '',
     question: typeof entry?.question === 'string' ? entry.question : '',
@@ -228,20 +237,22 @@ export class RelayServer {
    *
    * 为什么需要：提问以 waterfall 帧经 $events 长连推送。DSH 会在新客户端接入时重放
    * 所有待处理事件，所以正常情况下中继不会漏；但若长连在提问期间断开过（网络抖动、
-   * DSH 重启），这一条就可能没收到。此时投影又只登记已超时挂起（continued）的问题，
-   * 前台阻塞（open）的提问就会看不见。
+   * DSH 重启），这一条就可能没收到。
    *
-   * 做法：确实一处待答记录都没有、但存在运行中的会话时，重连一次事件流以触发重放。
-   * 加频率限制，避免反复打断长连。
+   * 只在「确实一处待答记录都没有」且「存在运行中的会话」时才考虑重连，并加两道闸：
+   * - 每次重连都会换掉 clientId，正在等待回答的提问会随之失效，因此绝不能频繁触发；
+   * - 把「会话列表里有人标了 waiting」也算作已知有待答问题，避免与它打架。
+   *
+   * 早期版本在这里每 30 秒无脑重连一次，导致日志刷屏、事件流反复断开——不要退回那种写法。
    */
   async reconcilePending(sessions, projectionPending) {
     if (projectionPending.length > 0) return
-    // 事件流里已经记着提问时不重连：重连会换掉 clientId，反而让在途应答失效。
     if (this.pendingEvents.size > 0) return
+    if (sessions.some((session) => session.waiting)) return
     if (!sessions.some((session) => session.running)) return
     if (this.link.clientId === undefined) return
     const now = Date.now()
-    if (now - this.lastReconcileAt < 30_000) return
+    if (now - this.lastReconcileAt < 120_000) return
     this.lastReconcileAt = now
     this.log('未发现待答问题但有会话在运行，重连事件流以触发 DSH 重放待处理事件…')
     this.link.refreshEvents()
@@ -275,12 +286,20 @@ export class RelayServer {
     return [...merged.values()].filter((ask) => ask.questions.length > 0)
   }
 
-  /** 读取会话的消息与元信息（列表页与会话页共用）。 */
-  async readSession(sessionId, running) {
+  /**
+   * 读取会话的消息与元信息（列表页与会话页共用）。
+   * @param {string} sessionId 会话 id
+   * @param {boolean} running 是否正在运行（来自会话列表，投影里没有这个字段）
+   * @param {number} [throughSeq] 从哪个 seq 往前读；省略则读最新
+   */
+  async readSession(sessionId, running, throughSeq) {
     const projection = await this.link.rpc('session/projections', { request: { sessionId } })
-    const asOfSeq = Number(projection?.asOfSeq ?? 0)
+    const latest = Number(projection?.asOfSeq ?? 0)
+    const from = typeof throughSeq === 'number' && Number.isSafeInteger(throughSeq) && throughSeq > 0
+      ? Math.min(throughSeq, latest)
+      : latest
     const page = await this.link.rpc('session/page', {
-      request: { address: { kind: 'session', sessionId }, throughSeq: asOfSeq, maxMessages: MAX_MESSAGES },
+      request: { address: { kind: 'session', sessionId }, throughSeq: from, maxMessages: MAX_MESSAGES },
     })
     const active = projection?.values?.userQuestions?.active
     const first = Array.isArray(active) && active.length > 0 ? active[0] : undefined
@@ -311,15 +330,19 @@ export class RelayServer {
       title: typeof projection?.values?.title === 'string' ? projection.values.title : '',
       running,
       hasMore: page?.hasMore === true,
-      asOfSeq,
+      asOfSeq: latest,
+      fromSeq: from,
+      // beforeSeq 是这一批最早的 seq，手表用它继续往前翻。
+      beforeSeq: earliestSeqOf(page?.records),
       messages: normalizeMessages(page?.records),
+      steps: normalizeSteps(page?.records),
+      usage: normalizeUsage(projection?.values),
       ...(question === undefined ? {} : { question }),
     }
   }
 
   async route(req, res, url) {
     const path = url.pathname
-
     // 无需鉴权：手表用它确认「这是不是 DSH 中继」。
     if (path === '/api/status' && req.method === 'GET') {
       json(res, 200, {
@@ -357,7 +380,13 @@ export class RelayServer {
       const includeSubagents = url.searchParams.get('subagents') === '1'
       const value = await this.link.rpc('session/list', { _request: {} })
       const sessions = normalizeSessionList(value, includeSubagents)
-      json(res, 200, { ok: true, sessions, pending: await this.pendingQuestions(sessions) })
+      json(res, 200, {
+        ok: true,
+        sessions,
+        // 按项目折叠后的视图：手表列表首屏显示项目，点进去看会话。
+        projects: groupByProject(sessions),
+        pending: await this.pendingQuestions(sessions),
+      })
       return
     }
 
@@ -367,10 +396,42 @@ export class RelayServer {
         json(res, 400, { ok: false, error: '缺少 id 参数' })
         return
       }
+      // through 用于往前翻历史；省略即读最新一批。
+      const throughRaw = url.searchParams.get('through') ?? ''
+      const through = throughRaw === '' ? undefined : Number(throughRaw)
       // running 从列表摘要读：projections 里没有这个字段。
       const listed = normalizeSessionList(await this.link.rpcSafe('session/list', { _request: {} }), true)
       const summary = listed.find((item) => item.id === sessionId)
-      json(res, 200, await this.readSession(sessionId, summary?.running === true))
+      json(res, 200, await this.readSession(sessionId, summary?.running === true, through))
+      return
+    }
+
+    if (path === '/api/models' && req.method === 'GET') {
+      const catalog = normalizeModelCatalog(await this.link.rpc('session/modelCatalog', {}))
+      json(res, 200, { ok: true, ...catalog })
+      return
+    }
+
+    if (path === '/api/model' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const sessionId = String(body.sessionId ?? '')
+      const provider = String(body.provider ?? '')
+      const model = String(body.model ?? '')
+      if (sessionId === '' || provider === '' || model === '') {
+        json(res, 400, { ok: false, error: '缺少 sessionId、provider 或 model' })
+        return
+      }
+      // reasoningEffort 可选：不传时由 DSH 用该模型的默认档位。
+      const request = { sessionId, provider, model }
+      if (typeof body.effort === 'string' && body.effort !== '') request.reasoningEffort = body.effort
+      const value = await this.link.rpc('session/selectModel', { request })
+      const selected = value?.selected ?? {}
+      json(res, 200, {
+        ok: true,
+        provider: String(selected.provider ?? provider),
+        model: String(selected.model ?? model),
+        effort: String(selected.reasoningEffort ?? ''),
+      })
       return
     }
 

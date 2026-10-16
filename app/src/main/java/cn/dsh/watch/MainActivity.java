@@ -5,12 +5,15 @@ import android.content.Intent;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.KeyEvent;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.inputmethod.EditorInfo;
 import android.view.inputmethod.InputMethodManager;
 import android.widget.Button;
 import android.widget.EditText;
+import android.widget.FrameLayout;
 import android.widget.LinearLayout;
+import android.widget.ScrollView;
 import android.widget.TextView;
 
 import org.json.JSONArray;
@@ -37,8 +40,21 @@ public class MainActivity extends Activity {
     private Discovery discovery;
 
     private final List<Api.Session> sessions = new ArrayList<>();
+    private final List<Api.Project> projects = new ArrayList<>();
     private final List<Api.Ask> pending = new ArrayList<>();
     private final List<Api.Message> messages = new ArrayList<>();
+    private final List<Api.Step> steps = new ArrayList<>();
+    private Api.Usage usage;
+
+    /** 会话页的展示模式：全部步骤 / 只看对话。 */
+    private boolean showAllSteps = true;
+    /** 当前项目分组（空串表示「全部会话」）。 */
+    private String currentProject = "";
+    /** 翻页：当前这批最早的 seq，以及是否还有更早的历史。 */
+    private long currentBeforeSeq;
+    private boolean currentHasMore;
+    /** 上一次成功渲染的内容指纹，用于避免无变化时重建整屏（闪烁的根因）。 */
+    private int lastContentSignature;
 
     private String currentSessionId = "";
     private String currentSessionTitle = "";
@@ -54,6 +70,16 @@ public class MainActivity extends Activity {
      * 会话页每 4 秒重建一次整屏；若此时用户正在输入，重建会把输入框连同已输入的内容一起丢掉。
      */
     private boolean editing;
+    /**
+     * 用户刚触摸/滚动过的时间戳。
+     *
+     * 自动刷新虽然会保留滚动位置，但「重建整屏」本身就会让正在看的内容跳动一下；
+     * 用户随手一滑时尤其明显。因此在最近一次交互后的静默窗口内跳过刷新，
+     * 让阅读和滑动不被打断。
+     */
+    private long lastInteractionAt;
+    /** 交互后暂停刷新的时长：足够覆盖一次连续滑动。 */
+    private static final long INTERACTION_QUIET_MS = 2_500L;
     /** 下次重建整屏时是否回到顶部。 */
     private boolean resetScrollOnNextRender;
     /** 标记「刚从会话页返回」，用于让会话列表回顶部。 */
@@ -64,8 +90,8 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             if (destroyed || !onSessionPage) return;
-            // 正在输入时跳过本次刷新，避免重建把输入框和已打的内容清掉。
-            if (!editing) loadSession(currentSessionId, true);
+            // 正在输入、或用户刚滑过，就跳过本次刷新，避免重建把界面顶掉。
+            if (!editing && !recentlyTouched()) loadSession(currentSessionId, true);
             refresh.postDelayed(this, SESSION_REFRESH_MS);
         }
     };
@@ -73,10 +99,47 @@ public class MainActivity extends Activity {
         @Override
         public void run() {
             if (destroyed || onSessionPage) return;
-            loadSessions(true);
+            if (!recentlyTouched()) loadSessions(true, false);
             refresh.postDelayed(this, LIST_REFRESH_MS);
         }
     };
+
+    /** 最近是否刚发生过触摸/滚动。 */
+    private boolean recentlyTouched() {
+        return System.currentTimeMillis() - lastInteractionAt < INTERACTION_QUIET_MS;
+    }
+
+    /**
+     * 分发触摸事件时记一笔交互时间，并在这里判定横向手势。
+     *
+     * 手势必须在这一层判定：子层的 ScrollView 会先消费触摸，挂在页面容器上的
+     * 监听器收不到完整的横向滑动，左滑会被当成纵向滚动。
+     */
+    @Override
+    public boolean dispatchTouchEvent(MotionEvent event) {
+        int action = event.getActionMasked();
+        if (action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE
+                || action == MotionEvent.ACTION_UP || action == MotionEvent.ACTION_SCROLL) {
+            lastInteractionAt = System.currentTimeMillis();
+        }
+        // 操作菜单已打开时不做手势判定，避免与面板内的点击冲突。
+        if (!menuOpen && gesture != null && gesture.onTouch(currentPage, event)) {
+            // 横向手势已消费本次事件：补一个取消事件给子视图，避免它们停在按下态。
+            MotionEvent cancel = MotionEvent.obtain(event);
+            cancel.setAction(MotionEvent.ACTION_CANCEL);
+            super.dispatchTouchEvent(cancel);
+            cancel.recycle();
+            return true;
+        }
+        return super.dispatchTouchEvent(event);
+    }
+
+    /** 手势识别器（与设备密度相关，延迟初始化）。 */
+    private WatchUi.HorizontalGesture gesture;
+    /** 当前页面的手势回调持有者。 */
+    private WatchUi.Page currentPage;
+    /** 操作菜单是否打开。 */
+    private boolean menuOpen;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -130,11 +193,28 @@ public class MainActivity extends Activity {
      * 旧页面的滚动位置并还原；确实需要回到顶部时调用 {@link #resetScroll()}。
      */
     private void render(WatchUi.Page page) {
+        currentPage = page;
+        if (gesture == null) {
+            gesture = new WatchUi.HorizontalGesture(getResources().getDisplayMetrics().density);
+        }
         int restore = resetScrollOnNextRender ? 0 : currentScroll();
         resetScrollOnNextRender = false;
         setContentView(page.root);
+        if (pendingScrollToBottom) {
+            pendingScrollToBottom = false;
+            // 等布局完成再滚，否则内容高度还是 0、滚不到底。
+            page.scroll.post(() -> page.scroll.post(page::scrollToBottom));
+            return;
+        }
         page.scroll.post(() -> page.scroll.scrollTo(0, restore));
     }
+
+    /** 下一次渲染后滚到底部（进入会话时用，便于直接看到最新结果）。 */
+    private void scrollToBottomAfterRender() {
+        pendingScrollToBottom = true;
+    }
+
+    private boolean pendingScrollToBottom;
 
     /** 下一次重建时回到顶部（换页时用，避免带着上一页的偏移）。 */
     private void resetScroll() {
@@ -267,6 +347,13 @@ public class MainActivity extends Activity {
 
     // ------------------------------------------------------------ 会话列表页
 
+    /**
+     * 进入会话列表页（首次进入或从别处返回时调用）。
+     *
+     * 这里只负责渲染与安排定时刷新，**不**直接触发列表请求——请求结果回来后会自己
+     * 决定要不要重绘。此前写成「渲染 + 强制请求」，而请求回调又会调用本方法，
+     * 形成每轮都重建整屏的循环，屏幕因此持续上下抽动。
+     */
     private void showSessionList() {
         onSessionPage = false;
         // 从会话页返回时回到列表顶部；列表自身的定时刷新则由 render() 保持位置。
@@ -275,80 +362,198 @@ public class MainActivity extends Activity {
             returningFromSession = false;
         }
         refresh.removeCallbacks(listTicker);
+        renderSessionListPage();
+
+        // 首次进入需要真实数据；已有数据时后台静默刷新即可。
+        if (sessions.isEmpty() && projects.isEmpty()) {
+            loadSessions(false, true);
+        } else {
+            loadSessions(true, false);
+        }
+        refresh.postDelayed(listTicker, LIST_REFRESH_MS);
+    }
+
+    /** 只渲染当前列表页，不发请求、不安排定时器。 */
+    private void renderSessionListPage() {
         WatchUi.Page page = ui.page();
-        ui.heading(page, "DSH 会话", loadingSession ? "正在刷新…" : "点开一个会话继续对话");
+        if (currentProject.isEmpty()) {
+            renderProjectList(page);
+        } else {
+            renderProjectSessions(page);
+        }
+        // 手势：在会话列表里右滑回到项目列表，左滑打开操作菜单。
+        page.setOnSwipeRight(() -> {
+            if (!currentProject.isEmpty()) {
+                currentProject = "";
+                resetScroll();
+                showSessionList();
+            }
+        });
+        page.setOnSwipeLeft(() -> showActionMenu(menuForProjects()));
+        render(page);
+    }
+
+    /** 首屏：按项目分组，点进去看该项目的会话。 */
+    private void renderProjectList(WatchUi.Page page) {
+        ui.heading(page, "项目", loadingSession ? "正在刷新…" : "点一个项目看它的会话");
 
         if (pending.size() > 0) {
-            LinearLayout notice = ui.card();
-            TextView title = ui.text("有 " + pending.size() + " 个问题在等你回答", 13, WatchUi.WARN);
-            notice.addView(title);
-            TextView sub = ui.text("点下面的会话即可回答", 11, WatchUi.MUTED);
-            sub.setPadding(0, ui.dp(5), 0, 0);
-            notice.addView(sub);
-            notice.setOnClickListener(v -> showQuestion(pending.get(0)));
-            notice.setFocusable(true);
-            notice.setClickable(true);
-            ui.add(page, notice, 0, 10);
+            ui.add(page, pendingNotice(), 0, 10);
         }
 
-        if (sessions.isEmpty()) {
-            ui.add(page, ui.text(loadingSession ? "正在载入…" : "没有可显示的会话", 13, WatchUi.MUTED), 0, 10);
+        if (projects.isEmpty()) {
+            ui.add(page, ui.text(loadingSession ? "正在载入…" : "没有可显示的项目", 13, WatchUi.MUTED), 0, 10);
         }
 
-        for (Api.Session session : sessions) {
-            View row = ui.row(session.title, session.subtitle(), () -> showSession(session.id));
-            if (session.waiting) {
-                // 待回答的会话加一个颜色条，扫一眼就能定位。
+        for (Api.Project project : projects) {
+            String subtitle = project.sessions.size() + " 个会话";
+            if (project.waiting > 0) subtitle = "待回答 · " + subtitle;
+            else if (project.running > 0) subtitle = "运行中 · " + subtitle;
+            View row = ui.row(project.project, subtitle + " · " + Api.relativeTime(project.updatedAt), () -> {
+                currentProject = project.project;
+                resetScroll();
+                showSessionList();
+            });
+            if (project.waiting > 0 || project.running > 0) {
                 row.setBackground(ui.surface(WatchUi.SURFACE_HI, 16));
             }
             ui.add(page, row, 0, 7);
         }
 
-        ui.add(page, ui.button("新建会话", false, this::createSession), 4, 7);
-        ui.add(page, ui.button("断开连接", false, () -> {
-            store.clearToken();
-            sessions.clear();
-            pending.clear();
-            showConnect();
-        }), 0, 0);
-        render(page);
-        loadSessions(false);
-        refresh.removeCallbacks(listTicker);
-        refresh.postDelayed(listTicker, LIST_REFRESH_MS);
+        ui.add(page, ui.button("全部会话", false, () -> {
+            currentProject = ALL_SESSIONS;
+            resetScroll();
+            showSessionList();
+        }), 4, 7);
+        ui.add(page, ui.button("新建会话", false, this::createSession), 0, 7);
+        ui.add(page, ui.button("断开连接", false, this::disconnect), 0, 0);
     }
 
-    private void loadSessions(boolean silent) {
+    /** 「全部会话」用一个不与真实项目名冲突的哨兵值表示。 */
+    private static final String ALL_SESSIONS = "\u0000all";
+
+    /** 某个项目下的会话列表。 */
+    private void renderProjectSessions(WatchUi.Page page) {
+        boolean all = ALL_SESSIONS.equals(currentProject);
+        List<Api.Session> visible = new ArrayList<>();
+        if (all) {
+            visible.addAll(sessions);
+        } else {
+            for (Api.Session session : sessions) {
+                if (currentProject.equals(session.project)) visible.add(session);
+            }
+        }
+        String subtitle = all ? "全部 " + visible.size() + " 个" : visible.size() + " 个会话";
+        ui.heading(page, all ? "全部会话" : currentProject, loadingSession ? "正在刷新…" : subtitle);
+
+        if (pending.size() > 0) {
+            ui.add(page, pendingNotice(), 0, 10);
+        }
+
+        if (visible.isEmpty()) {
+            ui.add(page, ui.text("这个项目下没有会话", 13, WatchUi.MUTED), 0, 10);
+        }
+
+        for (Api.Session session : visible) {
+            String info = session.subtitle();
+            if (!session.model.isEmpty()) info = info + " · " + shortModel(session.model);
+            View row = ui.row(session.title, info, () -> showSession(session.id));
+            if (session.waiting) {
+                // 待回答的会话加一个颜色块，扫一眼就能定位。
+                row.setBackground(ui.surface(WatchUi.SURFACE_HI, 16));
+            }
+            ui.add(page, row, 0, 7);
+        }
+
+        ui.add(page, ui.button("返回项目", false, () -> {
+            currentProject = "";
+            resetScroll();
+            showSessionList();
+        }), 4, 7);
+        ui.add(page, ui.button("新建会话", false, this::createSession), 0, 7);
+        ui.add(page, ui.button("断开连接", false, this::disconnect), 0, 0);
+    }
+
+    /** 待答提示卡片，列表页与会话页共用。 */
+    private View pendingNotice() {
+        LinearLayout notice = ui.card();
+        notice.addView(ui.text("有 " + pending.size() + " 个问题在等你回答", 13, WatchUi.WARN));
+        TextView sub = ui.text("点这里直接回答", 11, WatchUi.MUTED);
+        sub.setPadding(0, ui.dp(5), 0, 0);
+        notice.addView(sub);
+        notice.setOnClickListener(v -> showQuestion(pending.get(0)));
+        notice.setFocusable(true);
+        notice.setClickable(true);
+        return notice;
+    }
+
+    private void disconnect() {
+        store.clearToken();
+        sessions.clear();
+        projects.clear();
+        pending.clear();
+        currentProject = "";
+        showConnect();
+    }
+
+    /** 模型名太长，去掉供应商前缀这类冗余部分。 */
+    static String shortModel(String model) {
+        String value = model == null ? "" : model;
+        return value.length() <= 18 ? value : value.substring(0, 18) + "…";
+    }
+
+    private void loadSessions(boolean silent, boolean force) {
         if (!store.paired()) return;
-        loadingSession = true;
+        // 只有首次加载才显示「正在刷新…」；定时刷新时不要改副标题，
+        // 否则文案在「正在刷新…」与正常描述之间来回跳，屏幕看起来就在抽动。
+        if (!silent) loadingSession = true;
         api.get(store.host(), store.port(), "/api/sessions", store.token(), result -> {
             loadingSession = false;
             if (destroyed || onSessionPage) return;
             if (!result.ok) {
+                // 静默刷新失败时保持现有画面：把错误页反复重绘同样会闪。
+                if (silent) return;
                 sessions.clear();
+                projects.clear();
                 pending.clear();
                 showListError(result.error);
                 return;
             }
+            List<Api.Session> loadedSessions = Api.parseSessions(result.value);
+            List<Api.Project> loadedProjects = Api.parseProjects(result.value);
+            List<Api.Ask> loadedPending = Api.parsePending(result.value);
+            int signature = listSignature(loadedSessions, loadedProjects, loadedPending);
+            // 内容没变就不重建：列表页每 10 秒刷新一次，重建会让正在滑的内容跳动。
+            if (silent && !force && signature == lastListSignature) return;
+            lastListSignature = signature;
             sessions.clear();
-            sessions.addAll(Api.parseSessions(result.value));
+            sessions.addAll(loadedSessions);
+            projects.clear();
+            projects.addAll(loadedProjects);
             pending.clear();
-            pending.addAll(Api.parsePending(result.value));
-            // 静默刷新时若内容没变就不重建，避免闪烁与打断滚动。
-            if (!silent || changed()) showSessionList();
+            pending.addAll(loadedPending);
+            // 只重绘列表页，不再走 showSessionList：那条路径会重新发请求，
+            // 与本次回调构成循环，表现为屏幕持续抽动。
+            renderSessionListPage();
         });
     }
 
-    private int lastSignature;
-
-    private boolean changed() {
-        int signature = sessions.size() * 31 + pending.size() * 7;
-        for (Api.Session session : sessions) {
-            signature = signature * 31 + session.id.hashCode() + (session.running ? 1 : 0) + (session.waiting ? 2 : 0);
+    /** 列表页内容指纹：会话、项目、待答问题任一变化都要重绘。 */
+    private int listSignature(List<Api.Session> sessionList, List<Api.Project> projectList, List<Api.Ask> pendingList) {
+        int signature = sessionList.size() * 31 + projectList.size() * 17 + pendingList.size() * 7;
+        for (Api.Session session : sessionList) {
+            signature = signature * 31 + session.id.hashCode()
+                    + (session.running ? 1 : 0) + (session.waiting ? 2 : 0)
+                    + session.title.hashCode();
         }
-        if (signature == lastSignature) return false;
-        lastSignature = signature;
-        return true;
+        for (Api.Project project : projectList) {
+            signature = signature * 31 + project.project.hashCode() + project.sessions.size()
+                    + project.running + project.waiting * 3;
+        }
+        return signature;
     }
+
+    private int lastListSignature;
 
     private void showListError(String error) {
         onSessionPage = false;
@@ -407,7 +612,10 @@ public class MainActivity extends Activity {
         onSessionPage = true;
         editing = false;
         messages.clear();
+        steps.clear();
         currentAsk = null;
+        // 进入会话时自动滚到最新内容，省去手动翻到底部。
+        autoScrollToBottom = true;
         renderSession("正在载入…");
         loadSession(sessionId, false);
         refresh.removeCallbacks(sessionTicker);
@@ -432,27 +640,82 @@ public class MainActivity extends Activity {
                 return;
             }
             List<Api.Message> loaded = Api.parseMessages(result.value);
+            List<Api.Step> loadedSteps = Api.parseSteps(result.value);
+            Api.Usage loadedUsage = Api.parseUsage(result.value);
             currentRunning = result.value.optBoolean("running", false);
             currentAsk = Api.parseQuestion(result.value.optJSONObject("question"), sessionId, currentSessionTitle);
+            currentBeforeSeq = result.value.optLong("beforeSeq", 0L);
+            currentHasMore = result.value.optBoolean("hasMore", false);
             String title = result.value.optString("title", "");
             if (!title.isEmpty()) currentSessionTitle = title;
-            if (!silent || messageSignature(loaded) != messageSignature(messages)) {
-                messages.clear();
-                messages.addAll(loaded);
-                renderSession("");
-            } else if (currentAsk != null || !currentRunning) {
-                // 只有运行状态变化时也刷新一下底部控件。
+
+            // 只在内容真的变了才更新。
+            //
+            // 这里曾经写成「静默刷新时只要状态不是运行中就重建」，结果空闲会话每 4 秒
+            // 整屏重建一次，屏幕上就是持续闪烁。现在改成只替换列表区。
+            int signature = contentSignature(loaded, loadedSteps, loadedUsage);
+            if (silent && signature == lastContentSignature) return;
+            lastContentSignature = signature;
+            messages.clear();
+            messages.addAll(loaded);
+            steps.clear();
+            steps.addAll(loadedSteps);
+            usage = loadedUsage;
+            if (silent) {
+                // 自动刷新：原位更新列表，但副标题（模型/上下文）也要跟着变。
+                refreshSessionContent();
+                updateHeading();
+            } else {
                 renderSession("");
             }
         });
     }
 
-    private int messageSignature(List<Api.Message> list) {
-        int signature = list.size();
-        for (Api.Message message : list) {
+    /** 只更新标题与副标题，不动列表区。 */
+    private void updateHeading() {
+        View root = getWindow().getDecorView().findViewById(android.R.id.content);
+        if (!(root instanceof android.view.ViewGroup)) return;
+        android.view.ViewGroup group = (android.view.ViewGroup) root;
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            if (!(child instanceof android.view.ViewGroup)) continue;
+            android.view.ViewGroup frame = (android.view.ViewGroup) child;
+            for (int j = 0; j < frame.getChildCount(); j++) {
+                View inner = frame.getChildAt(j);
+                if (!(inner instanceof android.widget.ScrollView)) continue;
+                android.view.ViewGroup content = (android.view.ViewGroup) ((android.widget.ScrollView) inner).getChildAt(0);
+                // 标题区的前两个子视图是标题与副标题。
+                for (int k = 0; k < Math.min(2, content.getChildCount()); k++) {
+                    View view = content.getChildAt(k);
+                    if (view instanceof TextView) {
+                        TextView text = (TextView) view;
+                        if (k == 0) text.setText(clipLine(currentSessionTitle, 14));
+                        else text.setText(sessionSubtitle());
+                    }
+                }
+                return;
+            }
+        }
+    }
+
+    /** 画面内容指纹：消息、步骤、用量、运行状态、提问，任一变化都要重绘。 */
+    private int contentSignature(List<Api.Message> messageList, List<Api.Step> stepList, Api.Usage usageValue) {
+        int signature = 17;
+        signature = signature * 31 + messageList.size();
+        for (Api.Message message : messageList) {
             signature = signature * 31 + message.text.hashCode() + message.tools.size();
         }
-        return signature * 31 + (currentRunning ? 1 : 0) + (currentAsk == null ? 0 : 3);
+        signature = signature * 31 + stepList.size();
+        for (Api.Step step : stepList) {
+            signature = signature * 31 + step.status.hashCode() + step.result.hashCode();
+        }
+        signature = signature * 31 + (currentRunning ? 1 : 0);
+        signature = signature * 31 + (currentAsk == null ? 0 : 7);
+        if (usageValue != null) {
+            // 用 int 截断即可：指纹只用来判断「是否变化」，不需要完整数值。
+            signature = signature * 31 + (int) (usageValue.outputTokens + usageValue.pressureTokens);
+        }
+        return signature;
     }
 
     private void renderSessionError(String error) {
@@ -466,17 +729,18 @@ public class MainActivity extends Activity {
     /** 重建会话页。hint 非空时在消息区顶部显示提示文字。 */
     private void renderSession(String hint) {
         WatchUi.Page page = ui.page();
-        ui.heading(page, currentSessionTitle, currentRunning ? "正在运行" : (currentAsk == null ? "空闲" : "等你回答"));
+        contentArea = null;
+        // 标题限制在一行内：圆屏的可视高度有限，长标题折行会把内容挤出屏幕。
+        ui.heading(page, clipLine(currentSessionTitle, 14), sessionSubtitle());
 
         if (!hint.isEmpty()) {
             ui.add(page, ui.text(hint, 12, WatchUi.MUTED), 0, 8);
         }
 
-        // 操作按钮放在消息上方：长对话里用户不必先滚到底部才能发消息。
+        // 操作按钮放在内容上方：长对话里用户不必先滚到底部才能发消息。
         if (currentAsk != null) {
             LinearLayout ask = ui.card();
-            TextView title = ui.text("AI 在等你回答", 13, WatchUi.WARN);
-            ask.addView(title);
+            ask.addView(ui.text("AI 在等你回答", 13, WatchUi.WARN));
             String preview = currentAsk.questions.isEmpty() ? "" : currentAsk.questions.get(0).question;
             if (!preview.isEmpty()) {
                 TextView sub = ui.text(cut(preview, 60), 11, WatchUi.MUTED);
@@ -489,50 +753,827 @@ public class MainActivity extends Activity {
             ui.add(page, ask, 0, 8);
         }
 
+        // 操作入口收敛：左滑打开菜单能拿到全部功能，页面上只保留最常用的两个，
+        // 把屏幕留给内容（之前两排按钮占掉了近一半高度）。
         LinearLayout actions = new LinearLayout(this);
         actions.setOrientation(LinearLayout.HORIZONTAL);
-        Button send = ui.button("发消息", true, this::showCompose);
-        LinearLayout.LayoutParams sendParams = new LinearLayout.LayoutParams(0, -2, 1f);
-        sendParams.setMargins(0, 0, ui.dp(6), 0);
-        actions.addView(send, sendParams);
+        actions.addView(ui.button("发消息", true, this::showCompose), weighted(0));
         View second = currentRunning
                 ? ui.button("停止", false, this::cancelRun)
                 : (currentAsk != null ? ui.button("回答", false, () -> showQuestion(currentAsk)) : ui.button("刷新", false, () -> {
                     renderSession("正在刷新…");
                     loadSession(currentSessionId, false);
                 }));
-        actions.addView(second, new LinearLayout.LayoutParams(0, -2, 1f));
-        ui.add(page, actions, 0, 9);
+        actions.addView(second, weighted(0));
+        ui.add(page, actions, 0, 7);
 
-        if (messages.isEmpty()) {
-            ui.add(page, ui.text("还没有消息", 12, WatchUi.MUTED), 0, 8);
+        // 步骤区放在一个独立容器里：内容变化时可以只换它，不必重建整屏。
+        // 整屏重建会让正在看的内容跳动，这是闪烁与卡顿感的来源。
+        contentArea = new LinearLayout(this);
+        contentArea.setOrientation(LinearLayout.VERTICAL);
+        // 至少占满一屏：否则内容少的时候整页没法滚动，多点几下也翻不动。
+        contentArea.setMinimumHeight(getResources().getDisplayMetrics().heightPixels);
+        ui.add(page, contentArea, 0, 0);
+        fillContent();
+
+        // 历史翻页：手表只拉最近一批，想往前看要点一下。
+        if (currentHasMore) {
+            ui.add(page, ui.button("看更早的内容", false, this::loadOlder), 4, 7);
         }
+        ui.add(page, ui.text("右滑返回 · 左滑菜单", 9, WatchUi.MUTED), 6, 0);
 
-        for (Api.Message message : messages) {
-            if (message.text.trim().isEmpty() && message.tools.isEmpty()) continue;
-            if (!message.text.trim().isEmpty()) {
-                ui.add(page, ui.bubble(cut(message.text, 1200), "user".equals(message.role)), 0, 5);
-            }
-            if (!message.tools.isEmpty()) {
-                ui.add(page, ui.text("用了：" + join(message.tools), 10, WatchUi.MUTED), 0, 7);
-            }
+        // 手势：右滑返回上一级，左滑打开操作菜单。
+        page.setOnSwipeRight(this::backToList);
+        page.setOnSwipeLeft(() -> showActionMenu(menuForSession()));
+        // 进入会话时直接看到最新内容；手动刷新或翻页时不打断当前位置。
+        if (autoScrollToBottom) {
+            autoScrollToBottom = false;
+            scrollToBottomAfterRender();
         }
-
-        if (currentRunning) {
-            ui.add(page, ui.text("AI 正在回复…", 11, WatchUi.MUTED), 0, 8);
-        }
-
-        ui.add(page, ui.button("返回会话列表", false, this::backToList), 6, 0);
         render(page);
     }
 
+    /** 下一次重建会话页时是否自动滚到末尾。 */
+    private boolean autoScrollToBottom;
+
+    /** 菜单项：标题、说明与动作。 */
+    static final class MenuItem {
+        final String title;
+        final String subtitle;
+        final Runnable action;
+
+        MenuItem(String title, String subtitle, Runnable action) {
+            this.title = title;
+            this.subtitle = subtitle;
+            this.action = action;
+        }
+    }
+
+    /** 会话页的操作菜单。 */
+    private List<MenuItem> menuForSession() {
+        List<MenuItem> items = new ArrayList<>();
+        items.add(new MenuItem("发消息", "给这个会话发一条", this::showCompose));
+        if (currentRunning) {
+            items.add(new MenuItem("停止生成", "让 AI 立即停下", this::cancelRun));
+        }
+        if (currentAsk != null) {
+            items.add(new MenuItem("回答问题", "AI 正在等你", () -> showQuestion(currentAsk)));
+        }
+        items.add(new MenuItem(showAllSteps ? "只看对话" : "看全部步骤",
+                showAllSteps ? "隐藏工具调用细节" : "显示每一步工具与结果", () -> {
+            showAllSteps = !showAllSteps;
+            resetScroll();
+            renderSession("");
+        }));
+        items.add(new MenuItem("刷新", "重新拉取最新内容", () -> {
+            renderSession("正在刷新…");
+            loadSession(currentSessionId, false);
+        }));
+        items.add(new MenuItem("用量", "Token 与耗时", this::showUsage));
+        items.add(new MenuItem("模型", "切换模型与推理强度", this::showModelPicker));
+        if (currentHasMore) {
+            items.add(new MenuItem("看更早的内容", "往前翻历史", this::loadOlder));
+        }
+        items.add(new MenuItem("跳到最新", "滚到对话末尾", () -> {
+            scrollToBottomAfterRender();
+            renderSession("");
+        }));
+        items.add(new MenuItem("返回项目", "回到会话列表", this::backToList));
+        return items;
+    }
+
+    /** 项目列表页的操作菜单。 */
+    private List<MenuItem> menuForProjects() {
+        List<MenuItem> items = new ArrayList<>();
+        items.add(new MenuItem("新建会话", "在这台电脑上开一个新会话", this::createSession));
+        items.add(new MenuItem("全部会话", "不按项目分组", () -> {
+            currentProject = ALL_SESSIONS;
+            resetScroll();
+            showSessionList();
+        }));
+        if (!currentProject.isEmpty() && !ALL_SESSIONS.equals(currentProject)) {
+            items.add(new MenuItem("返回项目", "回到项目列表", () -> {
+                currentProject = "";
+                resetScroll();
+                showSessionList();
+            }));
+        }
+        items.add(new MenuItem("刷新", "重新拉取列表", () -> {
+            showSessionList();
+        }));
+        items.add(new MenuItem("断开连接", "清除配对，重新配一次", this::disconnect));
+        return items;
+    }
+
+    /**
+     * 操作菜单。
+     *
+     * 从左侧滑入：整块面板做位移 + 淡入，遮罩同步淡入。手表性能有限，
+     * 用 ViewPropertyAnimator 做短时（180ms）过渡即可，不做复杂转场。
+     */
+    private void showActionMenu(List<MenuItem> items) {
+        if (isFinishing() || destroyed || menuOpen) return;
+        menuOpen = true;
+        final FrameLayout overlay = new FrameLayout(this);
+        overlay.setBackgroundColor(0xB3000000);
+
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setBackground(ui.surface(WatchUi.SURFACE, 18));
+        panel.setPadding(ui.dp(10), ui.dp(10), ui.dp(10), ui.dp(10));
+
+        TextView title = ui.text("操作", 13, WatchUi.FG);
+        title.setTypeface(android.graphics.Typeface.DEFAULT, android.graphics.Typeface.BOLD);
+        panel.addView(title);
+
+        ScrollView scroll = new ScrollView(this);
+        scroll.setVerticalScrollBarEnabled(false);
+        scroll.setOverScrollMode(View.OVER_SCROLL_NEVER);
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        for (MenuItem item : items) {
+            View row = ui.row(item.title, item.subtitle, () -> {
+                dismissMenu(overlay, panel);
+                // 等关闭动画走完再切换页面，避免动画被打断。
+                overlay.postDelayed(item.action, 150);
+            });
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.setMargins(0, ui.dp(6), 0, 0);
+            list.addView(row, params);
+        }
+        scroll.addView(list, new ScrollView.LayoutParams(-1, -2));
+        panel.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        // 面板占屏幕左侧约 78%，留出一点背景提示可以点外面关闭。
+        int panelWidth = Math.round(getResources().getDisplayMetrics().widthPixels * 0.78f);
+        FrameLayout.LayoutParams panelParams = new FrameLayout.LayoutParams(panelWidth, -1, Gravity.START);
+        panelParams.setMargins(ui.dp(6), ui.dp(6), 0, ui.dp(6));
+        overlay.addView(panel, panelParams);
+        overlay.setOnClickListener(v -> dismissMenu(overlay, panel));
+
+        View rootView = getWindow().getDecorView().findViewById(android.R.id.content);
+        if (rootView instanceof android.view.ViewGroup) {
+            ((android.view.ViewGroup) rootView).addView(overlay,
+                    new android.view.ViewGroup.LayoutParams(-1, -1));
+        }
+
+        // 入场：面板从左外侧滑入，遮罩淡入。
+        panel.setTranslationX(-panelWidth);
+        panel.setAlpha(0.6f);
+        overlay.setAlpha(0f);
+        overlay.animate().alpha(1f).setDuration(140).start();
+        panel.animate().translationX(0f).alpha(1f).setDuration(180).start();
+    }
+
+    /** 关闭菜单：面板滑出、遮罩淡出，结束后移除视图。 */
+    private void dismissMenu(final View overlay, final View panel) {
+        if (overlay.getParent() == null) {
+            menuOpen = false;
+            return;
+        }
+        panel.animate().translationX(-panel.getWidth()).alpha(0.6f).setDuration(150).start();
+        overlay.animate().alpha(0f).setDuration(150).withEndAction(() -> {
+            android.view.ViewGroup parent = (android.view.ViewGroup) overlay.getParent();
+            if (parent != null) parent.removeView(overlay);
+            menuOpen = false;
+        }).start();
+    }
+
+    /** 步骤列表的容器；非空时表示当前屏幕上已有可原位更新的列表。 */
+    private LinearLayout contentArea;
+
+    /** 往内容区填充步骤（或只看对话时的消息）。 */
+    private void fillContent() {
+        if (contentArea == null) return;
+        contentArea.removeAllViews();
+        if (showAllSteps) {
+            renderSteps(contentArea);
+        } else {
+            renderMessagesOnly(contentArea);
+        }
+        if (currentRunning) {
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.setMargins(0, ui.dp(2), 0, ui.dp(8));
+            contentArea.addView(ui.text("AI 正在处理…", 11, WatchUi.MUTED), params);
+        }
+    }
+
+    /**
+     * 内容变化时只更新列表区。
+     *
+     * 刷新（自动或手动）走这里而不是重建整屏：标题、按钮、滚动位置全部原样保留，
+     * 用户看到的是内容增长而不是整页闪一下。
+     */
+    private void refreshSessionContent() {
+        if (contentArea == null || contentArea.getParent() == null) {
+            renderSession("");
+            return;
+        }
+        fillContent();
+    }
+
+    /** 会话页副标题：状态 + 当前模型 + 上下文占用。 */
+    private String sessionSubtitle() {
+        StringBuilder builder = new StringBuilder();
+        if (currentRunning) builder.append("正在运行");
+        else if (currentAsk != null) builder.append("等你回答");
+        else builder.append("空闲");
+        if (usage != null && usage.contextWindow > 0) {
+            builder.append(" · 上下文 ").append(usage.percent).append("%");
+        }
+        return builder.toString();
+    }
+
+    private LinearLayout.LayoutParams weighted(int rightDp) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(0, -2, 1f);
+        params.setMargins(0, 0, ui.dp(rightDp), 0);
+        return params;
+    }
+
+    /**
+     * 按电脑上的观感逐条列出：消息、工具调用、工具结果。
+     *
+     * 工具调用默认折叠成一行（工具名 + 状态 + 参数摘要），点开才看结果；
+     * 连续多个工具调用合并成一组，点一次可以整组展开。这样长对话里
+     * 关键的文字回复不会被几十条工具记录淹没。
+     */
+    private void renderSteps(LinearLayout container) {
+        if (steps.isEmpty()) {
+            container.addView(ui.text("还没有内容", 12, WatchUi.MUTED));
+            return;
+        }
+        int index = 0;
+        int i = 0;
+        while (i < steps.size()) {
+            Api.Step step = steps.get(i);
+
+            if ("tool".equals(step.kind)) {
+                // 收集连续的若干条工具调用，作为一个可折叠的组。
+                int end = i;
+                while (end < steps.size() && "tool".equals(steps.get(end).kind)) end += 1;
+                List<Api.Step> group = new ArrayList<>(steps.subList(i, end));
+                index += group.size();
+                addTo(container, toolGroup(group), 0, 6);
+                i = end;
+                continue;
+            }
+
+            index += 1;
+            i += 1;
+            if (step.text.trim().isEmpty()) continue;
+            addTo(container, stepLabel(step, index), 0, 3);
+            addTo(container, messageBubble(step), 0, 6);
+        }
+    }
+
+    /** 正文气泡：按 Markdown 渲染，用户消息用强调色。 */
+    private View messageBubble(Api.Step step) {
+        boolean user = "user".equals(step.role);
+        CharSequence rendered = Markdown.render(cut(step.text, 2400),
+                user ? WatchUi.ON_ACCENT : WatchUi.FG,
+                user ? WatchUi.ON_ACCENT : WatchUi.ACCENT,
+                user ? WatchUi.ON_ACCENT : WatchUi.MUTED,
+                WatchUi.SURFACE_HI);
+        return ui.bubbleRich(rendered, user);
+    }
+
+    /**
+     * 一组工具调用的折叠卡片。
+     *
+     * 折叠态只显示「N 次工具调用」与涉及的工具名；展开后逐条列出参数与结果。
+     * 单条时标题直接用工具名，读起来更自然。
+     */
+    private View toolGroup(List<Api.Step> group) {
+        LinearLayout card = ui.card();
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        boolean anyError = false;
+        boolean anyRunning = false;
+        StringBuilder labels = new StringBuilder();
+        for (Api.Step step : group) {
+            if (step.isError) anyError = true;
+            if ("running".equals(step.status)) anyRunning = true;
+            String label = step.label.isEmpty() ? "工具" : step.label;
+            if (labels.indexOf(label) < 0) {
+                if (labels.length() > 0) labels.append('、');
+                labels.append(label);
+            }
+        }
+        header.addView(ui.chip(anyRunning ? "进行中" : (anyError ? "有失败" : "完成"),
+                anyRunning ? WatchUi.WARN : (anyError ? WatchUi.DANGER : WatchUi.OK)));
+        header.addView(ui.text(" " + labels, 12, WatchUi.FG));
+        card.addView(header);
+
+        // 折叠态的一行摘要：第一条的参数或结果。
+        String summary = summaryOf(group);
+        TextView summaryView = ui.text(summary, 11, WatchUi.MUTED);
+        summaryView.setPadding(0, ui.dp(6), 0, 0);
+        summaryView.setMaxLines(2);
+        summaryView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        card.addView(summaryView);
+
+        // 展开后的明细容器：默认隐藏，点标题展开。
+        LinearLayout details = new LinearLayout(this);
+        details.setOrientation(LinearLayout.VERTICAL);
+        details.setVisibility(View.GONE);
+        for (Api.Step step : group) {
+            addTo(details, toolDetail(step), 6, 0);
+        }
+        card.addView(details);
+
+        TextView toggle = ui.text(group.size() > 1 ? "展开 " + group.size() + " 项 ▾" : "展开 ▾", 10, WatchUi.ACCENT);
+        toggle.setPadding(0, ui.dp(6), 0, 0);
+        card.addView(toggle);
+
+        setCollapsed(card, details, toggle, summaryView, true, group.size());
+        card.setOnClickListener(v -> {
+            boolean collapsed = details.getVisibility() != View.VISIBLE;
+            setCollapsed(card, details, toggle, summaryView, collapsed, group.size());
+        });
+        card.setFocusable(true);
+        card.setClickable(true);
+        return card;
+    }
+
+    /**
+     * 切换折叠状态。
+     *
+     * 展开时隐藏摘要（明细里已有全部信息），折叠时恢复；动画用 alpha + 高度渐显，
+     * 手表上不宜做复杂转场。
+     */
+    private void setCollapsed(View card, View details, TextView toggle, View summary,
+                              boolean collapsed, int count) {
+        if (collapsed) {
+            animateCollapse(details);
+            summary.setVisibility(View.VISIBLE);
+            toggle.setText(count > 1 ? "展开 " + count + " 项 ▾" : "展开 ▾");
+        } else {
+            summary.setVisibility(View.GONE);
+            animateExpand(details);
+            toggle.setText("收起 ▴");
+        }
+    }
+
+    /** 展开：先可见再淡入，避免突兀。 */
+    private void animateExpand(View details) {
+        details.setVisibility(View.VISIBLE);
+        details.setAlpha(0f);
+        details.animate().alpha(1f).setDuration(140).start();
+    }
+
+    /** 收起：淡出后隐藏。 */
+    private void animateCollapse(View details) {
+        if (details.getVisibility() != View.VISIBLE) return;
+        details.animate().alpha(0f).setDuration(110).withEndAction(() -> {
+            details.setVisibility(View.GONE);
+            details.setAlpha(1f);
+        }).start();
+    }
+
+    /** 折叠态摘要：优先显示第一条的参数，没有就显示结果首行。 */
+    private String summaryOf(List<Api.Step> group) {
+        for (Api.Step step : group) {
+            if (!step.detail.isEmpty()) return shortenPaths(step.detail);
+        }
+        for (Api.Step step : group) {
+            if (!step.result.isEmpty()) return firstLine(step.result);
+        }
+        return "";
+    }
+
+    /** 取首行并压短，用于折叠摘要。 */
+    private static String firstLine(String text) {
+        String value = text == null ? "" : text.trim();
+        int end = value.indexOf('\n');
+        if (end > 0) value = value.substring(0, end);
+        if (value.length() > 90) value = value.substring(0, 90) + "…";
+        return value;
+    }
+
+    /** 展开后的一条工具明细：参数、改动文件、结果。 */
+    private View toolDetail(Api.Step step) {
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setPadding(ui.dp(2), 0, 0, 0);
+
+        TextView name = ui.text("· " + (step.label.isEmpty() ? "工具" : step.label)
+                + (step.name.isEmpty() ? "" : "（" + step.name + "）"), 11, WatchUi.FG);
+        box.addView(name);
+
+        if (!step.detail.isEmpty()) {
+            addTo(box, ui.text(shortenPaths(step.detail), 10, WatchUi.MUTED), 4, 0);
+        }
+        if (!step.files.isEmpty()) {
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < step.files.size() && i < 6; i++) {
+                if (i > 0) builder.append('\n');
+                builder.append("· ").append(shortPath(step.files.get(i)));
+            }
+            if (step.files.size() > 6) builder.append("\n· 等 ").append(step.files.size()).append(" 个文件");
+            addTo(box, ui.text(builder.toString(), 10, WatchUi.ACCENT), 4, 0);
+        }
+        if (!step.result.isEmpty()) {
+            // 结果常是 Markdown（很多工具输出本身就是 .md 内容），一并渲染。
+            CharSequence rendered = Markdown.render(cut(shortenPaths(step.result), 2000),
+                    step.isError ? WatchUi.DANGER : WatchUi.MUTED,
+                    WatchUi.ACCENT, WatchUi.MUTED, WatchUi.SURFACE_HI);
+            TextView result = ui.text(rendered, 10, step.isError ? WatchUi.DANGER : WatchUi.MUTED);
+            addTo(box, result, 4, 0);
+        }
+        return box;
+    }
+
+    /** 往任意容器里加视图（ui.add 只支持整页，这里给列表局部更新用）。 */
+    private void addTo(LinearLayout container, View view, int top, int bottom) {
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+        params.setMargins(0, ui.dp(top), 0, ui.dp(bottom));
+        container.addView(view, params);
+    }
+
+    /** 步骤小标题：区分「你」和「AI」，并标出步号。 */
+    private TextView stepLabel(Api.Step step, int index) {
+        boolean user = "user".equals(step.role);
+        TextView label = ui.text((user ? "你" : "AI") + " · 第 " + index + " 步", 10,
+                user ? WatchUi.ACCENT : WatchUi.MUTED);
+        return label;
+    }
+
+    /**
+     * 一次工具调用的卡片。
+     *
+     * 电脑上的观感是「工具名 + 参数摘要 + 结果」；手表上保留这三样，
+     * 并给改动的文件单独列一行，让用户知道动了哪些文件。
+     */
+    private View toolCard(Api.Step step) {
+        LinearLayout card = ui.card();
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.addView(ui.chip(statusMark(step), statusColor(step)));
+        TextView name = ui.text(" " + (step.label.isEmpty() ? "工具" : step.label), 12, WatchUi.FG);
+        header.addView(name);
+        card.addView(header);
+
+        if (!step.detail.isEmpty()) {
+            // 参数摘要里常见完整路径；圆屏放不下，先压短再截断。
+            TextView detail = ui.text(cut(shortenPaths(step.detail), 160), 11, WatchUi.MUTED);
+            detail.setPadding(0, ui.dp(6), 0, 0);
+            card.addView(detail);
+        }
+
+        if (!step.files.isEmpty()) {
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < step.files.size() && i < 4; i++) {
+                if (i > 0) builder.append('\n');
+                builder.append("· ").append(shortPath(step.files.get(i)));
+            }
+            if (step.files.size() > 4) builder.append("\n· 等 ").append(step.files.size()).append(" 个文件");
+            TextView files = ui.text(builder.toString(), 10, WatchUi.ACCENT);
+            files.setPadding(0, ui.dp(6), 0, 0);
+            card.addView(files);
+        }
+
+        if (!step.result.isEmpty()) {
+            TextView result = ui.text(cut(shortenPaths(step.result), 260), 10,
+                    step.isError ? WatchUi.DANGER : WatchUi.MUTED);
+            result.setPadding(0, ui.dp(6), 0, 0);
+            card.addView(result);
+        }
+        // 点整张卡片看完整结果。
+        card.setOnClickListener(v -> showStepDetail(step));
+        card.setFocusable(true);
+        card.setClickable(true);
+        return card;
+    }
+
+    private String statusMark(Api.Step step) {
+        if ("running".equals(step.status)) return "进行中";
+        if (step.isError || "error".equals(step.status)) return "失败";
+        return "完成";
+    }
+
+    private int statusColor(Api.Step step) {
+        if ("running".equals(step.status)) return WatchUi.WARN;
+        if (step.isError || "error".equals(step.status)) return WatchUi.DANGER;
+        return WatchUi.OK;
+    }
+
+    /** 一条工具调用的完整信息，供点开查看。 */
+    private void showStepDetail(Api.Step step) {
+        onSessionPage = true;
+        editing = true;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, step.label.isEmpty() ? "工具" : step.label, statusMark(step));
+        if (!step.name.isEmpty()) {
+            ui.add(page, ui.text("内部名：" + step.name, 11, WatchUi.MUTED), 0, 8);
+        }
+        if (!step.detail.isEmpty()) {
+            ui.add(page, ui.text("调用参数", 11, WatchUi.ACCENT), 0, 4);
+            ui.add(page, ui.bubble(step.detail, false), 0, 10);
+        }
+        if (!step.files.isEmpty()) {
+            ui.add(page, ui.text("改动的文件", 11, WatchUi.ACCENT), 0, 4);
+            ui.add(page, ui.bubble(join(step.files), false), 0, 10);
+        }
+        ui.add(page, ui.text("结果", 11, WatchUi.ACCENT), 0, 4);
+        ui.add(page, ui.bubble(step.result.isEmpty() ? "（还在执行）" : step.result, false), 0, 10);
+        ui.add(page, ui.button("返回会话", true, () -> {
+            editing = false;
+            renderSession("");
+        }), 0, 0);
+        render(page);
+    }
+
+    /** 只看对话（不显示工具步骤）。 */
+    private void renderMessagesOnly(LinearLayout container) {
+        if (messages.isEmpty()) {
+            container.addView(ui.text("还没有对话", 12, WatchUi.MUTED));
+            return;
+        }
+        for (Api.Message message : messages) {
+            if (message.text.trim().isEmpty()) continue;
+            Api.Step step = new Api.Step();
+            step.role = message.role;
+            step.text = message.text;
+            addTo(container, messageBubble(step), 0, 6);
+        }
+    }
+
+    /** 往前翻一页历史。 */
+    private void loadOlder() {
+        if (currentBeforeSeq <= 1) {
+            renderSession("已经是最早的内容了");
+            return;
+        }
+        long through = currentBeforeSeq - 1;
+        renderSession("正在读取更早的内容…");
+        api.get(store.host(), store.port(),
+                "/api/session?id=" + Api.urlEncode(currentSessionId) + "&through=" + through,
+                store.token(), result -> {
+                    if (destroyed || !onSessionPage) return;
+                    if (!result.ok) {
+                        renderSession("读取失败：" + result.error);
+                        return;
+                    }
+                    List<Api.Step> older = Api.parseSteps(result.value);
+                    if (older.isEmpty()) {
+                        currentHasMore = false;
+                        renderSession("已经是最早的内容了");
+                        return;
+                    }
+                    // 把更早的步骤接到当前列表前面，用户往回翻就能看到。
+                    List<Api.Step> merged = new ArrayList<>(older);
+                    merged.addAll(steps);
+                    steps.clear();
+                    steps.addAll(merged);
+                    currentBeforeSeq = result.value.optLong("beforeSeq", 0L);
+                    currentHasMore = result.value.optBoolean("hasMore", false);
+                    lastContentSignature = 0;
+                    renderSession("已载入更早的 " + older.size() + " 个步骤");
+                });
+    }
+
+    /** 返回时把内容指纹清掉，强制下次进入重新渲染。 */
     private void backToList() {
         onSessionPage = false;
         editing = false;
         returningFromSession = true;
+        lastContentSignature = 0;
         refresh.removeCallbacks(sessionTicker);
         store.setLastSession("");
         showSessionList();
+    }
+
+    // ---------------------------------------------------------- 用量与模型
+
+    /** 用量页：token 消耗、上下文占用、耗时统计。 */
+    private void showUsage() {
+        onSessionPage = true;
+        editing = true;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "用量", currentSessionTitle);
+
+        if (usage == null) {
+            ui.add(page, ui.text("还没有用量数据（本会话尚未产生回复）", 12, WatchUi.MUTED), 0, 10);
+        } else {
+            LinearLayout tokens = ui.card();
+            tokens.addView(ui.text("Token 消耗", 12, WatchUi.ACCENT));
+            tokens.addView(usageRow("输入（未命中缓存）", formatTokens(usage.inputTokens)));
+            tokens.addView(usageRow("输出", formatTokens(usage.outputTokens)));
+            tokens.addView(usageRow("缓存读取", formatTokens(usage.cacheReadTokens)));
+            if (usage.cacheWriteTokens > 0) {
+                tokens.addView(usageRow("缓存写入", formatTokens(usage.cacheWriteTokens)));
+            }
+            ui.add(page, tokens, 0, 9);
+
+            LinearLayout context = ui.card();
+            context.addView(ui.text("上下文占用", 12, WatchUi.ACCENT));
+            context.addView(usageRow("已使用", formatTokens(usage.pressureTokens) + " / " + formatTokens(usage.contextWindow)));
+            context.addView(usageRow("占比", usage.percent + "%"));
+            context.addView(usageRow("系统提示", formatTokens(usage.systemTokens)));
+            context.addView(usageRow("工具定义", formatTokens(usage.toolsTokens)));
+            context.addView(usageRow("对话消息", formatTokens(usage.messageTokens)));
+            ui.add(page, context, 0, 9);
+
+            LinearLayout speed = ui.card();
+            speed.addView(ui.text("运行统计", 12, WatchUi.ACCENT));
+            speed.addView(usageRow("轮次 / 步数", usage.turns + " / " + usage.steps));
+            speed.addView(usageRow("模型耗时", formatDuration(usage.llmMs)));
+            speed.addView(usageRow("工具耗时", formatDuration(usage.toolMs)));
+            speed.addView(usageRow("首字延迟", formatDuration(usage.ttftMs)));
+            if (!usage.model.isEmpty()) {
+                speed.addView(usageRow("模型", usage.provider + "/" + usage.model));
+            }
+            if (!usage.effort.isEmpty()) {
+                speed.addView(usageRow("推理强度", effortName(usage.effort)));
+            }
+            ui.add(page, speed, 0, 9);
+        }
+
+        ui.add(page, ui.button("返回会话", true, () -> {
+            editing = false;
+            renderSession("");
+        }), 0, 0);
+        render(page);
+    }
+
+    /** 用量表里的一行：左标签右数值。 */
+    private View usageRow(String label, String value) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setPadding(0, ui.dp(4), 0, 0);
+        TextView left = ui.text(label, 11, WatchUi.MUTED);
+        row.addView(left, new LinearLayout.LayoutParams(0, -2, 1f));
+        TextView right = ui.text(value, 11, WatchUi.FG);
+        row.addView(right, new LinearLayout.LayoutParams(-2, -2));
+        return row;
+    }
+
+    /** 大数字用 k/M 简写，手表上放不下完整数字。 */
+    static String formatTokens(long value) {
+        if (value < 1000) return String.valueOf(value);
+        if (value < 1_000_000) {
+            double k = value / 1000.0;
+            return (k >= 100 ? String.valueOf(Math.round(k)) : String.format(java.util.Locale.US, "%.1f", k)) + "k";
+        }
+        double m = value / 1_000_000.0;
+        return String.format(java.util.Locale.US, "%.2f", m) + "M";
+    }
+
+    /** 毫秒转「1.2 秒」「3 分 5 秒」这类可读形式。 */
+    static String formatDuration(long ms) {
+        if (ms <= 0) return "—";
+        if (ms < 1000) return ms + " 毫秒";
+        if (ms < 60_000) return String.format(java.util.Locale.US, "%.1f", ms / 1000.0) + " 秒";
+        long totalSeconds = Math.round(ms / 1000.0);
+        return (totalSeconds / 60) + " 分 " + (totalSeconds % 60) + " 秒";
+    }
+
+    /** 推理档位的中文名。 */
+    static String effortName(String effort) {
+        switch (effort) {
+            case "off": return "关闭";
+            case "low": return "低";
+            case "medium": return "中";
+            case "high": return "高";
+            case "xhigh": return "很高";
+            case "max": return "最高";
+            default: return effort;
+        }
+    }
+
+    /** 模型选择页：先选供应商，再选模型，最后选推理档位。 */
+    private void showModelPicker() {
+        onSessionPage = true;
+        editing = true;
+        modelProviders.clear();
+        renderModelLoading();
+        api.get(store.host(), store.port(), "/api/models", store.token(), result -> {
+            if (destroyed) return;
+            if (!result.ok) {
+                renderModelError(result.error);
+                return;
+            }
+            modelProviders.addAll(Api.parseModels(result.value));
+            if (modelProviders.isEmpty()) {
+                renderModelError("电脑上没有可用的模型");
+                return;
+            }
+            renderProviderPicker(0);
+        });
+    }
+
+    private final List<Api.ProviderInfo> modelProviders = new ArrayList<>();
+
+    private void renderModelLoading() {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "选择模型", "正在读取…");
+        ui.add(page, ui.text("从电脑获取可用模型列表", 12, WatchUi.MUTED), 0, 0);
+        render(page);
+    }
+
+    private void renderModelError(String error) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "选择模型", "");
+        ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
+        ui.add(page, ui.button("返回会话", true, () -> {
+            editing = false;
+            renderSession("");
+        }), 0, 0);
+        render(page);
+    }
+
+    /** 第一步：列出供应商。 */
+    private void renderProviderPicker(int scrollTo) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "选择模型", "第 1 步：选供应商");
+        for (Api.ProviderInfo provider : modelProviders) {
+            String subtitle = provider.models.size() + " 个模型";
+            if (usage != null && provider.provider.equals(usage.provider)) subtitle = "当前 · " + subtitle;
+            ui.add(page, ui.row(provider.name, subtitle, () -> renderModelList(provider, 0)), 0, 7);
+        }
+        ui.add(page, ui.button("返回会话", false, () -> {
+            editing = false;
+            renderSession("");
+        }), 4, 0);
+        render(page);
+        page.scroll.post(() -> page.scroll.scrollTo(0, scrollTo));
+    }
+
+    /** 第二步：列出该供应商的模型。 */
+    private void renderModelList(Api.ProviderInfo provider, int scrollTo) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, provider.name, "第 2 步：选模型");
+        for (Api.ModelInfo model : provider.models) {
+            String subtitle = model.efforts.isEmpty() ? "" : "推理强度 " + model.efforts.size() + " 档";
+            if (usage != null && model.id.equals(usage.model)) subtitle = "当前使用" + (subtitle.isEmpty() ? "" : " · " + subtitle);
+            ui.add(page, ui.row(model.name, subtitle, () -> {
+                if (model.efforts.isEmpty()) {
+                    applyModel(provider.provider, model.id, "");
+                } else {
+                    renderEffortPicker(provider, model, 0);
+                }
+            }), 0, 7);
+        }
+        ui.add(page, ui.button("返回供应商", false, () -> renderProviderPicker(0)), 4, 0);
+        render(page);
+        page.scroll.post(() -> page.scroll.scrollTo(0, scrollTo));
+    }
+
+    /** 第三步：选推理档位。 */
+    private void renderEffortPicker(Api.ProviderInfo provider, Api.ModelInfo model, int scrollTo) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, model.name, "第 3 步：选推理强度");
+        for (String effort : model.efforts) {
+            String subtitle = usage != null && effort.equals(usage.effort) ? "当前" : "";
+            ui.add(page, ui.row(effortName(effort), subtitle, () -> applyModel(provider.provider, model.id, effort)), 0, 7);
+        }
+        ui.add(page, ui.button("返回模型", false, () -> renderModelList(provider, 0)), 4, 0);
+        render(page);
+        page.scroll.post(() -> page.scroll.scrollTo(0, scrollTo));
+    }
+
+    /** 提交模型切换。 */
+    private void applyModel(String provider, String model, String effort) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "切换中…", provider + "/" + model);
+        ui.add(page, ui.text("正在通知电脑切换模型", 12, WatchUi.MUTED), 0, 0);
+        render(page);
+
+        JSONObject body = new JSONObject();
+        try {
+            body.put("sessionId", currentSessionId);
+            body.put("provider", provider);
+            body.put("model", model);
+            if (!effort.isEmpty()) body.put("effort", effort);
+        } catch (Exception ignored) {
+            // 都是字符串，不会失败
+        }
+
+        api.post(store.host(), store.port(), "/api/model", store.token(), body, result -> {
+            if (destroyed) return;
+            if (!result.ok) {
+                WatchUi.Page failed = ui.page();
+                ui.heading(failed, "切换失败", "");
+                ui.add(failed, ui.text(result.error, 12, WatchUi.DANGER), 0, 12);
+                ui.add(failed, ui.button("返回会话", true, () -> {
+                    editing = false;
+                    renderSession("");
+                }), 0, 0);
+                render(failed);
+                return;
+            }
+            // 本地立刻反映新模型，随后拉一次会话以同步用量里的模型信息。
+            if (usage != null) {
+                usage.provider = result.value.optString("provider", provider);
+                usage.model = result.value.optString("model", model);
+                usage.effort = result.value.optString("effort", effort);
+            }
+            editing = false;
+            lastContentSignature = 0;
+            renderSession("已切换到 " + model);
+            loadSession(currentSessionId, true);
+        });
     }
 
     private void cancelRun() {
@@ -819,11 +1860,63 @@ public class MainActivity extends Activity {
         return builder.toString();
     }
 
-    /** 手表上长文本会拖垮滚动体验，截断并省略。 */
+    /** 手表上长文本会拖垮滚动体验，截断并省略（可折行，用于正文）。 */
     private static String cut(String text, int limit) {
         String value = text == null ? "" : text.trim();
         if (value.length() <= limit) return value;
         return value.substring(0, limit) + "\n…（已省略）";
+    }
+
+    /**
+     * 单行截断（不插入换行，用于标题）。
+     *
+     * 标题必须保持一行：圆屏可视高度有限，标题折成两行就会把内容区挤掉。
+     */
+    static String clipLine(String text, int limit) {
+        String value = text == null ? "" : text.trim();
+        if (value.length() <= limit) return value;
+        return value.substring(0, limit) + "…";
+    }
+
+    /**
+     * 路径只保留最后两段。
+     *
+     * 手表上放不下 `D:\桌面\项目‘\手表dsh\app\src\main\java\...\MainActivity.java`，
+     * 但只留文件名又分不清同名文件，所以保留「父目录/文件名」。
+     */
+    static String shortPath(String path) {
+        if (path == null || path.trim().isEmpty()) return "";
+        String normalized = path.replace('/', '\\');
+        String[] parts = normalized.split("\\\\");
+        List<String> kept = new ArrayList<>();
+        for (String part : parts) {
+            if (!part.isEmpty()) kept.add(part);
+        }
+        if (kept.size() <= 2) return normalized;
+        return kept.get(kept.size() - 2) + "\\" + kept.get(kept.size() - 1);
+    }
+
+    /**
+     * 把一段文本里出现的长路径整体压短。
+     *
+     * 工具参数摘要常是「C:\Users\...\src\main\java\...\MainActivity.java」这种长串，
+     * 在 233dp 宽的圆屏上会占满整屏。这里按空白切分，逐段把像路径的部分压成末两段。
+     */
+    static String shortenPaths(String text) {
+        if (text == null || text.isEmpty()) return "";
+        String[] words = text.split(" ");
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < words.length; i++) {
+            String word = words[i];
+            if (i > 0) builder.append(' ');
+            // 只有含反斜杠且足够长的词才当路径处理，避免动到普通文本。
+            if (word.length() > 24 && word.indexOf('\\') >= 0) {
+                builder.append(shortPath(word));
+            } else {
+                builder.append(word);
+            }
+        }
+        return builder.toString();
     }
 
     @Override

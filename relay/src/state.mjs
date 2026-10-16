@@ -189,8 +189,10 @@ export function normalizeSessionList(value, includeSubagents = false) {
     const origin = String(item?.origin ?? '')
     const isSubagent = origin === SUBAGENT_ORIGIN
     if (isSubagent && !includeSubagents) continue
-    const title = item?.projections?.values?.title
+    const values = item?.projections?.values ?? {}
+    const title = values.title
     const cwd = typeof item?.cwd === 'string' ? item.cwd : ''
+    const model = values.modelSelection?.next ?? values.modelSelection?.lastUsed
     sessions.push({
       id: String(item?.sessionId ?? ''),
       // 空标题的会话用工作目录名兜底，手表上至少能区分。
@@ -202,8 +204,309 @@ export function normalizeSessionList(value, includeSubagents = false) {
       seq: Number(item?.projections?.asOfSeq ?? 0),
       subagent: isSubagent,
       cwd,
+      // 项目分组用：取工作目录的最后一段作为组名，根目录会话归到「未分组」。
+      project: projectNameOf(cwd),
+      projectPath: cwd,
+      provider: typeof model?.provider === 'string' ? model.provider : '',
+      model: typeof model?.model === 'string' ? model.model : '',
+      effort: typeof model?.reasoningEffort === 'string' ? model.reasoningEffort : '',
     })
   }
   sessions.sort((a, b) => b.updatedAt - a.updatedAt)
   return sessions.slice(0, MAX_SESSIONS)
+}
+
+/**
+ * 项目的显示名。
+ *
+ * 手表屏幕上放不下完整路径，用最后一段目录名即可区分；但会话直接开在盘符或
+ * 用户主目录时最后一段没有信息量（如 `D:\`），这时退回完整路径。
+ */
+export function projectNameOf(cwd) {
+  if (typeof cwd !== 'string' || cwd.trim() === '') return '未分组'
+  const parts = cwd.split(/[\\/]+/).filter((part) => part !== '')
+  const last = parts[parts.length - 1] ?? ''
+  // 「D:」「C:」这类盘符根目录没有可读名称。
+  if (last === '' || last.endsWith(':')) return cwd
+  return last
+}
+
+/** 会话内每一步的展示条目：用户消息、助手回复、工具调用。 */
+const STEP_KINDS = {
+  message: 'message',
+  tool: 'tool',
+}
+
+/**
+ * 把会话事件压成「步骤」序列，尽量还原电脑上的观感。
+ *
+ * 与 normalizeMessages 的区别：这里保留工具调用与它的结果，并尽量抽出
+ * 可读的参数摘要（命令、文件路径）和结果开头，让手表能按步展示。
+ * @param {Array<object>} records `session/page` 的 records
+ * @param {number} [maxText] 单条文本上限
+ */
+export function normalizeSteps(records, maxText = 1_200) {
+  const steps = []
+  /** callId → 已生成的工具条目，便于把结果挂回去。 */
+  const pendingTools = new Map()
+  let pendingAssistant = undefined
+
+  const flushAssistant = () => {
+    if (pendingAssistant === undefined) return
+    if (pendingAssistant.text !== '' || pendingAssistant.tools.length > 0) steps.push(pendingAssistant)
+    pendingAssistant = undefined
+  }
+
+  for (const record of Array.isArray(records) ? records : []) {
+    const event = record?.event
+    if (event === undefined || event === null) continue
+    const seq = Number(event.seq ?? 0)
+    const time = Number(event.time ?? 0)
+    const data = event.data ?? {}
+
+    if (event.type === 'user/message') {
+      if (!isHumanMessage(data)) continue
+      flushAssistant()
+      const message = data.message ?? data
+      const text = textOfContent(message?.content)
+      if (text === '') continue
+      steps.push({ kind: STEP_KINDS.message, seq, time, role: 'user', text: clip(text, maxText), tools: [] })
+      continue
+    }
+
+    if (event.type === 'assistant/message') {
+      const message = data.message ?? {}
+      const text = textOfContent(message?.content)
+      const calls = Array.isArray(message?.content) ? message.content.filter((b) => b?.type === 'tool-call') : []
+      if (pendingAssistant === undefined) {
+        pendingAssistant = { kind: STEP_KINDS.message, seq, time, role: 'assistant', text: '', tools: [] }
+      }
+      if (text !== '') {
+        pendingAssistant.text = pendingAssistant.text === '' ? text : `${pendingAssistant.text}\n\n${text}`
+      }
+      pendingAssistant.seq = seq
+      pendingAssistant.time = time
+      // 每次工具调用单独成条，排在助手正文之后，顺序与电脑上一致。
+      for (const call of calls) {
+        flushAssistant()
+        const name = typeof call.name === 'string' ? call.name : '工具'
+        const label = TOOL_LABELS[name] ?? name
+        if (pendingAssistant === undefined) {
+          pendingAssistant = { kind: STEP_KINDS.message, seq, time, role: 'assistant', text: '', tools: [] }
+        }
+        pendingAssistant.tools.push(label)
+        const tool = {
+          kind: STEP_KINDS.tool,
+          seq,
+          time,
+          name,
+          label,
+          detail: describeToolCall(name, call.arguments),
+          status: 'running',
+          result: '',
+          files: [],
+          isError: false,
+        }
+        steps.push(tool)
+        if (typeof call.id === 'string') pendingTools.set(call.id, tool)
+      }
+      continue
+    }
+
+    if (event.type === 'tool/result') {
+      const message = data.message ?? {}
+      const callId = typeof message.toolCallId === 'string' ? message.toolCallId : ''
+      flushAssistant()
+      const tool = callId === '' ? undefined : pendingTools.get(callId)
+      const text = textOfContent(message?.content)
+      const diffs = Array.isArray(data.meta?.diffs) ? data.meta.diffs : []
+      if (tool === undefined) {
+        // 没有对应调用（例如从中间翻页）：单独成一条，信息不丢。
+        steps.push({
+          kind: STEP_KINDS.tool,
+          seq,
+          time,
+          name: '',
+          label: '工具结果',
+          detail: '',
+          status: message.isError === true ? 'error' : 'done',
+          result: clip(text, maxText),
+          files: diffs.map((d) => String(d?.path ?? '')).filter((p) => p !== ''),
+          isError: message.isError === true,
+        })
+        continue
+      }
+      tool.status = message.isError === true ? 'error' : 'done'
+      tool.result = clip(text, maxText)
+      tool.isError = message.isError === true
+      tool.files = diffs.map((d) => String(d?.path ?? '')).filter((p) => p !== '')
+      tool.resultSeq = seq
+      continue
+    }
+
+    if (event.type === 'turn/end') flushAssistant()
+  }
+  flushAssistant()
+  return steps
+}
+
+/** 截断长文本并标注省略。 */
+function clip(text, limit) {
+  if (typeof text !== 'string') return ''
+  const value = text.trim()
+  if (value.length <= limit) return value
+  return `${value.slice(0, limit)}…（已省略）`
+}
+
+/**
+ * 从工具参数里抽出最有信息量的一句说明。
+ *
+ * 手表上不可能展示完整 JSON，因此按工具类型挑关键字段：命令类给命令，
+ * 文件类给路径，搜索类给关键词或模式。
+ */
+export function describeToolCall(name, rawArguments) {
+  let args
+  if (typeof rawArguments === 'string') {
+    try { args = JSON.parse(rawArguments) } catch { return clipOneLine(rawArguments, 120) }
+  } else {
+    args = rawArguments
+  }
+  if (args === null || typeof args !== 'object') return ''
+
+  const order = [
+    'description', 'file_path', 'path', 'notebook_path',
+    'command', 'pattern', 'query', 'url', 'prompt', 'name', 'subagent_type', 'skill',
+  ]
+  for (const key of order) {
+    const value = args[key]
+    if (typeof value === 'string' && value.trim() !== '') return clipOneLine(value, key === 'command' ? 160 : 120)
+  }
+  // 没有已知字段时退回首行，至少让用户知道调了什么。
+  const text = typeof rawArguments === 'string' ? rawArguments : JSON.stringify(args)
+  return clipOneLine(text, 100)
+}
+
+/** 压成单行短文本。 */
+function clipOneLine(text, limit) {
+  const value = String(text).replace(/\s+/gu, ' ').trim()
+  if (value.length <= limit) return value
+  return `${value.slice(0, limit)}…`
+}
+
+/**
+ * 把会话的用量与运行统计压成手表能直接显示的结构。
+ *
+ * 数值都保持原始含义，格式化交给手表端（不同语言的单位写法不同）。
+ * @param {object} values `session/projections` 的 values
+ */
+export function normalizeUsage(values) {
+  const tokens = values?.tokenUsage ?? {}
+  const pressure = values?.contextPressure ?? {}
+  const breakdown = values?.contextBreakdown ?? {}
+  const stats = values?.sessionStats ?? {}
+  const numberOr = (value) => (typeof value === 'number' && Number.isFinite(value) ? value : 0)
+  const contextWindow = numberOr(pressure.contextWindow)
+  const pressureTokens = numberOr(pressure.pressureTokens)
+  return {
+    // token 用量
+    inputTokens: numberOr(tokens.uncachedInputTokens),
+    outputTokens: numberOr(tokens.outputTokens),
+    cacheReadTokens: numberOr(tokens.cacheReadTokens),
+    cacheWriteTokens: numberOr(tokens.cacheWriteTokens),
+    // 上下文占用
+    pressureTokens,
+    projectedTokens: numberOr(pressure.projectedTokens),
+    contextWindow,
+    percent: contextWindow > 0 ? Math.round((pressureTokens / contextWindow) * 1000) / 10 : 0,
+    systemTokens: numberOr(breakdown.systemTokens),
+    toolsTokens: numberOr(breakdown.toolsTokens),
+    messageTokens: numberOr(breakdown.messageTokens),
+    // 运行统计
+    turns: numberOr(stats.turns),
+    steps: numberOr(stats.steps),
+    llmMs: numberOr(stats.llmMs),
+    toolMs: numberOr(stats.toolMs),
+    ttftMs: numberOr(stats.ttftMs),
+    // 模型
+    provider: typeof values?.modelSelection?.next?.provider === 'string' ? values.modelSelection.next.provider : '',
+    model: typeof values?.modelSelection?.next?.model === 'string' ? values.modelSelection.next.model : '',
+    effort: typeof values?.modelSelection?.next?.reasoningEffort === 'string' ? values.modelSelection.next.reasoningEffort : '',
+    agentPreset: typeof values?.agentPreset === 'string' ? values.agentPreset : '',
+  }
+}
+
+/**
+ * 把 `session/modelCatalog` 压成手表用的分组列表。
+ *
+ * DSH 返回的 groups 里每个 provider 带一串模型与各自的 reasoning 档位；
+ * 手表只保留可路由的 provider，并把档位压成 id 数组。
+ */
+export function normalizeModelCatalog(catalog) {
+  const groups = Array.isArray(catalog?.groups) ? catalog.groups : []
+  const routable = new Set(Array.isArray(catalog?.routableProviders) ? catalog.routableProviders : [])
+  const out = []
+  for (const group of groups) {
+    const provider = String(group?.id ?? '')
+    if (provider === '') continue
+    if (routable.size > 0 && !routable.has(provider)) continue
+    const models = []
+    for (const model of Array.isArray(group?.models) ? group.models : []) {
+      const id = String(model?.id ?? '')
+      if (id === '') continue
+      models.push({
+        id,
+        name: typeof model?.name === 'string' && model.name !== '' ? model.name : id,
+        efforts: (Array.isArray(model?.reasoning?.efforts) ? model.reasoning.efforts : [])
+          .map((effort) => String(effort?.id ?? ''))
+          .filter((value) => value !== ''),
+      })
+    }
+    if (models.length === 0) continue
+    out.push({
+      provider,
+      name: typeof group?.name === 'string' && group.name !== '' ? group.name : provider,
+      models,
+    })
+  }
+  return {
+    groups: out,
+    default: {
+      provider: typeof catalog?.default?.provider === 'string' ? catalog.default.provider : '',
+      model: typeof catalog?.default?.model === 'string' ? catalog.default.model : '',
+      effort: typeof catalog?.default?.reasoningEffort === 'string' ? catalog.default.reasoningEffort : '',
+    },
+  }
+}
+
+/**
+ * 把会话按项目（工作目录）分组。
+ *
+ * 手表列表首屏放不下几十个会话，按项目折叠后一眼能看到「有哪些项目」。
+ * 组内保持按更新时间倒序，组之间按「最近活动」排序。
+ */
+export function groupByProject(sessions) {
+  const groups = new Map()
+  for (const session of sessions) {
+    const key = session.project === '' ? '未分组' : session.project
+    let group = groups.get(key)
+    if (group === undefined) {
+      group = {
+        project: key,
+        path: session.projectPath ?? '',
+        sessions: [],
+        running: 0,
+        waiting: 0,
+        updatedAt: 0,
+      }
+      groups.set(key, group)
+    }
+    group.sessions.push(session)
+    if (session.running) group.running += 1
+    if (session.waiting) group.waiting += 1
+    if (session.updatedAt > group.updatedAt) group.updatedAt = session.updatedAt
+  }
+  const out = [...groups.values()]
+  for (const group of out) group.sessions.sort((a, b) => b.updatedAt - a.updatedAt)
+  out.sort((a, b) => b.updatedAt - a.updatedAt)
+  return out
 }

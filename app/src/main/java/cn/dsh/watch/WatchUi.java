@@ -46,11 +46,36 @@ final class WatchUi {
         final FrameLayout root;
         final ScrollView scroll;
         final LinearLayout content;
+        private Runnable onSwipeLeft;
+        private Runnable onSwipeRight;
 
         Page(FrameLayout root, ScrollView scroll, LinearLayout content) {
             this.root = root;
             this.scroll = scroll;
             this.content = content;
+        }
+
+        /** 左滑（手指向左）时触发：按约定用于打开操作菜单。 */
+        void setOnSwipeLeft(Runnable action) {
+            this.onSwipeLeft = action;
+        }
+
+        /** 右滑（手指向右）时触发：按约定用于返回上一级。 */
+        void setOnSwipeRight(Runnable action) {
+            this.onSwipeRight = action;
+        }
+
+        void fireSwipeLeft() {
+            if (onSwipeLeft != null) onSwipeLeft.run();
+        }
+
+        void fireSwipeRight() {
+            if (onSwipeRight != null) onSwipeRight.run();
+        }
+
+        /** 滚动到底部（进入会话时用来直接看到最新内容）。 */
+        void scrollToBottom() {
+            scroll.post(() -> scroll.fullScroll(View.FOCUS_DOWN));
         }
     }
 
@@ -62,7 +87,12 @@ final class WatchUi {
         return Math.round(value * activity.getResources().getDisplayMetrics().density);
     }
 
-    /** 建立一个带安全边距、支持表冠滚动的页面。 */
+    /**
+     * 建立一个带安全边距、支持表冠滚动的页面。
+     *
+     * 页面同时识别左右滑动：由调用方通过 {@link Page#setOnSwipe} 注册回调，
+     * 这样各页面可以自行决定「右滑返回、左滑开菜单」这类行为。
+     */
     Page page() {
         FrameLayout root = new FrameLayout(activity);
         root.setBackgroundColor(BG);
@@ -77,12 +107,15 @@ final class WatchUi {
         content.setOrientation(LinearLayout.VERTICAL);
         scroll.addView(content, new ScrollView.LayoutParams(-1, -2));
         root.addView(scroll, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
+        Page page = new Page(root, scroll, content);
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             int width = r - l;
             int height = b - t;
             boolean round = activity.getResources().getConfiguration().isScreenRound();
-            int side = round ? Math.round(width * SIDE_RATIO) : dp(10);
-            int vertical = round ? Math.round(height * VERTICAL_RATIO) : dp(10);
+            // 圆屏侧边留出内接矩形之外的部分；上下留白略大于左右，
+            // 因为顶部状态栏与底部圆角都会压到内容。
+            int side = round ? Math.round(width * SIDE_RATIO) : dp(8);
+            int vertical = round ? Math.round(height * VERTICAL_RATIO) : dp(8);
             FrameLayout.LayoutParams current = (FrameLayout.LayoutParams) scroll.getLayoutParams();
             if (current.leftMargin != side || current.topMargin != vertical) {
                 current.setMargins(side, vertical, side, vertical);
@@ -98,7 +131,83 @@ final class WatchUi {
             }
             return false;
         });
-        return new Page(root, scroll, content);
+        // 横向手势不在这里拦：挂在页面的 FrameLayout 上时，触摸会先被子层
+        // ScrollView 消费掉，左滑会被当成纵向滚动。改由 MainActivity 的
+        // dispatchTouchEvent 统一判定（配合 page.setGestureTarget）。
+        return page;
+    }
+
+    /**
+     * 横向滑动识别器。
+     *
+     * 由 MainActivity 在 dispatchTouchEvent 里驱动：只有那里能拿到「还没被子视图
+     * 消费」的原始事件，挂在页面根容器上会被 ScrollView 抢先吃掉纵向与横向手势。
+     *
+     * 只认明显偏水平的滑动（横向位移 ≥60dp 且大于纵向的 1.5 倍），
+     * 否则手表上最常用的上下翻页会被误判成菜单手势。
+     */
+    static final class HorizontalGesture {
+        private static final int TRIGGER_DP = 60;
+        private static final int SLOP_DP = 24;
+
+        private final float triggerPx;
+        private final float slopPx;
+        private float startX;
+        private float startY;
+        private boolean triggered;
+
+        HorizontalGesture(float density) {
+            this.triggerPx = TRIGGER_DP * density;
+            this.slopPx = SLOP_DP * density;
+        }
+
+        /**
+         * 喂入一个触摸事件。
+         * @param page 当前页面（提供左右滑回调）
+         * @return true 表示本次手势已被横向滑动消费
+         */
+        boolean onTouch(WatchUi.Page page, MotionEvent event) {
+            if (page == null) return false;
+            switch (event.getActionMasked()) {
+                case MotionEvent.ACTION_DOWN:
+                    startX = event.getX();
+                    startY = event.getY();
+                    triggered = false;
+                    return false;
+                case MotionEvent.ACTION_MOVE: {
+                    if (triggered) return true;
+                    float dx = event.getX() - startX;
+                    float dy = event.getY() - startY;
+                    // 纵向一旦明显超过阈值就认定是滚动，本次不再判定横滑。
+                    if (Math.abs(dy) > slopPx && Math.abs(dy) > Math.abs(dx)) return false;
+                    if (Math.abs(dx) >= triggerPx && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                        triggered = true;
+                        if (dx > 0) page.fireSwipeRight();
+                        else page.fireSwipeLeft();
+                        return true;
+                    }
+                    return false;
+                }
+                case MotionEvent.ACTION_UP:
+                case MotionEvent.ACTION_CANCEL: {
+                    if (triggered) {
+                        triggered = false;
+                        return true;
+                    }
+                    // 快速轻扫可能移动步数少，抬手时补一次判定。
+                    float dx = event.getX() - startX;
+                    float dy = event.getY() - startY;
+                    if (Math.abs(dx) >= triggerPx && Math.abs(dx) > Math.abs(dy) * 1.5f) {
+                        if (dx > 0) page.fireSwipeRight();
+                        else page.fireSwipeLeft();
+                        return true;
+                    }
+                    return false;
+                }
+                default:
+                    return false;
+            }
+        }
     }
 
     TextView text(CharSequence value, float size, int color) {
@@ -113,12 +222,30 @@ final class WatchUi {
 
     /** 顶部标题区；副标题为空时不占位。 */
     void heading(Page page, String title, String subtitle) {
-        TextView name = text(title, 19, FG);
-        name.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        add(page, name, 0, 6);
+        TextView head = headingView(title);
+        // 顶部留一点空间，避免第一行贴着圆角。
+        add(page, head, 2, 4);
         if (subtitle != null && !subtitle.isEmpty()) {
-            add(page, text(subtitle, 11, MUTED), 0, 12);
+            TextView sub = text(subtitle, 10, MUTED);
+            sub.setSingleLine(true);
+            sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            add(page, sub, 0, 8);
         }
+    }
+
+    /**
+     * 标题视图。
+     *
+     * 会话标题常常很长（如「制作手表端DSH客户端应用」）。圆屏上一屏可见高度只有
+     * 三百多像素，标题一旦折成两三行，按钮和内容区就被挤出屏幕、整页也滚不动。
+     * 因此强制单行 + 省略号；调用方负责先把文本截短。
+     */
+    TextView headingView(String title) {
+        TextView view = text(title, 16, FG);
+        view.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        view.setSingleLine(true);
+        view.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        return view;
     }
 
     void add(Page page, View view, int top, int bottom) {
@@ -198,6 +325,16 @@ final class WatchUi {
 
     /** 对话气泡：用户靠右用强调色，助手靠左用卡片色。 */
     View bubble(String body, boolean fromUser) {
+        return bubbleRich(body, fromUser);
+    }
+
+    /**
+     * 富文本气泡。
+     *
+     * 正文可能带 Markdown 样式（粗体、等宽、底色），因此用 Spannable 而不是纯字符串。
+     * 长文本要能正常折行，所以宽度用 WRAP_CONTENT 加上限，不能固定宽度。
+     */
+    View bubbleRich(CharSequence body, boolean fromUser) {
         LinearLayout wrapper = new LinearLayout(activity);
         wrapper.setOrientation(LinearLayout.VERTICAL);
         TextView view = text(body, 13, fromUser ? ON_ACCENT : FG);

@@ -163,6 +163,12 @@ final class Api {
         boolean waiting;
         boolean subagent;
         long updatedAt;
+        /** 项目名（工作目录最后一段），列表按它分组。 */
+        String project = "";
+        String projectPath = "";
+        String provider = "";
+        String model = "";
+        String effort = "";
 
         /** 列表页的副标题：状态 + 相对时间。 */
         String subtitle() {
@@ -187,6 +193,72 @@ final class Api {
     static final class Option {
         String label = "";
         String description = "";
+    }
+
+    /** 会话中的一个步骤：用户消息、助手回复，或一次工具调用。 */
+    static final class Step {
+        /** message 或 tool。 */
+        String kind = "message";
+        String role = "assistant";
+        String text = "";
+        final List<String> tools = new ArrayList<>();
+        /** 工具内部名（如 pwsh），用于图标化显示。 */
+        String name = "";
+        /** 工具显示名（如 命令）。 */
+        String label = "工具";
+        /** 参数摘要：命令或文件路径等最有信息量的一句。 */
+        String detail = "";
+        /** running / done / error。 */
+        String status = "done";
+        String result = "";
+        final List<String> files = new ArrayList<>();
+        boolean isError;
+    }
+
+    /** 用量与运行统计。 */
+    static final class Usage {
+        long inputTokens;
+        long outputTokens;
+        long cacheReadTokens;
+        long cacheWriteTokens;
+        long pressureTokens;
+        long contextWindow;
+        double percent;
+        long systemTokens;
+        long toolsTokens;
+        long messageTokens;
+        long turns;
+        long steps;
+        long llmMs;
+        long toolMs;
+        long ttftMs;
+        String provider = "";
+        String model = "";
+        String effort = "";
+    }
+
+    /** 一个可选的模型。 */
+    static final class ModelInfo {
+        String id = "";
+        String name = "";
+        final List<String> efforts = new ArrayList<>();
+    }
+
+    /** 一个模型供应商及其模型。 */
+    static final class ProviderInfo {
+        String provider = "";
+        String name = "";
+        final List<ModelInfo> models = new ArrayList<>();
+    }
+
+    /** 按项目分组的会话。 */
+    static final class Project {
+        String project = "";
+        String path = "";
+        int running;
+        int waiting;
+        long updatedAt;
+        final List<Session> sessions = new ArrayList<>();
     }
 
     /** 单个问题。 */
@@ -241,9 +313,150 @@ final class Api {
             session.waiting = item.optBoolean("waiting", false);
             session.subagent = item.optBoolean("subagent", false);
             session.updatedAt = item.optLong("updatedAt", 0L);
+            session.project = text(item, "project");
+            session.projectPath = text(item, "projectPath");
+            session.provider = text(item, "provider");
+            session.model = text(item, "model");
+            session.effort = text(item, "effort");
             if (!session.id.isEmpty()) sessions.add(session);
         }
         return sessions;
+    }
+
+    /** 解析按项目分组的视图。 */
+    static List<Project> parseProjects(JSONObject root) {
+        List<Project> projects = new ArrayList<>();
+        JSONArray array = root.optJSONArray("projects");
+        if (array == null) return projects;
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item == null) continue;
+            Project project = new Project();
+            project.project = text(item, "project");
+            project.path = text(item, "path");
+            project.running = item.optInt("running", 0);
+            project.waiting = item.optInt("waiting", 0);
+            project.updatedAt = item.optLong("updatedAt", 0L);
+            JSONArray inner = item.optJSONArray("sessions");
+            if (inner != null) {
+                for (int j = 0; j < inner.length(); j++) {
+                    JSONObject raw = inner.optJSONObject(j);
+                    if (raw == null) continue;
+                    Session session = new Session();
+                    session.id = text(raw, "id");
+                    session.title = text(raw, "title");
+                    session.running = raw.optBoolean("running", false);
+                    session.waiting = raw.optBoolean("waiting", false);
+                    session.subagent = raw.optBoolean("subagent", false);
+                    session.updatedAt = raw.optLong("updatedAt", 0L);
+                    session.project = text(raw, "project");
+                    session.projectPath = text(raw, "projectPath");
+                    session.provider = text(raw, "provider");
+                    session.model = text(raw, "model");
+                    session.effort = text(raw, "effort");
+                    if (!session.id.isEmpty()) project.sessions.add(session);
+                }
+            }
+            if (!project.project.isEmpty()) projects.add(project);
+        }
+        return projects;
+    }
+
+    /** 解析会话里的步骤序列（含工具调用与结果）。 */
+    static List<Step> parseSteps(JSONObject root) {
+        List<Step> steps = new ArrayList<>();
+        JSONArray array = root.optJSONArray("steps");
+        if (array == null) return steps;
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item == null) continue;
+            Step step = new Step();
+            step.kind = text(item, "kind");
+            step.role = text(item, "role");
+            step.text = text(item, "text");
+            step.name = text(item, "name");
+            step.label = text(item, "label");
+            step.detail = text(item, "detail");
+            step.status = text(item, "status");
+            step.result = text(item, "result");
+            step.isError = item.optBoolean("isError", false);
+            JSONArray tools = item.optJSONArray("tools");
+            if (tools != null) {
+                for (int j = 0; j < tools.length(); j++) {
+                    String tool = text(tools, j);
+                    if (!tool.isEmpty()) step.tools.add(tool);
+                }
+            }
+            JSONArray files = item.optJSONArray("files");
+            if (files != null) {
+                for (int j = 0; j < files.length(); j++) {
+                    String file = text(files, j);
+                    if (!file.isEmpty()) step.files.add(file);
+                }
+            }
+            steps.add(step);
+        }
+        return steps;
+    }
+
+    /** 解析用量与运行统计。 */
+    static Usage parseUsage(JSONObject root) {
+        JSONObject item = root.optJSONObject("usage");
+        if (item == null) return null;
+        Usage usage = new Usage();
+        usage.inputTokens = item.optLong("inputTokens", 0L);
+        usage.outputTokens = item.optLong("outputTokens", 0L);
+        usage.cacheReadTokens = item.optLong("cacheReadTokens", 0L);
+        usage.cacheWriteTokens = item.optLong("cacheWriteTokens", 0L);
+        usage.pressureTokens = item.optLong("pressureTokens", 0L);
+        usage.contextWindow = item.optLong("contextWindow", 0L);
+        usage.percent = item.optDouble("percent", 0d);
+        usage.systemTokens = item.optLong("systemTokens", 0L);
+        usage.toolsTokens = item.optLong("toolsTokens", 0L);
+        usage.messageTokens = item.optLong("messageTokens", 0L);
+        usage.turns = item.optLong("turns", 0L);
+        usage.steps = item.optLong("steps", 0L);
+        usage.llmMs = item.optLong("llmMs", 0L);
+        usage.toolMs = item.optLong("toolMs", 0L);
+        usage.ttftMs = item.optLong("ttftMs", 0L);
+        usage.provider = text(item, "provider");
+        usage.model = text(item, "model");
+        usage.effort = text(item, "effort");
+        return usage;
+    }
+
+    /** 解析模型目录（供应商 → 模型 → 推理档位）。 */
+    static List<ProviderInfo> parseModels(JSONObject root) {
+        List<ProviderInfo> providers = new ArrayList<>();
+        JSONArray array = root.optJSONArray("groups");
+        if (array == null) return providers;
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject group = array.optJSONObject(i);
+            if (group == null) continue;
+            ProviderInfo info = new ProviderInfo();
+            info.provider = text(group, "provider");
+            info.name = text(group, "name");
+            JSONArray models = group.optJSONArray("models");
+            if (models != null) {
+                for (int j = 0; j < models.length(); j++) {
+                    JSONObject raw = models.optJSONObject(j);
+                    if (raw == null) continue;
+                    ModelInfo model = new ModelInfo();
+                    model.id = text(raw, "id");
+                    model.name = text(raw, "name");
+                    JSONArray efforts = raw.optJSONArray("efforts");
+                    if (efforts != null) {
+                        for (int k = 0; k < efforts.length(); k++) {
+                            String effort = text(efforts, k);
+                            if (!effort.isEmpty()) model.efforts.add(effort);
+                        }
+                    }
+                    if (!model.id.isEmpty()) info.models.add(model);
+                }
+            }
+            if (!info.provider.isEmpty()) providers.add(info);
+        }
+        return providers;
     }
 
     static List<Ask> parsePending(JSONObject root) {
