@@ -1020,6 +1020,16 @@ public class MainActivity extends Activity {
     /** 步骤列表的容器；非空时表示当前屏幕上已有可原位更新的列表。 */
     private LinearLayout contentArea;
 
+    /**
+     * 已展开的工具组与单条明细。
+     *
+     * 界面用「重建整屏」刷新，展开状态若不记在这里，每次自动刷新（会话页每 4 秒一次）
+     * 都会把用户刚点开的详情缩回去——这正是「点了展开却看不到内容」的直接原因。
+     * 键是 {@link #groupKey} 与它拼上组内下标。
+     */
+    private final java.util.Set<String> openGroups = new java.util.HashSet<>();
+    private final java.util.Set<String> openRows = new java.util.HashSet<>();
+
     /** 往内容区填充步骤（或只看对话时的消息）。 */
     private void fillContent() {
         if (contentArea == null) return;
@@ -1069,39 +1079,37 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * 按电脑上的观感逐条列出：消息、工具调用、工具结果。
+     * 按电脑上的观感逐条列出：正文，以及两段正文之间的工具调用。
      *
-     * 工具调用默认折叠成一行（工具名 + 状态 + 参数摘要），点开才看结果；
-     * 连续多个工具调用合并成一组，点一次可以整组展开。这样长对话里
-     * 关键的文字回复不会被几十条工具记录淹没。
+     * 分组依据是**正文输出**，不是「相邻的工具步骤」：中继为每次工具调用插了一条
+     * 空文本的助手步骤（它只承载工具清单），所以相邻的工具步骤几乎从不相邻，
+     * 按相邻关系分组会让每次调用各自成组，一屏塞满几十张单条卡片。
+     * 这里把两段正文之间的全部工具调用并成一组，空文本消息不参与分隔。
+     *
+     * 折叠分两级：组卡片点开是这次连续调用的清单，再点某一条才看它的参数与结果。
      */
     private void renderSteps(LinearLayout container) {
         if (steps.isEmpty()) {
             container.addView(ui.text("还没有内容", 12, WatchUi.MUTED));
             return;
         }
-        int index = 0;
-        int i = 0;
-        while (i < steps.size()) {
+        List<Api.Step> group = new ArrayList<>();
+        for (int i = 0; i < steps.size(); i++) {
             Api.Step step = steps.get(i);
-
             if ("tool".equals(step.kind)) {
-                // 收集连续的若干条工具调用，作为一个可折叠的组。
-                int end = i;
-                while (end < steps.size() && "tool".equals(steps.get(end).kind)) end += 1;
-                List<Api.Step> group = new ArrayList<>(steps.subList(i, end));
-                index += group.size();
-                addTo(container, toolGroup(group), 0, 6);
-                i = end;
+                group.add(step);
                 continue;
             }
-
-            index += 1;
-            i += 1;
             if (step.text.trim().isEmpty()) continue;
-            addTo(container, stepLabel(step, index), 0, 3);
+            // 正文本身是一道分隔：先把上一段的工具调用收成一组。
+            if (!group.isEmpty()) {
+                addTo(container, toolGroup(group), 0, 6);
+                group = new ArrayList<>();
+            }
+            addTo(container, stepLabel(step, i + 1), 0, 3);
             addTo(container, messageBubble(step), 0, 6);
         }
+        if (!group.isEmpty()) addTo(container, toolGroup(group), 0, 6);
     }
 
     /** 正文气泡：按 Markdown 渲染，用户消息用强调色。 */
@@ -1118,11 +1126,13 @@ public class MainActivity extends Activity {
     /**
      * 一组工具调用的折叠卡片。
      *
-     * 折叠态只显示「N 次工具调用」与涉及的工具名；展开后逐条列出参数与结果。
-     * 单条时标题直接用工具名，读起来更自然。
+     * 折叠态只显示「N 次工具调用」与涉及的工具名；第一次展开列出这次连续调用的清单，
+     * 点清单里的某一条才展开它的参数与结果。单条时标题直接用工具名，读起来更自然。
      */
     private View toolGroup(List<Api.Step> group) {
         LinearLayout card = ui.card();
+        // 每组一个稳定的编号，用于记住展开状态（自动刷新重建视图后要还原）。
+        final String key = groupKey(group);
 
         LinearLayout header = new LinearLayout(this);
         header.setOrientation(LinearLayout.HORIZONTAL);
@@ -1151,30 +1161,133 @@ public class MainActivity extends Activity {
         summaryView.setEllipsize(android.text.TextUtils.TruncateAt.END);
         card.addView(summaryView);
 
-        // 展开后的明细容器：默认隐藏，点标题展开。
-        LinearLayout details = new LinearLayout(this);
-        details.setOrientation(LinearLayout.VERTICAL);
-        details.setVisibility(View.GONE);
-        for (Api.Step step : group) {
-            addTo(details, toolDetail(step), 6, 0);
+        // 第一级：这次连续调用的清单，每行可点开看单条详情。
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setVisibility(View.GONE);
+        final List<View> rowDetails = new ArrayList<>();
+        final List<View> rowLines = new ArrayList<>();
+        for (int i = 0; i < group.size(); i++) {
+            final Api.Step step = group.get(i);
+            final String rowKey = key + "#" + i;
+            // 整行可点：点标题、点描述、点行的空白处都算「这一条」。
+            // 只把监听器挂在标题那一小块上时，点行内其它位置会落到外层卡片上，
+            // 结果是「想展开这一条，却把整组收了起来」。
+            LinearLayout rowBox = new LinearLayout(this);
+            rowBox.setOrientation(LinearLayout.VERTICAL);
+            rowBox.setMinimumHeight(ui.dp(48));
+
+            LinearLayout rowHead = new LinearLayout(this);
+            rowHead.setOrientation(LinearLayout.HORIZONTAL);
+            rowHead.setPadding(0, ui.dp(5), 0, 0);
+            rowHead.addView(ui.chip(statusMark(step), statusColor(step)));
+            String label = step.label.isEmpty() ? "工具" : step.label;
+            rowHead.addView(ui.text(" " + label, 11, WatchUi.FG));
+            rowBox.addView(rowHead);
+
+            String detailLine = step.detail.isEmpty() ? firstLine(step.result) : shortenPaths(step.detail);
+            TextView line = ui.text(detailLine, 10, WatchUi.MUTED);
+            line.setPadding(ui.dp(2), ui.dp(3), 0, 0);
+            line.setMaxLines(2);
+            line.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            rowBox.addView(line);
+
+            // 第二级：单条工具的参数、改动文件与结果。
+            TextView full = ui.text(toolDetailText(step), 10,
+                    step.isError ? WatchUi.DANGER : WatchUi.MUTED);
+            full.setPadding(ui.dp(2), ui.dp(4), 0, 0);
+            full.setVisibility(View.GONE);
+            rowBox.addView(full);
+
+            rowBox.setFocusable(true);
+            rowBox.setClickable(true);
+            rowBox.setOnClickListener(v -> {
+                boolean open = full.getVisibility() != View.VISIBLE;
+                full.setVisibility(open ? View.VISIBLE : View.GONE);
+                line.setVisibility(open ? View.GONE : View.VISIBLE);
+                if (open) openRows.add(rowKey);
+                else openRows.remove(rowKey);
+            });
+            rowDetails.add(full);
+            rowLines.add(line);
+            list.addView(rowBox);
         }
-        card.addView(details);
+        card.addView(list);
 
         TextView toggle = ui.text(group.size() > 1 ? "展开 " + group.size() + " 项 ▾" : "展开 ▾", 10, WatchUi.ACCENT);
         toggle.setPadding(0, ui.dp(6), 0, 0);
         card.addView(toggle);
 
-        setCollapsed(card, details, toggle, summaryView, true, group.size());
-        card.setOnClickListener(v -> {
-            // 这里的参数是「目标状态」，因此按当前可见性取反：
-            // 明细可见说明该收起，不可见说明该展开。曾把「当前是否折叠」直接当参数传入，
-            // 结果每次点击都再折叠一次，卡片永远打不开。
-            boolean targetCollapsed = details.getVisibility() == View.VISIBLE;
-            setCollapsed(card, details, toggle, summaryView, targetCollapsed, group.size());
-        });
-        card.setFocusable(true);
-        card.setClickable(true);
+        // 还原上一次的展开状态：自动刷新会整片重建视图，不留这份记忆的话，
+        // 用户刚点开的详情会在下一次刷新（会话页每 4 秒一次）时缩回去。
+        boolean expanded = openGroups.contains(key);
+        restoreCollapsed(list, toggle, summaryView, expanded, group.size());
+        for (int i = 0; i < rowDetails.size(); i++) {
+            boolean rowOpen = openRows.contains(key + "#" + i);
+            rowDetails.get(i).setVisibility(rowOpen ? View.VISIBLE : View.GONE);
+            rowLines.get(i).setVisibility(rowOpen ? View.GONE : View.VISIBLE);
+        }
+
+        View.OnClickListener toggleGroup = v -> {
+            // 参数是「目标状态」：当前可见说明该收起，不可见说明该展开。
+            boolean targetOpen = list.getVisibility() != View.VISIBLE;
+            if (targetOpen) openGroups.add(key);
+            else {
+                openGroups.remove(key);
+                // 收起整组时连带收起内部明细，下次打开是干净的清单。
+                for (int i = 0; i < rowDetails.size(); i++) {
+                    rowDetails.get(i).setVisibility(View.GONE);
+                    rowLines.get(i).setVisibility(View.VISIBLE);
+                    openRows.remove(key + "#" + i);
+                }
+            }
+            toggleCollapsed(list, toggle, summaryView, targetOpen, group.size());
+        };
+        // 收组只认标题、摘要与那行「展开/收起」提示；清单区域留给单条明细，
+        // 否则「点这一条」会先被卡片抢走，变成把整组收起来。
+        header.setOnClickListener(toggleGroup);
+        header.setFocusable(true);
+        header.setClickable(true);
+        summaryView.setOnClickListener(toggleGroup);
+        summaryView.setFocusable(true);
+        summaryView.setClickable(true);
+        toggle.setOnClickListener(toggleGroup);
+        toggle.setFocusable(true);
+        toggle.setClickable(true);
         return card;
+    }
+
+    /** 组内第一条工具步骤的位置与名字，用于在多次重建之间认出同一组。 */
+    private static String groupKey(List<Api.Step> group) {
+        Api.Step first = group.get(0);
+        return first.seq + ":" + group.size() + ":" + first.name;
+    }
+
+    /** 还原展开状态：直接设可见性，不做动画，否则整屏重建时会在每张卡片上闪一遍。 */
+    private void restoreCollapsed(View list, TextView toggle, View summary, boolean expanded, int count) {
+        list.animate().cancel();
+        list.setAlpha(1f);
+        list.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        summary.setVisibility(expanded ? View.GONE : View.VISIBLE);
+        toggle.setText(expanded ? "收起 ▴" : (count > 1 ? "展开 " + count + " 项 ▾" : "展开 ▾"));
+    }
+
+    /**
+     * 用户点击后的展开/收起。
+     *
+     * 展开时隐藏摘要（清单里已有全部信息），折叠时恢复；动画用 alpha 渐显，
+     * 手表上不宜做复杂转场。
+     */
+    private void toggleCollapsed(View list, TextView toggle, View summary, boolean expanded, int count) {
+        if (expanded) {
+            summary.setVisibility(View.GONE);
+            animateExpand(list);
+            toggle.setText("收起 ▴");
+        } else {
+            animateCollapse(list);
+            summary.setVisibility(View.VISIBLE);
+            toggle.setText(count > 1 ? "展开 " + count + " 项 ▾" : "展开 ▾");
+        }
     }
 
     /**
@@ -1232,37 +1345,33 @@ public class MainActivity extends Activity {
         return value;
     }
 
-    /** 展开后的一条工具明细：参数、改动文件、结果。 */
-    private View toolDetail(Api.Step step) {
-        LinearLayout box = new LinearLayout(this);
-        box.setOrientation(LinearLayout.VERTICAL);
-        box.setPadding(ui.dp(2), 0, 0, 0);
-
-        TextView name = ui.text("· " + (step.label.isEmpty() ? "工具" : step.label)
-                + (step.name.isEmpty() ? "" : "（" + step.name + "）"), 11, WatchUi.FG);
-        box.addView(name);
-
+    /**
+     * 展开后单条工具的完整文本：参数、改动文件、结果。
+     *
+     * 拼成一段纯文本再一次渲染，而不是多个视图叠起来——手表上一次重建会同时
+     * 生成所有卡片的明细，视图数量直接决定滚动是否跟手。
+     */
+    private CharSequence toolDetailText(Api.Step step) {
+        StringBuilder builder = new StringBuilder();
         if (!step.detail.isEmpty()) {
-            addTo(box, ui.text(shortenPaths(step.detail), 10, WatchUi.MUTED), 4, 0);
+            builder.append(shortenPaths(step.detail));
         }
         if (!step.files.isEmpty()) {
-            StringBuilder builder = new StringBuilder();
+            if (builder.length() > 0) builder.append("\n\n");
+            builder.append("改动文件：");
             for (int i = 0; i < step.files.size() && i < 6; i++) {
                 if (i > 0) builder.append('\n');
                 builder.append("· ").append(shortPath(step.files.get(i)));
             }
             if (step.files.size() > 6) builder.append("\n· 等 ").append(step.files.size()).append(" 个文件");
-            addTo(box, ui.text(builder.toString(), 10, WatchUi.ACCENT), 4, 0);
         }
-        if (!step.result.isEmpty()) {
-            // 结果常是 Markdown（很多工具输出本身就是 .md 内容），一并渲染。
-            CharSequence rendered = Markdown.render(cut(shortenPaths(step.result), 2000),
-                    step.isError ? WatchUi.DANGER : WatchUi.MUTED,
-                    WatchUi.ACCENT, WatchUi.MUTED, WatchUi.SURFACE_HI);
-            TextView result = ui.text(rendered, 10, step.isError ? WatchUi.DANGER : WatchUi.MUTED);
-            addTo(box, result, 4, 0);
-        }
-        return box;
+        String result = step.result.isEmpty() ? "（还在执行）" : cut(shortenPaths(step.result), 3000);
+        if (builder.length() > 0) builder.append("\n\n");
+        builder.append(result);
+        // 结果常是 Markdown（很多工具输出本身就是 .md 内容），一并渲染。
+        return Markdown.render(builder.toString(),
+                step.isError ? WatchUi.DANGER : WatchUi.MUTED,
+                WatchUi.ACCENT, WatchUi.MUTED, WatchUi.SURFACE_HI);
     }
 
     /** 往任意容器里加视图（走 WatchUi 以保证圆屏四角安全）。 */
@@ -1278,53 +1387,6 @@ public class MainActivity extends Activity {
         return label;
     }
 
-    /**
-     * 一次工具调用的卡片。
-     *
-     * 电脑上的观感是「工具名 + 参数摘要 + 结果」；手表上保留这三样，
-     * 并给改动的文件单独列一行，让用户知道动了哪些文件。
-     */
-    private View toolCard(Api.Step step) {
-        LinearLayout card = ui.card();
-        LinearLayout header = new LinearLayout(this);
-        header.setOrientation(LinearLayout.HORIZONTAL);
-        header.addView(ui.chip(statusMark(step), statusColor(step)));
-        TextView name = ui.text(" " + (step.label.isEmpty() ? "工具" : step.label), 12, WatchUi.FG);
-        header.addView(name);
-        card.addView(header);
-
-        if (!step.detail.isEmpty()) {
-            // 参数摘要里常见完整路径；圆屏放不下，先压短再截断。
-            TextView detail = ui.text(cut(shortenPaths(step.detail), 160), 11, WatchUi.MUTED);
-            detail.setPadding(0, ui.dp(6), 0, 0);
-            card.addView(detail);
-        }
-
-        if (!step.files.isEmpty()) {
-            StringBuilder builder = new StringBuilder();
-            for (int i = 0; i < step.files.size() && i < 4; i++) {
-                if (i > 0) builder.append('\n');
-                builder.append("· ").append(shortPath(step.files.get(i)));
-            }
-            if (step.files.size() > 4) builder.append("\n· 等 ").append(step.files.size()).append(" 个文件");
-            TextView files = ui.text(builder.toString(), 10, WatchUi.ACCENT);
-            files.setPadding(0, ui.dp(6), 0, 0);
-            card.addView(files);
-        }
-
-        if (!step.result.isEmpty()) {
-            TextView result = ui.text(cut(shortenPaths(step.result), 260), 10,
-                    step.isError ? WatchUi.DANGER : WatchUi.MUTED);
-            result.setPadding(0, ui.dp(6), 0, 0);
-            card.addView(result);
-        }
-        // 点整张卡片看完整结果。
-        card.setOnClickListener(v -> showStepDetail(step));
-        card.setFocusable(true);
-        card.setClickable(true);
-        return card;
-    }
-
     private String statusMark(Api.Step step) {
         if ("running".equals(step.status)) return "进行中";
         if (step.isError || "error".equals(step.status)) return "失败";
@@ -1335,32 +1397,6 @@ public class MainActivity extends Activity {
         if ("running".equals(step.status)) return WatchUi.WARN;
         if (step.isError || "error".equals(step.status)) return WatchUi.DANGER;
         return WatchUi.OK;
-    }
-
-    /** 一条工具调用的完整信息，供点开查看。 */
-    private void showStepDetail(Api.Step step) {
-        onSessionPage = true;
-        editing = true;
-        WatchUi.Page page = ui.page();
-        ui.heading(page, step.label.isEmpty() ? "工具" : step.label, statusMark(step));
-        if (!step.name.isEmpty()) {
-            ui.add(page, ui.text("内部名：" + step.name, 11, WatchUi.MUTED), 0, 8);
-        }
-        if (!step.detail.isEmpty()) {
-            ui.add(page, ui.text("调用参数", 11, WatchUi.ACCENT), 0, 4);
-            ui.add(page, ui.bubble(step.detail, false), 0, 10);
-        }
-        if (!step.files.isEmpty()) {
-            ui.add(page, ui.text("改动的文件", 11, WatchUi.ACCENT), 0, 4);
-            ui.add(page, ui.bubble(join(step.files), false), 0, 10);
-        }
-        ui.add(page, ui.text("结果", 11, WatchUi.ACCENT), 0, 4);
-        ui.add(page, ui.bubble(step.result.isEmpty() ? "（还在执行）" : step.result, false), 0, 10);
-        ui.add(page, ui.button("返回会话", true, () -> {
-            editing = false;
-            renderSession("");
-        }), 0, 0);
-        render(page);
     }
 
     /** 只看对话（不显示工具步骤）。 */
@@ -1521,11 +1557,12 @@ public class MainActivity extends Activity {
         }
     }
 
-    /** 模型选择页：先选供应商，再选模型，最后选推理档位。 */
+    /** 模型选择页：先显示当前模型，再选供应商、模型，最后选推理档位。 */
     private void showModelPicker() {
         onSessionPage = true;
         editing = true;
         modelProviders.clear();
+        modelDefault = null;
         renderModelLoading();
         api.get(baseUrl(), "/api/models", store.token(), result -> {
             if (destroyed) return;
@@ -1534,6 +1571,7 @@ public class MainActivity extends Activity {
                 return;
             }
             modelProviders.addAll(Api.parseModels(result.value));
+            modelDefault = Api.parseModelDefault(result.value);
             if (modelProviders.isEmpty()) {
                 renderModelError("电脑上没有可用的模型");
                 return;
@@ -1543,6 +1581,53 @@ public class MainActivity extends Activity {
     }
 
     private final List<Api.ProviderInfo> modelProviders = new ArrayList<>();
+
+    /** 目录里的默认选择；会话尚无用量时充当「当前模型」。 */
+    private Api.ModelChoice modelDefault;
+
+    /**
+     * 当前生效的模型（供应商、模型名、推理强度）。
+     *
+     * 优先用会话用量——它是这个会话真正在跑的模型；会话还没有回复时用量是空的，
+     * 这时才退回目录里的默认值。两者都不能凭空捏造，否则会显示一个并不生效的模型。
+     */
+    private Api.ModelChoice currentChoice() {
+        Api.ModelChoice choice = new Api.ModelChoice();
+        if (usage != null && !usage.model.isEmpty()) {
+            choice.provider = usage.provider;
+            choice.model = usage.model;
+            choice.effort = usage.effort;
+            return choice;
+        }
+        // 会话列表的摘要里也带模型，进入会话后先于用量到位。
+        for (Api.Session session : sessions) {
+            if (session.id.equals(currentSessionId) && !session.model.isEmpty()) {
+                choice.provider = session.provider;
+                choice.model = session.model;
+                choice.effort = session.effort;
+                return choice;
+            }
+        }
+        return modelDefault == null ? choice : modelDefault;
+    }
+
+    /** 「供应商/模型」的展示形态；缺供应商时只给模型名。 */
+    private static String choiceName(Api.ModelChoice choice) {
+        if (choice.model.isEmpty()) return "未知";
+        return choice.provider.isEmpty() ? choice.model : choice.provider + "/" + choice.model;
+    }
+
+    /** 当前模型的展示名：优先用目录里的可读名，找不到就用 id。 */
+    private String choiceDisplayName(Api.ModelChoice choice) {
+        for (Api.ProviderInfo provider : modelProviders) {
+            for (Api.ModelInfo model : provider.models) {
+                if (model.id.equals(choice.model)) {
+                    return model.name.isEmpty() ? choice.model : model.name;
+                }
+            }
+        }
+        return choice.model.isEmpty() ? "未知" : choice.model;
+    }
 
     private void renderModelLoading() {
         WatchUi.Page page = ui.page();
@@ -1562,13 +1647,16 @@ public class MainActivity extends Activity {
         render(page);
     }
 
-    /** 第一步：列出供应商。 */
+    /** 第一步：先说明当前模型，再列出供应商。 */
     private void renderProviderPicker(int scrollTo) {
         WatchUi.Page page = ui.page();
-        ui.heading(page, "选择模型", "第 1 步：选供应商");
+        Api.ModelChoice current = currentChoice();
+        ui.heading(page, "选择模型", "当前：" + choiceDisplayName(current));
+        ui.add(page, currentModelCard(current), 0, 10);
+        ui.add(page, ui.text("第 1 步：选供应商", 11, WatchUi.ACCENT), 0, 5);
         for (Api.ProviderInfo provider : modelProviders) {
             String subtitle = provider.models.size() + " 个模型";
-            if (usage != null && provider.provider.equals(usage.provider)) subtitle = "当前 · " + subtitle;
+            if (provider.provider.equals(current.provider)) subtitle = "当前 · " + subtitle;
             ui.add(page, ui.row(provider.name, subtitle, () -> renderModelList(provider, 0)), 0, 7);
         }
         ui.add(page, ui.button("返回会话", false, () -> {
@@ -1579,13 +1667,30 @@ public class MainActivity extends Activity {
         page.scroll.post(() -> page.scroll.scrollTo(0, scrollTo));
     }
 
+    /** 当前模型卡片：模型名、所属供应商与推理强度。 */
+    private View currentModelCard(Api.ModelChoice current) {
+        LinearLayout card = ui.card();
+        card.addView(ui.text("当前模型", 11, WatchUi.ACCENT));
+        TextView name = ui.text(choiceDisplayName(current), 14, WatchUi.FG);
+        name.setPadding(0, ui.dp(5), 0, 0);
+        card.addView(name);
+        StringBuilder sub = new StringBuilder(choiceName(current));
+        if (!current.effort.isEmpty()) sub.append(" · 推理强度 ").append(effortName(current.effort));
+        TextView detail = ui.text(sub.toString(), 10, WatchUi.MUTED);
+        detail.setPadding(0, ui.dp(4), 0, 0);
+        detail.setMaxLines(2);
+        card.addView(detail);
+        return card;
+    }
+
     /** 第二步：列出该供应商的模型。 */
     private void renderModelList(Api.ProviderInfo provider, int scrollTo) {
         WatchUi.Page page = ui.page();
+        Api.ModelChoice current = currentChoice();
         ui.heading(page, provider.name, "第 2 步：选模型");
         for (Api.ModelInfo model : provider.models) {
             String subtitle = model.efforts.isEmpty() ? "" : "推理强度 " + model.efforts.size() + " 档";
-            if (usage != null && model.id.equals(usage.model)) subtitle = "当前使用" + (subtitle.isEmpty() ? "" : " · " + subtitle);
+            if (model.id.equals(current.model)) subtitle = "当前使用" + (subtitle.isEmpty() ? "" : " · " + subtitle);
             ui.add(page, ui.row(model.name, subtitle, () -> {
                 if (model.efforts.isEmpty()) {
                     applyModel(provider.provider, model.id, "");
@@ -1602,9 +1707,11 @@ public class MainActivity extends Activity {
     /** 第三步：选推理档位。 */
     private void renderEffortPicker(Api.ProviderInfo provider, Api.ModelInfo model, int scrollTo) {
         WatchUi.Page page = ui.page();
+        Api.ModelChoice current = currentChoice();
         ui.heading(page, model.name, "第 3 步：选推理强度");
         for (String effort : model.efforts) {
-            String subtitle = usage != null && effort.equals(usage.effort) ? "当前" : "";
+            // 只有当前用的就是这个模型时才标「当前」，否则会同时出现好几行「当前」。
+            String subtitle = model.id.equals(current.model) && effort.equals(current.effort) ? "当前" : "";
             ui.add(page, ui.row(effortName(effort), subtitle, () -> applyModel(provider.provider, model.id, effort)), 0, 7);
         }
         ui.add(page, ui.button("返回模型", false, () -> renderModelList(provider, 0)), 4, 0);
@@ -1643,14 +1750,30 @@ public class MainActivity extends Activity {
                 return;
             }
             // 本地立刻反映新模型，随后拉一次会话以同步用量里的模型信息。
+            String newProvider = result.value.optString("provider", provider);
+            String newModel = result.value.optString("model", model);
+            String newEffort = result.value.optString("effort", effort);
             if (usage != null) {
-                usage.provider = result.value.optString("provider", provider);
-                usage.model = result.value.optString("model", model);
-                usage.effort = result.value.optString("effort", effort);
+                usage.provider = newProvider;
+                usage.model = newModel;
+                usage.effort = newEffort;
+            }
+            // 会话还没产生回复时用量是空的；不补一份选择记录，返回模型页仍会显示旧模型。
+            Api.ModelChoice choice = new Api.ModelChoice();
+            choice.provider = newProvider;
+            choice.model = newModel;
+            choice.effort = newEffort;
+            modelDefault = choice;
+            for (Api.Session session : sessions) {
+                if (session.id.equals(currentSessionId)) {
+                    session.provider = newProvider;
+                    session.model = newModel;
+                    session.effort = newEffort;
+                }
             }
             editing = false;
             lastContentSignature = 0;
-            renderSession("已切换到 " + model);
+            renderSession("已切换到 " + newModel);
             loadSession(currentSessionId, true);
         });
     }
@@ -1929,15 +2052,6 @@ public class MainActivity extends Activity {
     }
 
     // ---------------------------------------------------------------- 工具
-
-    private static String join(List<String> values) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < values.size(); i++) {
-            if (i > 0) builder.append("、");
-            builder.append(values.get(i));
-        }
-        return builder.toString();
-    }
 
     /** 手表上长文本会拖垮滚动体验，截断并省略（可折行，用于正文）。 */
     private static String cut(String text, int limit) {

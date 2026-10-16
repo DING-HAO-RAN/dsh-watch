@@ -241,6 +241,8 @@ final class Api {
     static final class Step {
         /** message 或 tool。 */
         String kind = "message";
+        /** 事件序号；同一个会话里唯一，界面用它认出「还是那一组工具调用」。 */
+        long seq;
         String role = "assistant";
         String text = "";
         final List<String> tools = new ArrayList<>();
@@ -291,6 +293,13 @@ final class Api {
         String provider = "";
         String name = "";
         final List<ModelInfo> models = new ArrayList<>();
+    }
+
+    /** 模型目录里记的默认选择；会话还没产生回复时用它当作「当前模型」。 */
+    static final class ModelChoice {
+        String provider = "";
+        String model = "";
+        String effort = "";
     }
 
     /** 按项目分组的会话。 */
@@ -414,6 +423,7 @@ final class Api {
             if (item == null) continue;
             Step step = new Step();
             step.kind = text(item, "kind");
+            step.seq = item.optLong("seq", 0L);
             step.role = text(item, "role");
             step.text = text(item, "text");
             step.name = text(item, "name");
@@ -499,6 +509,22 @@ final class Api {
             if (!info.provider.isEmpty()) providers.add(info);
         }
         return providers;
+    }
+
+    /**
+     * 解析模型目录里的默认选择。
+     *
+     * 会话还没产生回复时用量里没有模型信息（新建会话就是这样），
+     * 此时目录的 default 才是「当前模型」的唯一来源。
+     */
+    static ModelChoice parseModelDefault(JSONObject root) {
+        ModelChoice choice = new ModelChoice();
+        JSONObject item = root.optJSONObject("default");
+        if (item == null) return choice;
+        choice.provider = text(item, "provider");
+        choice.model = text(item, "model");
+        choice.effort = text(item, "effort");
+        return choice;
     }
 
     static List<Ask> parsePending(JSONObject root) {
