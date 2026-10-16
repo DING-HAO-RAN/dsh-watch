@@ -19,8 +19,11 @@
 
 需要电脑装了 Node.js 22 以上，并确认 DSH 桌面版正在运行。
 
+最省事的办法是双击 [scripts/启动中继.cmd](<scripts/启动中继.cmd>)。想用命令行或改端口：
+
 ```powershell
 node relay/src/server.mjs
+node relay/src/server.mjs --port 19390 --dsh-port 19387   # 指定端口
 ```
 
 启动后它会打印局域网地址和一个 **6 位配对码**，例如：
