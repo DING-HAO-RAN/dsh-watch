@@ -21,7 +21,9 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
 
 $WorkRoot = [IO.Path]::GetFullPath($WorkRoot)
-if (-not $OutputDir) { $OutputDir = Join-Path $WorkRoot 'dist' }
+# 输出到独立目录：build-app.ps1 会清空自己的输出目录，两者共用 dist/DSH中继 时
+# 后跑的那个会把先跑的产物删掉。
+if (-not $OutputDir) { $OutputDir = Join-Path $WorkRoot 'dist\中继命令行版' }
 $relay = Join-Path $WorkRoot 'relay'
 
 if (-not $NodePath) {
