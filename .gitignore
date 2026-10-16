@@ -1,11 +1,19 @@
 # 构建产物（体积大，按需重新生成，不进版本库）
 # 手表安装包：scripts/build.ps1
 dist/*.apk
-# 中继独立程序：scripts/pack-relay.ps1（含 Node 运行时，单文件近 90MB）
+# 中继桌面程序：scripts/build-app.ps1
 dist/DSH中继/
+# 中继命令行版：scripts/pack-relay.ps1（含 Node 运行时，单文件近 90MB）
+dist/中继命令行版/
 build/
+build-app/
 *.class
 *.dex
+
+# 程序运行时在自身目录生成的东西
+startup.log
+debug.log
+WebView2Loader.dll
 
 # 本地环境
 .env

@@ -628,6 +628,8 @@ public class MainActivity extends Activity {
             store.clearToken();
             showConnect();
         }), 0, 0);
+        // 错误页也要能开菜单（右键回到项目列表），否则用户被锁在这一页。
+        page.setOnSwipeLeft(() -> showActionMenu(menuForProjects()));
         render(page);
     }
 
@@ -784,7 +786,17 @@ public class MainActivity extends Activity {
         WatchUi.Page page = ui.page();
         ui.heading(page, "读取失败", currentSessionTitle);
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
+        ui.add(page, ui.text("地址：" + store.base(), 11, WatchUi.MUTED), 0, 12);
         ui.add(page, ui.button("重试", true, () -> loadSession(currentSessionId, false)), 0, 8);
+        // 必须留出口：应用会直接恢复到上次的会话页，若只给「重试」，地址失效时
+        // （换网、中继换机或换端口）就再也进不了设置页，只能卸载重装。
+        ui.add(page, ui.button("重新配对", false, () -> {
+            store.clearToken();
+            showConnect();
+        }), 0, 0);
+        // 手势与正常会话页保持一致，否则左滑开不了菜单、右滑回不去列表。
+        page.setOnSwipeRight(this::backToList);
+        page.setOnSwipeLeft(() -> showActionMenu(menuForSession()));
         render(page);
     }
 
@@ -1154,8 +1166,11 @@ public class MainActivity extends Activity {
 
         setCollapsed(card, details, toggle, summaryView, true, group.size());
         card.setOnClickListener(v -> {
-            boolean collapsed = details.getVisibility() != View.VISIBLE;
-            setCollapsed(card, details, toggle, summaryView, collapsed, group.size());
+            // 这里的参数是「目标状态」，因此按当前可见性取反：
+            // 明细可见说明该收起，不可见说明该展开。曾把「当前是否折叠」直接当参数传入，
+            // 结果每次点击都再折叠一次，卡片永远打不开。
+            boolean targetCollapsed = details.getVisibility() == View.VISIBLE;
+            setCollapsed(card, details, toggle, summaryView, targetCollapsed, group.size());
         });
         card.setFocusable(true);
         card.setClickable(true);

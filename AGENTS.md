@@ -2,12 +2,29 @@
 
 ## 构成
 
-- 两个部件：[电脑端中继](<relay/>)（Node，无第三方运行依赖）与[手表端应用](<app/>)（原生 Java，无第三方运行库）。中继负责 DSH 鉴权与数据裁剪，手表只调用中继自己的简单接口。
+- 三个部件：[桌面程序](<desktop/>)（C#，装在电脑上，日常用这个）、[手表端应用](<app/>)（原生 Java）、[命令行中继](<relay/>)（Node，无界面，供脚本或服务器环境使用）。中继负责 DSH 鉴权与数据裁剪，手表只调用中继自己的简单接口。
+- **桌面程序是主推形态**：一个 exe 拷到任何 Windows 10/11 上双击即用，自动找到本机 DSH 并显示配对码与地址。
 - 中继**不修改 DSH 配置、不依赖任何 DSH 插件**，这是需求方明确要求的前提，改动方案时不得破坏。
-- 中继支持三种分发形态，改动时三者都要兼顾：开发时直接跑 `relay/src/server.mjs`；[start-relay.cmd](<relay/start-relay.cmd>) 双击启动；[scripts/pack-relay.ps1](<scripts/pack-relay.ps1>) 打成单文件 exe（目标机无需 Node）。
 - 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**。
 
-## 中继打包（SEA）
+## 桌面程序（C#）
+
+- 构建：[scripts/build-app.ps1](<scripts/build-app.ps1>) 用**系统自带的 .NET Framework 4.8 编译器**（`%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe`）。这是刻意的选择：产出的 exe 在 Win10 1903+/Win11 上开箱即用，**目标机不需要装 .NET SDK、不需要装 Node.js**。
+- **该编译器只支持 C# 5**：不能用 `$"..."` 字符串插值、`nameof`、表达式体成员。集合初始化器、`var`、lambda、匿名方法都可以。违规时报 `error CS1644: 功能"..."在 C# 5 中不可用`。
+- 界面有两层，**不要把它们合并**：
+  1. **WebView2 网页界面**（[panel.html](<desktop/src/panel.html>) + [MainForm.cs](<desktop/src/MainForm.cs>)）：好看、信息密度高，但依赖 WebView2 运行时；
+  2. **原生界面**（[NativePanel.cs](<desktop/src/NativePanel.cs>)）：纯 WinForms，零依赖，**永远可用**，同时是内嵌浏览器失败时的自动降级目标。
+  这样分层的理由：中继本身不需要浏览器就能工作，精简版 Windows 上可能没有 WebView2；有了第二层，「任何电脑都能打开并显示配对码」才有保证。
+- **依赖全部嵌进 exe**，分发只有一个文件。挂载方式（[Bootstrap.cs](<desktop/src/Bootstrap.cs>)）分两条路，两者都必须保留：
+  - 托管程序集用 `Assembly.Load(byte[])` **从内存装入**（在 `AssemblyResolve` 里实现）；
+  - 原生加载器 `WebView2Loader.dll` **必须落盘**（Win32 的 `LoadLibrary` 只接受路径），优先写程序自身目录，失败再退到临时目录。
+- **绝不要把依赖做成"解压到用户配置目录"**：受控环境（企业策略、沙箱）会拒绝对 `%LOCALAPPDATA%` 的写入，表现为 `Directory.CreateDirectory` 抛"访问被拒绝"，随后 WebView2 报"未能加载程序集"。优先写程序目录就是这个原因。
+- `Bootstrap.Init()` 必须在**任何 WebView2 类型被 JIT 之前**调用，否则类型解析会先失败。
+- 程序目录下的 `startup.log` 记录启动全过程（DSH 定位、端口、依赖释放、异常堆栈）。**GUI 程序闪退时这是唯一的诊断线索**，排查先看它。
+- 判断程序是否真的在运行**不要用 `Get-Process -Name 中文名`**（对中文进程名不可靠，会假报"未找到"）。可靠做法：`tasklist /FO CSV` 过滤，或 `Get-CimInstance Win32_Process -Filter "Name='DSH中继.exe'"`。
+- 从命令行启动 GUI 程序时 `Start-Process`/`& exe` 会阻塞到程序退出，**这不代表失败**。要立即返回并拿到 PID，用 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create`。
+
+## 中继打包（命令行版，SEA）
 
 - 打包链路：`scripts/pack-relay.ps1` → `scripts/bundle-relay.mjs` → Node SEA → postject 注入。
 - `bundle-relay.mjs` 的四条硬规则，改动时不要违反（每条都对应一个真实故障）：
@@ -21,7 +38,8 @@
 
 ## 公网中转
 
-- `--tunnel` 会拉起 cloudflared 生成一条临时 `*.trycloudflare.com` 地址；可执行文件按 `relay/bin/` → 分发包 `bin/` → DSH 插件目录 → PATH 的顺序查找。
+- 桌面程序与命令行版都支持公网中转，拉起 cloudflared 生成一条临时 `*.trycloudflare.com` 地址。查找顺序：程序目录 → `relay/bin/` → DSH 插件目录 → PATH。
+- **Cloudflare 对免注册隧道有频率限制**，短时间内反复开关会返回 HTTP 429。桌面程序为此做了 4 轮递增退避重试，且看到 429 立即收工而不是等满超时——**不要把这个重试去掉**，去掉后用户点一次就会拿到失败弹窗。局域网功能不受影响。
 - 手表端走 HTTPS 时放行全部证书（`Api.insecureFactory`）——手表上没有便捷的证书安装入口，访问控制由配对令牌承担。
 
 ## DSH 协议（实测结论，改动前先复核）

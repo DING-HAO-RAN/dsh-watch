@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DSH 中继</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d1117;
+    --card: #161b22;
+    --line: #262d38;
+    --fg: #e6edf3;
+    --muted: #8b98a9;
+    --accent: #58a6ff;
+    --ok: #3fb950;
+    --warn: #d29922;
+    --bad: #f85149;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.65 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  .wrap { width: min(880px, 94vw); margin: 0 auto; padding: 28px 0 48px; }
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 22px; margin: 0; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.off { background: var(--bad); }
+  .sub { color: var(--muted); font-size: 13px; margin-bottom: 22px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 720px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--line);
+    border-radius: 12px; padding: 18px 20px;
+  }
+  .card h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+    color: var(--muted); margin: 0 0 14px; font-weight: 600;
+  }
+  .wide { grid-column: 1 / -1; }
+  .row { display: flex; justify-content: space-between; gap: 14px; padding: 5px 0; font-size: 14px; }
+  .row .k { color: var(--muted); flex: none; }
+  .row .v { text-align: right; word-break: break-all; font-family: ui-monospace, Consolas, monospace; }
+  .code {
+    font-family: ui-monospace, Consolas, monospace;
+    font-size: 40px; letter-spacing: 10px; color: var(--warn);
+    text-align: center; padding: 6px 0 2px; user-select: all;
+  }
+  .addr {
+    display: flex; align-items: center; gap: 8px;
+    padding: 8px 10px; border-radius: 8px; background: #1c2230;
+    margin-bottom: 8px; font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+  }
+  .addr .tag {
+    flex: none; font-size: 11px; padding: 1px 7px; border-radius: 5px;
+    background: #2d3646; color: var(--muted); font-family: inherit;
+  }
+  .addr .text { flex: 1; word-break: break-all; user-select: all; }
+  button {
+    font: inherit; font-size: 13px; color: var(--fg);
+    background: #21262d; border: 1px solid var(--line);
+    border-radius: 7px; padding: 5px 12px; cursor: pointer;
+  }
+  button:hover { background: #2d333b; border-color: #3d444d; }
+  button.primary { background: #1f6feb; border-color: #1f6feb; }
+  button.primary:hover { background: #2b7cf5; }
+  button:disabled { opacity: .5; cursor: default; }
+  ol { margin: 0; padding-left: 20px; color: var(--muted); font-size: 13px; }
+  ol li { margin: 7px 0; }
+  ol li b { color: var(--fg); font-weight: 600; }
+  code { background: #21262d; padding: 1px 6px; border-radius: 5px; font-size: 12.5px; }
+  .meta { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+  .meta .hint { color: var(--muted); font-size: 12.5px; }
+  .empty { color: var(--muted); font-size: 13px; }
+  .bad { color: var(--bad); font-size: 13px; }
+  .ok { color: var(--ok); }
+  .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <span class="dot" id="dot"></span>
+    <h1>DSH 中继</h1>
+  </header>
+  <div class="sub" id="status">正在连接…</div>
+
+  <div class="grid">
+    <div class="card wide">
+      <h2>配对码</h2>
+      <div class="code" id="code">——————</div>
+      <div class="meta">
+        <span class="hint" id="codeHint">在手表的「设置」里填入即可配对</span>
+        <button id="refreshCode">换一个</button>
+      </div>
+    </div>
+
+    <div class="card wide">
+      <h2>地址</h2>
+      <div id="addresses"></div>
+      <div class="actions">
+        <button class="primary" id="addTunnel">开启公网访问</button>
+        <button id="stopTunnel" disabled>关闭公网访问</button>
+        <button id="copyAll">复制全部信息</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>手表怎么连</h2>
+      <ol>
+        <li>手表上打开「DSH 手表」→ 左滑 →「设置」</li>
+        <li>地址填上面任意一条（同一 WiFi 用局域网，否则用公网）</li>
+        <li>配对码填上面的 6 位数字，点「配对并连接」</li>
+      </ol>
+    </div>
+
+    <div class="card">
+      <h2>运行状态</h2>
+      <div class="row"><span class="k">DSH</span><span class="v" id="dshInfo">—</span></div>
+      <div class="row"><span class="k">已运行</span><span class="v" id="uptime">—</span></div>
+      <div class="row"><span class="k">已配对设备</span><span class="v" id="devices">—</span></div>
+      <div class="row"><span class="k">中继端口</span><span class="v" id="port">—</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let state = null;
+
+  function fmtDuration(ms) {
+    if (!ms) return '—';
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + ' 秒';
+    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+    return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
+  }
+
+  function render() {
+    if (!state) return;
+    $('dot').className = 'dot ' + (state.running ? 'on' : 'off');
+    $('status').textContent = state.running
+      ? `中继正在运行，${state.deviceCount} 台设备已配对`
+      : (state.error ? '中继未在运行：' + state.error : '中继未在运行');
+
+    $('code').textContent = state.pairingCode || '——————';
+    $('dshInfo').textContent = state.dshPort ? ('127.0.0.1:' + state.dshPort) : '—';
+    $('uptime').textContent = fmtDuration(state.uptimeMs);
+    $('devices').textContent = state.deviceCount ?? '—';
+    $('port').textContent = state.port ?? '—';
+
+    const list = $('addresses');
+    list.innerHTML = '';
+    const items = [];
+    (state.lanAddresses || []).forEach((ip, i) => {
+      items.push({ tag: i === 0 ? '局域网' : '', url: `http://${ip}:${state.port}` });
+    });
+    if (state.publicUrl) items.push({ tag: '公网', url: state.publicUrl });
+
+    if (items.length === 0) {
+      list.innerHTML = '<div class="empty">尚未取得地址</div>';
+    }
+    items.forEach((item) => {
+      const row = document.createElement('div');
+      row.className = 'addr';
+      row.innerHTML = `<span class="tag">${item.tag || '备用'}</span><span class="text">${item.url}</span>`;
+      const copy = document.createElement('button');
+      copy.textContent = '复制';
+      copy.onclick = () => { navigator.clipboard.writeText(item.url); copy.textContent = '已复制'; setTimeout(() => copy.textContent = '复制', 1200); };
+      row.appendChild(copy);
+      list.appendChild(row);
+    });
+
+    $('stopTunnel').disabled = !state.publicUrl;
+    $('addTunnel').disabled = !!state.publicUrl;
+    $('addTunnel').textContent = state.tunnelBusy ? '正在开启…' : '开启公网访问';
+  }
+
+  async function poll() {
+    try {
+      const response = await fetch('state');
+      state = await response.json();
+      render();
+    } catch (error) {
+      $('dot').className = 'dot off';
+      $('status').textContent = '与中继进程失去联系';
+    }
+  }
+
+  $('refreshCode').onclick = async () => {
+    await fetch('rotate-code', { method: 'POST' });
+    poll();
+  };
+
+  $('addTunnel').onclick = async () => {
+    state.tunnelBusy = true; render();
+    const response = await fetch('tunnel', { method: 'POST' });
+    const body = await response.json();
+    if (!body.ok) alert('公网访问未开启：' + body.error);
+    await poll();
+    state.tunnelBusy = false; render();
+  };
+
+  $('stopTunnel').onclick = async () => {
+    await fetch('tunnel', { method: 'DELETE' });
+    poll();
+  };
+
+  $('copyAll').onclick = () => {
+    const lines = [`DSH 手表连接信息`, `配对码：${state.pairingCode}`];
+    (state.lanAddresses || []).forEach((ip, i) => lines.push(`局域网${i === 0 ? '' : i + 1}：http://${ip}:${state.port}`));
+    if (state.publicUrl) lines.push(`公网：${state.publicUrl}`);
+    navigator.clipboard.writeText(lines.join('\n'));
+    $('copyAll').textContent = '已复制';
+    setTimeout(() => $('copyAll').textContent = '复制全部信息', 1400);
+  };
+
+  poll();
+  setInterval(poll, 2000);
+</script>
+</body>
+</html>
