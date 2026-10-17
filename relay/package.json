@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "description": "把本机 DSH 桌面版桥接给局域网内手表的轻量中继",
+  "license": "MIT",
   "main": "src/server.mjs",
   "engines": {
     "node": ">=22"
