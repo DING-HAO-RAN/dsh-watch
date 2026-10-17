@@ -6,6 +6,24 @@
 - **桌面程序是主推形态**：一个 exe 拷到任何 Windows 10/11 上双击即用，自动找到本机 DSH 并显示配对码与地址。
 - 中继**不修改 DSH 配置、不依赖任何 DSH 插件**，这是需求方明确要求的前提，改动方案时不得破坏。
 - 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**。
+- 需求方明确要求「**默认沿用同一端口与密钥，除非用户主动更改**」：配对码与令牌必须跨启动、跨升级保留，不要改回每次都随机生成。
+
+## 配对与多设备
+
+- 桌面程序的配对码与令牌存在 [RelaySettings](<desktop/src/RelaySettings.cs>)：优先 `%LOCALAPPDATA%\dsh-relay\relay-settings.json`，不可写时用程序目录的 `data\`。**`build-app.ps1` 会保留 `data\`**，否则每次重建就丢一次配对（实测过）。
+- **配对码配对成功时不更换**：换了手表下次就得重输，与需求方要求相反。需要换码时由用户点界面上的按钮。
+- 一键配对的链路：手表发 UDP 查询 → 中继单播回复 → 手表 `POST /api/pair/request` → 电脑弹窗 → 用户点「是」→ 中继发放一次性票据 → 手表轮询 `GET /api/pair/result` 拿到 grant → `POST /api/pair {grant}` 换令牌。
+- **`/api/pair/request` 与 `/api/pair/result` 必须先于鉴权判断**（手表这时还没有令牌）。安全边界靠电脑端弹窗，因此这三条防护不能删：
+  1. 同 IP 15 秒冷却 + 待确认请求上限 3（防弹窗轰炸）；
+  2. **grant 必须是独立随机值**，不能复用 `requestId`——requestId 明文回给请求方，复用它等于把用户确认环节架空；
+  3. grant 2 分钟过期并定期清理（`PruneGrants`），否则旧票据永久有效。
+- 手表端 [Store](<app/src/main/java/cn/dsh/watch/Store.java>) 存的是**设备列表**（地址 + 令牌 + 备注 + 最后使用时间），`base()`/`token()` 语义不变仍指「当前设备」，因此三十余处调用点不用改。切换设备时必须清空会话、`steps`、`openGroups`、`openRows` 与 `lastListSignature`，否则上一台设备的状态会套到新界面上。
+- 局域网发现是**双向**的：中继既周期广播也响应手表的查询，且要按网段算定向广播地址（部分路由器丢弃 `255.255.255.255`）。**收发必须用两个独立 socket**——共用一个时，bind 到固定端口后再 Send 在部分 Windows 配置下会静默失败。
+
+## 思考内容
+
+- DSH 的 `assistant/message` 里 `content` 块按 `type` 分三类：`text`、`tool-call`、`reasoning`。实测一条会话里 reasoning 占 35 个、tool-call 59 个、text 仅 5 个——**思考才是占比最高的一类**，早期把它整类丢掉了。
+- reasoning 块与 text 块字段相同（`type` + `text`），由 `Steps.ThinkingOfContent` 单独抽取，写进 `thinking` 字段。手表上做成默认折叠的「思考 ▸」块，展开状态记在 `openRows`（键 `think:<seq>`），否则 4 秒一次的刷新会把它收回去。
 
 ## 桌面程序（C#）
 
@@ -103,7 +121,7 @@
 
 - 三个只读/半只读自检脚本：`tests/check-protocol.mjs`（端点参数形态）、`tests/check-features.mjs`（项目分组、步骤详情、模型目录、用量、翻页）、`tests/e2e.mjs`（配对、列表、读消息、发消息）。
 - **`check-features.mjs` / `answer-once.mjs` / `send.mjs` 不带 `--token` 时会去读 `~/.dsh-watch-relay.json`**，那是**命令行版中继**的存档；桌面程序的令牌只存在内存里，不落这个文件。因此对着桌面程序跑而不显式传 `--token` 时，会拿到旧令牌或空令牌，**表现为 8 条用例全红**（「列表失败」「缺少样本会话」），容易被误判成功能坏了。稳妥做法是另起一个带 `--state-file` 的命令行中继，配对取新令牌后再跑。
-- **配对码一次性**：配对成功即刻更换，`e2e.mjs` 与前面手动配对不能共用同一个码，一条命令里连跑两次必然失败。每次跑之前重新从 `/local/state` 取当前配对码。
+- **配对码现在不再「用一次就换」**（按需求方要求改为沿用），所以同一台中继的配对码在多次测试间是稳定的，可以从 `/local/state` 反复取用。要让它换新只有两条路：点界面上的「换一个配对码」，或删掉设置文件。
 - **`e2e.mjs` 挑样本会话有两条硬要求**，否则会误报失败：
   1. 必须**有正文**——列表首项常是刚建的空会话；
   2. 必须**空闲**（`running !== true`）——DSH 对运行中的会话会把新消息放进队列而不立即写入历史，此时查历史必然找不到。发送用例因此单独建一个空白会话。
