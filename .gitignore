@@ -27,5 +27,6 @@ Thumbs.db
 # 浏览器数据（运行时生成，位置随版本变化）
 *.WebView2/
 
-# 介绍片成片（11MB，上传 B 站用）；制作脚本在 D:\WatchDshVideo
+# 介绍片成片与封面（上传 B 站用）；制作脚本在 D:\WatchDshVideo-src
 docs/*.mp4
+docs/*.png
