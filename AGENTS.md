@@ -133,7 +133,7 @@
 ## 介绍片素材
 
 - 成片与封面放在 `docs/`：`DSH手表-项目介绍.mp4`（1920×1080 / 60fps / 约 70 秒 / 11MB）、`DSH手表-视频封面.png`。**两者都不进版本库**（`.gitignore` 已忽略，体积与用途都不适合放仓库），只在本机留档。
-- 制作脚本在仓库外的 `D:\WatchDshVideo-src`：`player.html` 用一个纯函数 `render(t)` 描述每一帧，`render.mjs` 通过 CDP 驱动无头 Edge 按时间点逐帧截图，`tts.mjs` 调曼波 TTS 生成配音，`bgm.mjs` 用纯数学合成背景音乐，`audio.mjs` / `encode.mjs` 负责混音与编码。
+- 制作脚本在 `docs/介绍片制作/`（含字体，24MB，`.gitignore` 已忽略）：`player.html` 用一个纯函数 `render(t)` 描述每一帧，`render.mjs` 通过 CDP 驱动无头 Edge 按时间点逐帧截图，`tts.mjs` 调曼波 TTS 生成配音，`bgm.mjs` 用纯数学合成背景音乐，`audio.mjs` / `encode.mjs` 负责混音与编码。
 - **画面不许用 CSS 动画**：逐帧截图时 CSS 动画不受控，同一 `t` 会截到不同画面。所有随时间变化的量都必须由 `t` 直接算出来。
 - 只改某一镜时不要重渲全片（60fps 下 4201 帧约 20 分钟）：用 `node render.mjs 60 <目录> <起> <止>` 只渲染该区间，再按 `round(t*60)` 把帧写回 `frames/` 对应编号。
 - **配音稿改了就全部重配**：`tts.mjs` 会重写 `timeline.json`，而画面里每一镜的节奏点都挂在 `S.start` 上，时间轴一动整片都要重渲。
