@@ -23,6 +23,8 @@ namespace DshRelay
             public Dictionary<string, string> Query = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             public Dictionary<string, string> Headers = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
             public string BodyText = "";
+            /// <summary>发起方 IP（由服务端接受连接时填入，用于配对确认时说明来源）。</summary>
+            public string ClientAddress = "";
         }
 
         public class Response

@@ -26,6 +26,7 @@ import android.widget.TextView;
  *
  * 取 h=0.15、v=0.18 时该距离约 0.474，比半径小 0.026（约 12px），四角留有可见余量。
  * 这是本文件的硬约束：**任何改动都不得让四角跑出圆外**，否则卡片边缘会被圆弧啃掉。
+ * 安全区只在 {@link #page()} 里按比例算一次，其余控件一律满宽，不加边距。
  */
 final class WatchUi {
     /** 圆屏左右安全边距（屏宽的 15%）。 */
@@ -42,6 +43,19 @@ final class WatchUi {
     static final int WARN = Color.rgb(250, 184, 96);
     static final int OK = Color.rgb(126, 217, 160);
     static final int DANGER = Color.rgb(248, 132, 132);
+
+    /** 卡片顶部的浅一档颜色，与 SURFACE 组成几乎察觉不到、但能拉出厚度的垂直渐变。 */
+    private static final int CARD_TOP = Color.rgb(27, 34, 47);
+    /** 主按钮渐变的高光一档；底端仍落在 ACCENT，主色不偏离用户已熟悉的蓝。 */
+    private static final int ACCENT_TOP = Color.rgb(150, 207, 255);
+    /** 页面顶部一层极弱的聚光：整屏纯平底色在圆屏上会显得发闷。 */
+    private static final int BACKDROP_TOP = Color.rgb(13, 18, 27);
+    /** 面板描边：低不透明度的浅蓝灰，只负责把边界勾出来，不参与配色。 */
+    private static final int STROKE = Color.argb(40, 152, 180, 216);
+    /** 分隔线，比正文弱两档；也用于「左侧细竖线」这类弱化标记。 */
+    static final int LINE = Color.rgb(36, 45, 60);
+    /** 按下波纹。 */
+    private static final int RIPPLE = Color.argb(46, 206, 228, 255);
 
     final Activity activity;
 
@@ -94,12 +108,15 @@ final class WatchUi {
     /**
      * 建立一个带安全边距、支持表冠滚动的页面。
      *
-     * 页面同时识别左右滑动：由调用方通过 {@link Page#setOnSwipe} 注册回调，
-     * 这样各页面可以自行决定「右滑返回、左滑开菜单」这类行为。
+     * 页面同时识别左右滑动：由调用方通过 {@link Page#setOnSwipeLeft} / {@link Page#setOnSwipeRight}
+     * 注册回调，这样各页面可以自行决定「右滑返回、左滑开菜单」这类行为。
      */
     Page page() {
         FrameLayout root = new FrameLayout(activity);
-        root.setBackgroundColor(BG);
+        // 背景用一层从上到下由 BACKDROP_TOP 收到 BG 的渐变，只差几个色阶，
+        // 作用是在圆屏四周露出一圈底色时仍有层次，而不是一块死板的纯色。
+        root.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{BACKDROP_TOP, BG}));
         ScrollView scroll = new ScrollView(activity);
         scroll.setFillViewport(false);
         scroll.setClipToPadding(false);
@@ -137,7 +154,7 @@ final class WatchUi {
         });
         // 横向手势不在这里拦：挂在页面的 FrameLayout 上时，触摸会先被子层
         // ScrollView 消费掉，左滑会被当成纵向滚动。改由 MainActivity 的
-        // dispatchTouchEvent 统一判定（配合 page.setGestureTarget）。
+        // dispatchTouchEvent 统一判定（配合 page 上的滑动回调）。
         return page;
     }
 
@@ -147,15 +164,13 @@ final class WatchUi {
      * 由 MainActivity 在 dispatchTouchEvent 里驱动：只有那里能拿到「还没被子视图
      * 消费」的原始事件，挂在页面根容器上会被 ScrollView 抢先吃掉纵向与横向手势。
      *
-     * 只认明显偏水平的滑动（横向位移 ≥60dp 且大于纵向的 1.5 倍），
+     * 只认明显偏水平的滑动（横向位移 ≥44dp 且大于纵向的 1.2 倍），
      * 否则手表上最常用的上下翻页会被误判成菜单手势。
      */
     static final class HorizontalGesture {
         private static final int TRIGGER_DP = 44;
-        private static final int SLOP_DP = 36;
 
         private final float triggerPx;
-        private final float slopPx;
         private float startX;
         private float startY;
         private float maxDx;
@@ -164,7 +179,6 @@ final class WatchUi {
 
         HorizontalGesture(float density) {
             this.triggerPx = TRIGGER_DP * density;
-            this.slopPx = SLOP_DP * density;
         }
 
         boolean onTouch(WatchUi.Page page, MotionEvent event) {
@@ -213,22 +227,29 @@ final class WatchUi {
         }
     }
 
+    /**
+     * 基础文本视图。
+     *
+     * 行距比系统默认略松：13sp 的中文正文在圆屏上贴行会更难读。倍数刻意压得低，
+     * 因为一屏可见高度只有三百多像素，行距一大内容就被挤出屏幕。
+     */
     TextView text(CharSequence value, float size, int color) {
         TextView view = new TextView(activity);
         view.setText(value);
         view.setTextSize(size);
         view.setTextColor(color);
         view.setIncludeFontPadding(false);
-        view.setLineSpacing(dp(3), 1.12f);
+        view.setLineSpacing(dp(2), 1.16f);
         return view;
     }
 
     /** 顶部标题区；副标题为空时不占位。 */
     void heading(Page page, String title, String subtitle) {
+        boolean hasSubtitle = subtitle != null && !subtitle.isEmpty();
         TextView head = headingView(title);
-        // 顶部留一点空间，避免第一行贴着圆角。
-        add(page, head, 2, 4);
-        if (subtitle != null && !subtitle.isEmpty()) {
+        // 顶部留一点空间，避免第一行贴着圆角；有副标题时把两者收成一组。
+        add(page, head, 2, hasSubtitle ? 0 : 4);
+        if (hasSubtitle) {
             TextView sub = text(subtitle, 10, MUTED);
             sub.setSingleLine(true);
             sub.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -277,7 +298,7 @@ final class WatchUi {
 
     void divider(Page page) {
         View line = new View(activity);
-        line.setBackgroundColor(Color.rgb(44, 54, 70));
+        line.setBackgroundColor(LINE);
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, Math.max(1, dp(0.6f)));
         params.setMargins(0, dp(8), 0, dp(8));
         page.content.addView(line, params);
@@ -289,9 +310,13 @@ final class WatchUi {
      * 用 TextView 而不是 Button：Button 的默认样式带 9-patch 背景与最小宽度约束，
      * 在窄圆屏上会被固有宽度顶住、无法撑满整行（曾出现同排两个按钮宽度不一致、
      * 标题折成两行）。这里自己画背景，宽度完全交给父容器决定。
+     *
+     * 主次按钮的区分放在「底色 + 字重 + 描边」三处，而不是只靠深浅：
+     * 主按钮是亮蓝渐变实心配深色粗体字，次按钮是深色底 + 细描边配蓝色常规字。
      */
     TextView button(String label, boolean primary, Runnable action) {
         TextView button = text(label, 14, primary ? ON_ACCENT : ACCENT);
+        button.setTypeface(Typeface.DEFAULT, primary ? Typeface.BOLD : Typeface.NORMAL);
         button.setGravity(Gravity.CENTER);
         button.setMaxLines(1);
         button.setEllipsize(android.text.TextUtils.TruncateAt.END);
@@ -299,8 +324,10 @@ final class WatchUi {
         button.setMinHeight(dp(48));
         // 关掉 TextView 默认的额外字体留白，让高度完全由 padding 决定。
         button.setIncludeFontPadding(false);
+        // 单行按钮不需要行距，留着会把文字顶得偏上。
+        button.setLineSpacing(0, 1f);
         button.setPadding(dp(10), dp(14), dp(10), dp(14));
-        button.setBackground(surface(primary ? ACCENT : SURFACE, 16));
+        button.setBackground(primary ? buttonPrimaryBackground() : surface(SURFACE, 16));
         button.setClickable(true);
         button.setFocusable(true);
         button.setOnClickListener(v -> action.run());
@@ -315,6 +342,7 @@ final class WatchUi {
         row.setMinimumHeight(dp(52));
         row.setBackground(surface(SURFACE, 16));
         TextView top = text(title, 14, FG);
+        top.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
         top.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO);
         row.addView(top);
         if (subtitle != null && !subtitle.isEmpty()) {
@@ -337,11 +365,18 @@ final class WatchUi {
         return row;
     }
 
-    /** 小圆角标签，用于「运行中」「待回答」等状态。 */
+    /**
+     * 小圆角标签，用于「运行中」「待回答」等状态。
+     *
+     * 底色不再固定为 SURFACE_HI，而是调用方传入的语义色（运行中/失败/完成）派生出的
+     * 同色低不透明度版本：橙底橙字、红底红字、绿底绿字，状态一眼可辨。
+     */
     TextView chip(String label, int color) {
         TextView chip = text(label, 10, color);
+        chip.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        chip.setLineSpacing(0, 1f);
         chip.setPadding(dp(7), dp(3), dp(7), dp(3));
-        chip.setBackground(surface(SURFACE_HI, 9));
+        chip.setBackground(chipBackground(color));
         return chip;
     }
 
@@ -360,8 +395,8 @@ final class WatchUi {
         LinearLayout wrapper = new LinearLayout(activity);
         wrapper.setOrientation(LinearLayout.VERTICAL);
         TextView view = text(body, 13, fromUser ? ON_ACCENT : FG);
-        view.setPadding(dp(10), dp(8), dp(10), dp(8));
-        view.setBackground(surface(fromUser ? ACCENT : SURFACE, 14));
+        view.setPadding(dp(11), dp(9), dp(11), dp(9));
+        view.setBackground(bubbleBackground(fromUser));
         LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-2, -2);
         params.gravity = fromUser ? Gravity.END : Gravity.START;
         wrapper.addView(view, params);
@@ -372,15 +407,67 @@ final class WatchUi {
     LinearLayout card() {
         LinearLayout card = new LinearLayout(activity);
         card.setOrientation(LinearLayout.VERTICAL);
-        card.setPadding(dp(11), dp(11), dp(11), dp(11));
-        card.setBackground(surface(SURFACE, 16));
+        card.setPadding(dp(12), dp(11), dp(12), dp(11));
+        card.setBackground(cardBackground());
         return card;
     }
 
+    /**
+     * 通用面板背景。
+     *
+     * 深色主题里卡片与页面底色只差一档亮度，纯靠明度差看不出边界，
+     * 因此统一补一条 1dp 低不透明度描边——它只勾边，不改变任何一块的配色。
+     */
     android.graphics.drawable.Drawable surface(int color, int radiusDp) {
         GradientDrawable shape = new GradientDrawable();
         shape.setColor(color);
         shape.setCornerRadius(dp(radiusDp));
-        return new RippleDrawable(ColorStateList.valueOf(Color.argb(46, 200, 224, 255)), shape, null);
+        shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
+        return new RippleDrawable(ColorStateList.valueOf(RIPPLE), shape, null);
+    }
+
+    /** 主按钮：亮蓝渐变 + 白色波纹，按下时整块明显变亮。 */
+    private android.graphics.drawable.Drawable buttonPrimaryBackground() {
+        GradientDrawable shape = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{ACCENT_TOP, ACCENT});
+        shape.setCornerRadius(dp(16));
+        return new RippleDrawable(ColorStateList.valueOf(Color.argb(56, 255, 255, 255)), shape, null);
+    }
+
+    /** 卡片：极轻的垂直渐变让卡片有厚度，描边把边界从背景里勾出来。 */
+    private android.graphics.drawable.Drawable cardBackground() {
+        GradientDrawable shape = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[]{CARD_TOP, SURFACE});
+        shape.setCornerRadius(dp(16));
+        shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
+        return new RippleDrawable(ColorStateList.valueOf(RIPPLE), shape, null);
+    }
+
+    /**
+     * 气泡背景：靠内的一侧两角收小、外侧两角放大，形成指向说话人的「尾巴」。
+     * 用户消息靠右，收右下角；助手消息靠左，收左下角。
+     * 角的顺序是「左上、右上、右下、左下」，每角两个值（x/y 半径）。
+     */
+    private android.graphics.drawable.Drawable bubbleBackground(boolean fromUser) {
+        int big = dp(16);
+        int small = dp(5);
+        float[] radii = fromUser
+                ? new float[]{big, big, big, big, small, small, big, big}
+                : new float[]{small, small, big, big, big, big, big, big};
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(fromUser ? ACCENT : SURFACE);
+        shape.setCornerRadii(radii);
+        if (!fromUser) shape.setStroke(Math.max(1, dp(0.8f)), STROKE);
+        return shape;
+    }
+
+    /** 标签背景：由文字色派生的低不透明度底 + 同色细描边，圆角取满即胶囊形。 */
+    private android.graphics.drawable.Drawable chipBackground(int color) {
+        GradientDrawable shape = new GradientDrawable();
+        shape.setColor(Color.argb(30, Color.red(color), Color.green(color), Color.blue(color)));
+        shape.setCornerRadius(dp(12));
+        shape.setStroke(Math.max(1, dp(0.6f)),
+                Color.argb(72, Color.red(color), Color.green(color), Color.blue(color)));
+        return shape;
     }
 }

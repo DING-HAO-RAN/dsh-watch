@@ -161,8 +161,21 @@ using System.Reflection;
 
     # ---------------------------------------------------------------- 组装
     Write-Host '组装分发目录…'
+    # 保留 data\ 子目录：那里存着配对码与令牌（用户数据目录不可写时的后路）。
+    # 整个删掉会让用户每次重建都要重新配对手表。
+    $preserved = Join-Path $OutputDir 'data'
+    $backup = $null
+    if (Test-Path $preserved) {
+        $backup = Join-Path ([IO.Path]::GetTempPath()) ('relay-data-' + [guid]::NewGuid().ToString('N'))
+        Copy-Item -LiteralPath $preserved -Destination $backup -Recurse -Force
+    }
     if (Test-Path $OutputDir) { Remove-Item $OutputDir -Recurse -Force }
     New-Item -ItemType Directory -Force $OutputDir | Out-Null
+    if ($backup -ne $null -and (Test-Path $backup)) {
+        Copy-Item -LiteralPath $backup -Destination $preserved -Recurse -Force
+        Remove-Item $backup -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host '  已保留 data\（配对码与令牌）'
+    }
     # 依赖已经嵌进 exe（由 Bootstrap 在启动时释放），因此这里只有一个文件。
     Copy-Item -LiteralPath $out -Destination (Join-Path $OutputDir 'DSH中继.exe') -Force
     # cloudflared 单独放：它只在用户点「开启公网访问」时才需要，且体积大（约 50MB），

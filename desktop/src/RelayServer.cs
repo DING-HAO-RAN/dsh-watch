@@ -46,11 +46,19 @@ namespace DshRelay
 
         private TcpListener listener;
         private Thread acceptThread;
+        /// <summary>接收手表查询的 socket（绑定 19391）。</summary>
         private UdpClient beacon;
+        /// <summary>专门用来发广播与单播回复的 socket（不绑定固定端口）。</summary>
+        private UdpClient sender;
         private Timer beaconTimer;
         private volatile bool stopping;
 
-        /// <summary>6 位配对码；配对成功后更换，也可由界面手动更换。</summary>
+        /// <summary>
+        /// 6 位配对码。
+        ///
+        /// **默认保持不变**：从设置文件读出来，只有用户主动点「换一个配对码」才变。
+        /// 以前每次启动都随机生成，导致手表每次都要重新配一遍。
+        /// </summary>
         public string PairingCode { get; set; }
         public int Port { get; private set; }
         public bool Running { get; private set; }
@@ -60,14 +68,319 @@ namespace DshRelay
         /// <summary>已配对设备数。</summary>
         public int PairedDevices { get { lock (gate) { return tokens.Count; } } }
 
+        /// <summary>设置文件的存放目录（空表示不持久化）。</summary>
+        private readonly string stateDirectory;
+
         public RelayServer(DshClient dsh, int port, Action<string> log)
+            : this(dsh, port, log, null)
+        {
+        }
+
+        /// <summary>
+        /// @param stateDirectory 设置文件目录；给出时会读取/保存配对码与令牌，
+        ///        使重启后手表不必重新配对。传 null 则不落盘（测试用）。
+        /// </summary>
+        public RelayServer(DshClient dsh, int port, Action<string> log, string stateDirectory)
         {
             this.dsh = dsh;
             this.Port = port;
             this.log = log ?? delegate { };
             this.json = new JavaScriptSerializer();
             this.json.MaxJsonLength = 64 * 1024 * 1024;
-            this.PairingCode = NewPairingCode();
+            this.stateDirectory = stateDirectory;
+
+            RelaySettings settings = stateDirectory == null
+                ? new RelaySettings()
+                : RelaySettings.Load(stateDirectory);
+
+            // 配对码优先沿用存档；没有才生成一个并存下来。
+            this.PairingCode = string.IsNullOrEmpty(settings.PairingCode)
+                ? NewPairingCode()
+                : settings.PairingCode;
+
+            // 恢复此前发过且未过期的令牌，手表就能继续用原令牌。
+            long now = NowMs();
+            foreach (var pair in settings.Tokens)
+            {
+                if (now - pair.Value <= TokenTtlMs) tokens[pair.Key] = pair.Value;
+            }
+
+            Persist();
+            if (tokens.Count > 0)
+            {
+                log("已恢复 " + tokens.Count + " 个配对令牌，配对码沿用 " + this.PairingCode);
+            }
+        }
+
+        /// <summary>
+        /// 一次通过一次性票据换令牌的配对请求。
+        ///
+        /// 流程：手表在电脑上点了「同意」之后才拿到 grant，用它来换令牌。
+        /// 这样「一键配对」的**决定权在电脑端**——手表不能自己把自己配上。
+        /// </summary>
+        private readonly Dictionary<string, long> grants = new Dictionary<string, long>();
+
+        /// <summary>一次性票据有效期（用户点了同意但手表没及时来换的情况）。</summary>
+        private const long GrantTtlMs = 120L * 1000;
+
+        /// <summary>发起一键配对的回调：由界面层弹出确认框，用户同意后调用 ApprovePairing。</summary>
+        public Action<PairRequest> PairingRequested;
+
+        /// <summary>一张待用户确认的配对请求。</summary>
+        public class PairRequest
+        {
+            public string Id = "";
+            /// <summary>发起方（手表的）IP，用于在弹窗里说明「谁在请求」。</summary>
+            public string From = "";
+            /// <summary>手表自报的名字（可能为空）。</summary>
+            public string DeviceName = "";
+            public long CreatedAt;
+        }
+
+        /// <summary>
+        /// 手表通过 HTTP 请求一键配对：记下请求并通知界面弹窗。
+        ///
+        /// 返回 requestId 给手表去轮询结果；用户同意后手表的轮询会拿到 grant。
+        ///
+        /// **这是无需令牌的端点**（手表还没配对），因此必须自己做防护：
+        /// - 同一 IP 冷却期内只受理一次，防止有人写脚本反复触发把弹窗刷屏；
+        /// - 待确认请求总量设上限，防止内存被灌满；
+        /// - 真正的放行仍由用户在电脑上点「是」决定，这里只防骚扰。
+        /// </summary>
+        private Http.Response RequestPairing(Http.Request request)
+        {
+            string from = request.ClientAddress ?? "";
+            long now = NowMs();
+
+            lock (gate)
+            {
+                long last;
+                if (pairingCooldown.TryGetValue(from, out last) && now - last < PairCooldownMs)
+                {
+                    log("忽略来自 " + from + " 的重复配对请求（冷却中）");
+                    var busy = new Dictionary<string, object>();
+                    busy["ok"] = false;
+                    busy["error"] = "刚刚已请求过，请稍等片刻";
+                    return Http.Json(429, busy);
+                }
+                if (pairingRequests.Count >= MaxPendingPairs)
+                {
+                    var full = new Dictionary<string, object>();
+                    full["ok"] = false;
+                    full["error"] = "待确认的配对请求太多，请在电脑上处理后再试";
+                    return Http.Json(429, full);
+                }
+                pairingCooldown[from] = now;
+                // 顺手清掉冷却表里的老记录，避免长期运行越积越多。
+                if (pairingCooldown.Count > 200)
+                {
+                    var stale = new List<string>();
+                    foreach (var pair in pairingCooldown)
+                    {
+                        if (now - pair.Value > PairCooldownMs * 10) stale.Add(pair.Key);
+                    }
+                    foreach (string key in stale) pairingCooldown.Remove(key);
+                }
+            }
+            // 每次请求顺带清一次过期票据：这是配对功能里唯一稳定的调用点。
+            PruneGrants();
+
+            var body = ParseJson(request.BodyText) as Dictionary<string, object>;
+            var entry = new PairRequest();
+            entry.Id = Guid.NewGuid().ToString("N");
+            entry.From = from;
+            entry.DeviceName = body != null && body.ContainsKey("name") ? Convert.ToString(body["name"]) : "";
+            entry.CreatedAt = now;
+
+            lock (gate) { pairingRequests[entry.Id] = entry; }
+            log("收到手表的一键配对请求（来自 " + entry.From + "），等待在电脑上确认");
+
+            var handler = PairingRequested;
+            if (handler != null)
+            {
+                try { handler(entry); }
+                catch (Exception error) { log("弹出配对确认失败：" + error.Message); }
+            }
+            else
+            {
+                log("没有界面可以确认配对请求，请用配对码方式配对");
+            }
+
+            var result = new Dictionary<string, object>();
+            result["ok"] = true;
+            result["requestId"] = entry.Id;
+            return Http.Json(200, result);
+        }
+
+        /// <summary>手表轮询配对结果：等待 / 已同意（返回 grant）/ 被拒绝。</summary>
+        private Http.Response PairingResult(Http.Request request)
+        {
+            string id = request.Query.ContainsKey("id") ? request.Query["id"] : "";
+            string grant;
+            string state;
+            lock (gate)
+            {
+                if (pairingDenied.ContainsKey(id))
+                {
+                    state = "denied";
+                    pairingDenied.Remove(id);
+                    grant = "";
+                }
+                else if (approvedRequests.ContainsKey(id))
+                {
+                    // grant 是独立生成的随机值，**不能**直接用 requestId：
+                    // requestId 是明文发给请求方的，同网段的人拿到它就能换令牌，
+                    // 等于绕过用户在电脑上的确认。
+                    state = "approved";
+                    approvedRequests.TryGetValue(id, out grant);
+                }
+                else if (NowMs() - GrantTtlMs > RequestAge(id))
+                {
+                    state = "expired";
+                    grant = "";
+                }
+                else
+                {
+                    state = "waiting";
+                    grant = "";
+                }
+            }
+
+            var result = new Dictionary<string, object>();
+            result["ok"] = true;
+            result["state"] = state;
+            if (grant.Length > 0) result["grant"] = grant;
+            return Http.Json(200, result);
+        }
+
+        private long RequestAge(string id)
+        {
+            lock (gate)
+            {
+                PairRequest entry;
+                return pairingRequests.TryGetValue(id, out entry) ? entry.CreatedAt : 0L;
+            }
+        }
+
+        private readonly Dictionary<string, PairRequest> pairingRequests = new Dictionary<string, PairRequest>();
+        private readonly Dictionary<string, bool> pairingDenied = new Dictionary<string, bool>();
+        /// <summary>已同意但还没被换走的票据：requestId → grant（随机值）。</summary>
+        private readonly Dictionary<string, string> approvedRequests = new Dictionary<string, string>();
+        /// <summary>每个来源 IP 上次请求配对的时间，用于冷却。</summary>
+        private readonly Dictionary<string, long> pairingCooldown = new Dictionary<string, long>();
+        /// <summary>同一 IP 的配对请求冷却时间。</summary>
+        private const long PairCooldownMs = 15L * 1000;
+        /// <summary>同时待确认的配对请求上限。</summary>
+        private const int MaxPendingPairs = 3;
+
+        /// <summary>用户在电脑上点了「同意」：发放一次性票据并与请求 Id 关联。</summary>
+        public void ApprovePairing(string requestId)
+        {
+            if (string.IsNullOrEmpty(requestId)) return;
+            // 票据必须是独立随机值：requestId 会明文回给请求方，
+            // 拿它当票据等于把「用户确认」这个环节架空了。
+            string ticket = NewGrant();
+            lock (gate)
+            {
+                approvedRequests[requestId] = ticket;
+                grants[ticket] = NowMs();
+                pairingRequests.Remove(requestId);
+            }
+            log("已同意配对请求 " + requestId);
+        }
+
+        /// <summary>生成一张不可猜测的一次性票据。</summary>
+        private static string NewGrant()
+        {
+            var bytes = new byte[24];
+            using (var rng = new RNGCryptoServiceProvider()) { rng.GetBytes(bytes); }
+            return DshLocator.Base64UrlEncode(bytes);
+        }
+
+        /// <summary>用户在电脑上点了「拒绝」。</summary>
+        public void DenyPairing(string requestId)
+        {
+            if (string.IsNullOrEmpty(requestId)) return;
+            lock (gate)
+            {
+                pairingDenied[requestId] = true;
+                pairingRequests.Remove(requestId);
+            }
+            log("已拒绝配对请求 " + requestId);
+        }
+
+        /// <summary>取走并作废一张票据（一次性）。</summary>
+        private bool ConsumeGrant(string grant)
+        {
+            lock (gate)
+            {
+                if (!grants.ContainsKey(grant)) return false;
+                grants.Remove(grant);
+                // 对应的 requestId → grant 映射也一并清掉，避免内存里留下永久有效的记录。
+                var dead = new List<string>();
+                foreach (var pair in approvedRequests)
+                {
+                    if (pair.Value == grant) dead.Add(pair.Key);
+                }
+                foreach (string key in dead) approvedRequests.Remove(key);
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// 清掉过期的一次性票据。
+        ///
+        /// 用户点了「同意」但手表没来换（关掉了、断网了）时，票据会一直留着。
+        /// 不清理的话：内存缓慢增长，且这些旧票据**永久有效**——
+        /// 谁拿到就能换令牌，绕过时间限制。
+        /// </summary>
+        private void PruneGrants()
+        {
+            long now = NowMs();
+            lock (gate)
+            {
+                var stale = new List<string>();
+                foreach (var pair in grants)
+                {
+                    if (now - pair.Value > GrantTtlMs) stale.Add(pair.Key);
+                }
+                foreach (string key in stale) grants.Remove(key);
+                if (stale.Count > 0)
+                {
+                    var deadRequests = new List<string>();
+                    foreach (var pair in approvedRequests)
+                    {
+                        if (!grants.ContainsKey(pair.Value)) deadRequests.Add(pair.Key);
+                    }
+                    foreach (string key in deadRequests) approvedRequests.Remove(key);
+                }
+
+                // 被拒绝的记录同样会残留，一并按时间清掉。
+                if (pairingDenied.Count > 100)
+                {
+                    pairingDenied.Clear();
+                }
+            }
+        }
+
+        /// <summary>当前是否有待确认的配对请求（界面据此决定要不要弹窗）。</summary>
+        public List<PairRequest> PendingPairing()
+        {
+            lock (gate) { return new List<PairRequest>(pairingRequests.Values); }
+        }
+
+        /// <summary>把配对码与令牌写回设置文件。</summary>
+        private void Persist()
+        {
+            if (stateDirectory == null) return;
+            var settings = new RelaySettings();
+            settings.Port = Port;
+            settings.PairingCode = PairingCode;
+            lock (gate)
+            {
+                foreach (var pair in tokens) settings.Tokens[pair.Key] = pair.Value;
+            }
+            settings.Save(stateDirectory);
         }
 
         /// <summary>生成易读的 6 位配对码（避开容易看错的 0/O/1/I）。</summary>
@@ -104,6 +417,7 @@ namespace DshRelay
             try { if (listener != null) listener.Stop(); } catch { }
             try { if (beaconTimer != null) beaconTimer.Dispose(); } catch { }
             try { if (beacon != null) beacon.Close(); } catch { }
+            try { if (sender != null) sender.Close(); } catch { }
         }
 
         public void Dispose() { Stop(); }
@@ -123,26 +437,208 @@ namespace DshRelay
             }
         }
 
-        /// <summary>周期性 UDP 广播，让手表无需手输 IP 即可发现。</summary>
+        /// <summary>
+        /// 局域网发现：既周期广播自己的存在，也响应手表的主动查询。
+        ///
+        /// 两个方向都要有——只广播的话，手表必须恰好在那 2 秒窗口里监听才能发现；
+        /// 而手表点「寻找电脑」时不希望靠运气，所以它也会发一条查询广播，
+        /// 中继收到后立刻单播回复。
+        /// </summary>
         private void StartBeacon()
         {
             try
             {
+                // 收与发用**两个独立的 socket**：
+                // 一个 bind 在 19391 上收（手表发来的查询），另一个专门用来发广播。
+                // 共用一个 socket 时，bind 到固定端口后再 Send 在部分 Windows 配置下会失败，
+                // 表现就是「广播一次都发不出去」。
                 beacon = new UdpClient();
-                beacon.EnableBroadcast = true;
-                var payload = Encoding.UTF8.GetBytes(
-                    "{\"service\":\"" + ServiceTag + "\",\"port\":" + Port.ToString(CultureInfo.InvariantCulture) + ",\"name\":\"DSH 中继\"}");
-                var target = new IPEndPoint(IPAddress.Broadcast, DiscoveryPort);
+                beacon.Client.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
+                beacon.Client.Bind(new IPEndPoint(IPAddress.Any, DiscoveryPort));
+
+                sender = new UdpClient();
+                sender.EnableBroadcast = true;
+
+                // 单播回复也要能发：从一个临时端口发，避免和监听端口抢。
                 beaconTimer = new Timer(delegate (object unused)
                 {
-                    try { beacon.Send(payload, payload.Length, target); }
+                    try
+                    {
+                        byte[] payload = BeaconPayload(false);
+                        sender.Send(payload, payload.Length, new IPEndPoint(IPAddress.Broadcast, DiscoveryPort));
+                        // 再往各网段的定向广播发一次：部分路由器会丢弃 255.255.255.255。
+                        foreach (string target in SubnetBroadcasts())
+                        {
+                            try
+                            {
+                                sender.Send(payload, payload.Length,
+                                    new IPEndPoint(IPAddress.Parse(target), DiscoveryPort));
+                            }
+                            catch { }
+                        }
+                    }
                     catch { }
                 }, null, 0, 2000);
+
+                // 监听手表的查询：收到就单播回一份带端口的身份信息。
+                var receiveThread = new Thread(ListenForQueries);
+                receiveThread.IsBackground = true;
+                receiveThread.Name = "relay-discovery";
+                receiveThread.Start();
             }
             catch (Exception error)
             {
                 log("广播启动失败（不影响局域网直连）：" + error.Message);
             }
+        }
+
+        /// <summary>本机各网段的定向广播地址（如 192.168.1.255），用于提高发现成功率。</summary>
+        private List<string> SubnetBroadcasts()
+        {
+            var list = new List<string>();
+            try
+            {
+                foreach (var nic in System.Net.NetworkInformation.NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (nic.OperationalStatus != System.Net.NetworkInformation.OperationalStatus.Up) continue;
+                    if (nic.NetworkInterfaceType == System.Net.NetworkInformation.NetworkInterfaceType.Loopback) continue;
+                    foreach (var info in nic.GetIPProperties().UnicastAddresses)
+                    {
+                        if (info.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                        byte[] bytes = info.Address.GetAddressBytes();
+                        byte[] mask = info.PrefixLength <= 0 ? null : PrefixToMask(info.PrefixLength);
+                        if (bytes.Length != 4 || mask == null) continue;
+                        var broadcast = new byte[4];
+                        for (int i = 0; i < 4; i++)
+                        {
+                            broadcast[i] = (byte)(bytes[i] | (byte)~mask[i]);
+                        }
+                        list.Add(new IPAddress(broadcast).ToString());
+                    }
+                }
+            }
+            catch { }
+            return list;
+        }
+
+        private static byte[] PrefixToMask(int prefix)
+        {
+            if (prefix < 0 || prefix > 32) return null;
+            var mask = new byte[4];
+            for (int i = 0; i < 4; i++)
+            {
+                int bits = prefix - i * 8;
+                if (bits >= 8) mask[i] = 0xFF;
+                else if (bits <= 0) mask[i] = 0x00;
+                else mask[i] = (byte)(0xFF << (8 - bits));
+            }
+            return mask;
+        }
+
+        /// <summary>广播/回复用的身份信息。</summary>
+        private byte[] BeaconPayload(bool reply)
+        {
+            var map = new Dictionary<string, object>();
+            map["service"] = ServiceTag;
+            map["port"] = Port;
+            map["name"] = Environment.MachineName;
+            map["pairing"] = true;
+            if (reply) map["reply"] = true;
+            return Encoding.UTF8.GetBytes(json.Serialize(map));
+        }
+
+        /// <summary>回应手表发来的查询广播。</summary>
+        private void ListenForQueries()
+        {
+            while (!stopping)
+            {
+                try
+                {
+                    IPEndPoint remote = new IPEndPoint(IPAddress.Any, 0);
+                    byte[] data = beacon.Receive(ref remote);
+                    string text = Encoding.UTF8.GetString(data);
+                    if (text.IndexOf("dsh-watch-query", StringComparison.Ordinal) < 0) continue;
+
+                    byte[] reply = BeaconPayload(true);
+                    sender.Send(reply, reply.Length, remote);
+                    log("手表在寻找中继（来自 " + remote.Address + "），已回复");
+                }
+                catch
+                {
+                    // 停止或套接字关闭时会抛异常，直接退出循环。
+                    if (stopping) return;
+                }
+            }
+        }
+
+        /// <summary>
+        /// 某个会话当前是否在生成回复。
+        ///
+        /// 用 session/list 里的 running 字段判断：这是 DSH 自己维护的权威状态。
+        /// 查列表比查单个会话便宜（一次调用覆盖所有会话），因此还顺带缓存 2 秒，
+        /// 避免手表 4 秒一次的刷新把 DSH 打爆。
+        /// </summary>
+        private bool IsRunning(string sessionId)
+        {
+            lock (runningGate)
+            {
+                if (NowMs() - runningCheckedAt < 2000)
+                {
+                    bool cached;
+                    if (runningCache.TryGetValue(sessionId, out cached)) return cached;
+                    return false;
+                }
+            }
+
+            var args = new Dictionary<string, object>();
+            args["_request"] = new Dictionary<string, object>();
+            var value = dsh.RpcSafe("session/list", args) as Dictionary<string, object>;
+            var items = ListField(value, "items");
+
+            var fresh = new Dictionary<string, bool>();
+            if (items != null)
+            {
+                foreach (var raw in items)
+                {
+                    var item = raw as Dictionary<string, object>;
+                    if (item == null) continue;
+                    string id = GetString(item, "sessionId");
+                    if (id.Length == 0) continue;
+                    fresh[id] = GetBool(item, "running");
+                }
+            }
+
+            lock (runningGate)
+            {
+                runningCache = fresh;
+                runningCheckedAt = NowMs();
+                bool cached;
+                return runningCache.TryGetValue(sessionId, out cached) && cached;
+            }
+        }
+
+        private readonly object runningGate = new object();
+        private Dictionary<string, bool> runningCache = new Dictionary<string, bool>();
+        private long runningCheckedAt;
+
+        /// <summary>中继的身份信息（无需令牌）：手表用它确认连的是哪台电脑。</summary>
+        private Http.Response Identity()
+        {
+            var result = new Dictionary<string, object>();
+            result["ok"] = true;
+            result["service"] = ServiceTag;
+            result["name"] = Environment.MachineName;
+            result["port"] = Port;
+            result["lanAddresses"] = ToObjectList(LanAddresses());
+            result["paired"] = PairedDevices > 0;
+            return Http.Json(200, result);
+        }
+
+        private static List<object> ToObjectList(List<string> values)
+        {
+            var list = new List<object>();
+            foreach (string value in values) list.Add(value);
+            return list;
         }
 
         /// <summary>本机局域网 IPv4 地址，用于界面显示。</summary>
@@ -174,11 +670,19 @@ namespace DshRelay
             {
                 client.ReceiveTimeout = 30000;
                 client.SendTimeout = 30000;
+                string clientAddress = "";
+                try
+                {
+                    IPEndPoint remote = client.Client.RemoteEndPoint as IPEndPoint;
+                    if (remote != null) clientAddress = remote.Address.ToString();
+                }
+                catch { }
                 using (var stream = client.GetStream())
                 {
                     // 只处理一条请求——手表每次调用都是独立的短连接，避免长连管理。
                     var request = Http.ReadRequest(stream);
                     if (request == null) return;
+                    request.ClientAddress = clientAddress;
                     var response = Route(request);
                     Http.WriteResponse(stream, response);
                 }
@@ -204,20 +708,35 @@ namespace DshRelay
             {
                 var body = ParseJson(request.BodyText) as Dictionary<string, object>;
                 string code = body != null && body.ContainsKey("code") ? Convert.ToString(body["code"]) : "";
-                if (code == null || code.Trim() != PairingCode)
+                // 一键配对：手表扫到中继后在电脑上点了「同意」，凭一次性票据直接换令牌。
+                string grant = body != null && body.ContainsKey("grant") ? Convert.ToString(body["grant"]) : "";
+                if (!string.IsNullOrEmpty(grant) && !ConsumeGrant(grant))
+                {
+                    return Http.Json(403, Simple("配对请求已失效，请在电脑上重新同意"));
+                }
+                if (string.IsNullOrEmpty(grant) && (code == null || code.Trim() != PairingCode))
                 {
                     return Http.Json(403, Simple("配对码不正确"));
                 }
-                // 配对成功后换一个新口令，防止同一口令被重复使用。
+
                 string token = NewToken();
-                lock (gate) { PairingCode = NewPairingCode(); }
-                log("手表已配对，新的配对码：" + PairingCode);
+                // 配对码**保持不变**（用户要求「密钥不变，除非主动更改」），
+                // 只把令牌存下来，重启后手表不用重配。
+                Persist();
+                log("新设备已配对（当前共 " + PairedDevices + " 台），配对码仍是 " + PairingCode);
                 var ok = new Dictionary<string, object>();
                 ok["ok"] = true;
                 ok["token"] = token;
                 ok["expiresInMs"] = TokenTtlMs;
                 return Http.Json(200, ok);
             }
+
+            // 一键配对的两个端点**必须在鉴权之前**：手表这时还没拿到令牌。
+            // 安全边界靠「电脑端弹窗确认」而不是令牌——用户不点同意，什么都不会发生。
+            if (path == "/api/pair/request" && request.Method == "POST") return RequestPairing(request);
+            if (path == "/api/pair/result" && request.Method == "GET") return PairingResult(request);
+            // 中继身份：手表用来在设置页里确认「连的是哪台电脑」。
+            if (path == "/api/identity" && request.Method == "GET") return Identity();
 
             if (!IsAuthorized(request))
             {
@@ -465,7 +984,9 @@ namespace DshRelay
             result["ok"] = true;
             result["sessionId"] = id;
             result["title"] = GetString(values, "title");
-            result["running"] = false;
+            // running 必须反映真实状态：手表靠它决定显示「停止」还是「刷新」，
+            // 写死 false 会让「停止生成」按钮永远不出现。
+            result["running"] = IsRunning(id);
             result["hasMore"] = page != null && GetBool(page, "hasMore");
             result["asOfSeq"] = asOfSeq;
             result["beforeSeq"] = EarliestSeq(records);

@@ -3,14 +3,22 @@ package cn.dsh.watch;
 import android.content.Context;
 import android.content.SharedPreferences;
 
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.util.ArrayList;
+import java.util.List;
+
 /**
- * 手表侧的本地状态：中继地址与配对令牌。
+ * 手表侧的本地状态：多个中继设备的连接信息，以及当前正在用的那一台。
  *
- * 支持两种地址形态：
- * - 局域网：主机 + 端口（如 192.168.1.121:19390），用明文 HTTP；
- * - 公网：完整 URL（如 https://dsh.example.com），走 HTTPS，端口由协议默认或地址自带。
- *
- * 两者都存在同一个 base 字段里，由 {@link Endpoint} 统一解析，避免两套存取逻辑。
+ * 设计要点：
+ * - **记住多台设备**。同一块手表可能在「家里电脑的局域网」「公司电脑的局域网」
+ *   「某个公网地址」之间来回切，每次都重新输配对码很麻烦。因此每台设备
+ *   （地址 + 令牌 + 备注 + 最后使用时间）单独存一条，可随时切换。
+ * - **base() / token() 这些原有方法保持语义不变**，它们返回「当前设备」的值。
+ *   这样数十处调用点不用改，切换设备后自然生效。
+ * - 旧的单设备存档会被自动迁移成列表里的第一条，用户不需要重新配对。
  */
 final class Store {
     private static final String FILE = "dsh-watch";
@@ -19,27 +27,216 @@ final class Store {
     private static final String KEY_LAST_SESSION = "lastSession";
     private static final String KEY_LAST_SESSION_TITLE = "lastSessionTitle";
 
+    /** 多设备列表（JSON 数组）。 */
+    private static final String KEY_DEVICES = "devices";
+
+    /** 一台已记住的中继设备。 */
+    static final class Device {
+        /** 地址原文，形如 `192.168.1.121:19390` 或 `https://xxx.trycloudflare.com`。 */
+        String base = "";
+        String token = "";
+        /** 用户可读的备注；为空时界面按地址与网络类型自动取名。 */
+        String label = "";
+        /** 是否为公网地址（决定显示「公网」还是「局域网」）。 */
+        long lastUsed = 0L;
+
+        boolean valid() {
+            return base != null && !base.isEmpty() && token != null && !token.isEmpty();
+        }
+
+        /** 地址里是否带 https（公网）。 */
+        boolean isPublic() {
+            return base != null && base.startsWith("https://");
+        }
+
+        JSONObject toJson() {
+            JSONObject object = new JSONObject();
+            try {
+                object.put("base", base == null ? "" : base);
+                object.put("token", token == null ? "" : token);
+                object.put("label", label == null ? "" : label);
+                object.put("lastUsed", lastUsed);
+            } catch (Exception ignored) {
+                // 值都是字符串与数字，不会失败。
+            }
+            return object;
+        }
+
+        static Device fromJson(JSONObject object) {
+            if (object == null) return null;
+            Device device = new Device();
+            device.base = Api.text(object, "base");
+            device.token = Api.text(object, "token");
+            device.label = Api.text(object, "label");
+            device.lastUsed = object.optLong("lastUsed", 0L);
+            return device.valid() ? device : null;
+        }
+    }
+
     private final SharedPreferences prefs;
 
     Store(Context context) {
         this.prefs = context.getSharedPreferences(FILE, Context.MODE_PRIVATE);
+        migrateLegacy();
     }
+
+    /**
+     * 把旧的单设备存档迁移成多设备列表。
+     *
+     * 只在「列表为空且旧存档有效」时执行，迁移后清掉旧字段，避免重复迁移。
+     */
+    private void migrateLegacy() {
+        String legacyBase = prefs.getString(KEY_BASE, "");
+        String legacyToken = prefs.getString(KEY_TOKEN, "");
+        if (legacyBase == null || legacyBase.isEmpty() || legacyToken == null || legacyToken.isEmpty()) return;
+        if (!devices().isEmpty()) return;
+
+        Device device = new Device();
+        device.base = legacyBase;
+        device.token = legacyToken;
+        device.lastUsed = System.currentTimeMillis();
+        saveDevices(single(device));
+        prefs.edit().putLong(KEY_CURRENT, 0L).apply();
+    }
+
+    /** 当前设备的索引（相对列表）。 */
+    private static final String KEY_CURRENT = "currentDevice";
+
+    // ------------------------------------------------------------ 设备列表
+
+    /** 读全部已记住的设备（按最后使用时间倒序，最近的在前）。 */
+    List<Device> devices() {
+        List<Device> list = new ArrayList<>();
+        String raw = prefs.getString(KEY_DEVICES, "");
+        if (raw == null || raw.isEmpty()) return list;
+        try {
+            JSONArray array = new JSONArray(raw);
+            for (int i = 0; i < array.length(); i++) {
+                Device device = Device.fromJson(array.optJSONObject(i));
+                if (device != null) list.add(device);
+            }
+        } catch (Exception ignored) {
+            // 存档损坏时当作空列表，用户可以重新配对。
+        }
+        list.sort((a, b) -> Long.compare(b.lastUsed, a.lastUsed));
+        return list;
+    }
+
+    private void saveDevices(List<Device> list) {
+        JSONArray array = new JSONArray();
+        for (Device device : list) array.put(device.toJson());
+        prefs.edit().putString(KEY_DEVICES, array.toString()).apply();
+    }
+
+    private static List<Device> single(Device device) {
+        List<Device> list = new ArrayList<>();
+        list.add(device);
+        return list;
+    }
+
+    /** 当前正在用的设备；未配对时为 null。 */
+    Device current() {
+        for (Device device : devices()) {
+            if (device.base.equals(base())) return device;
+        }
+        return null;
+    }
+
+    /**
+     * 记住（或更新）一台设备，并切换过去。
+     *
+     * 同一地址视为同一台设备——换令牌就覆盖，不会堆出多条。
+     */
+    void rememberDevice(String base, String token, String label) {
+        if (base == null || base.trim().isEmpty() || token == null || token.trim().isEmpty()) return;
+        String address = base.trim();
+        List<Device> list = devices();
+        Device target = null;
+        for (Device device : list) {
+            if (device.base.equals(address)) {
+                target = device;
+                break;
+            }
+        }
+        if (target == null) {
+            target = new Device();
+            target.base = address;
+            list.add(target);
+        }
+        target.token = token.trim();
+        if (label != null && !label.trim().isEmpty()) target.label = label.trim();
+        target.lastUsed = System.currentTimeMillis();
+
+        saveDevices(list);
+        prefs.edit()
+                .putString(KEY_BASE, target.base)
+                .putString(KEY_TOKEN, target.token)
+                .apply();
+    }
+
+    /** 切换到一台已记住的设备。 */
+    void useDevice(Device device) {
+        if (device == null || !device.valid()) return;
+        // 先读列表再改时间：devices() 每次都从存档重建对象，
+        // 改传入对象上的时间不会反映到列表里，必须改列表里的那一条。
+        List<Device> list = devices();
+        for (Device item : list) {
+            if (item.base.equals(device.base)) {
+                item.lastUsed = System.currentTimeMillis();
+                break;
+            }
+        }
+        saveDevices(list);
+        prefs.edit()
+                .putString(KEY_BASE, device.base)
+                .putString(KEY_TOKEN, device.token)
+                .remove(KEY_LAST_SESSION)
+                .remove(KEY_LAST_SESSION_TITLE)
+                .apply();
+    }
+
+    /** 忘掉一台设备。 */
+    void forgetDevice(Device device) {
+        if (device == null) return;
+        List<Device> list = devices();
+        Device removed = null;
+        for (Device item : list) {
+            if (item.base.equals(device.base)) {
+                removed = item;
+                break;
+            }
+        }
+        if (removed == null) return;
+        list.remove(removed);
+        saveDevices(list);
+        if (removed.base.equals(base())) {
+            // 删的正是当前这台：清空当前连接，避免继续拿废令牌去请求。
+            prefs.edit().remove(KEY_BASE).remove(KEY_TOKEN)
+                    .remove(KEY_LAST_SESSION).remove(KEY_LAST_SESSION_TITLE).apply();
+        }
+    }
+
+    // ------------------------------------------------------------ 当前设备（原有语义）
 
     /** 中继地址（形如 host:port 或 https://host）。 */
     String base() {
-        return prefs.getString(KEY_BASE, "");
+        String value = prefs.getString(KEY_BASE, "");
+        return value == null ? "" : value;
     }
 
     String token() {
-        return prefs.getString(KEY_TOKEN, "");
+        String value = prefs.getString(KEY_TOKEN, "");
+        return value == null ? "" : value;
     }
 
     String lastSession() {
-        return prefs.getString(KEY_LAST_SESSION, "");
+        String value = prefs.getString(KEY_LAST_SESSION, "");
+        return value == null ? "" : value;
     }
 
     String lastSessionTitle() {
-        return prefs.getString(KEY_LAST_SESSION_TITLE, "");
+        String value = prefs.getString(KEY_LAST_SESSION_TITLE, "");
+        return value == null ? "" : value;
     }
 
     void setBase(String base) {
@@ -60,6 +257,18 @@ final class Store {
     /** 断开连接：清除令牌，保留上次地址以便重连时预填。 */
     void clearToken() {
         prefs.edit().remove(KEY_TOKEN).remove(KEY_LAST_SESSION).remove(KEY_LAST_SESSION_TITLE).apply();
+        // 列表里对应那台也去掉令牌，否则切换回来又是一个废令牌。
+        String address = base();
+        List<Device> list = devices();
+        boolean changed = false;
+        for (Device device : list) {
+            if (device.base.equals(address)) {
+                device.token = "";
+                changed = true;
+                break;
+            }
+        }
+        if (changed) saveDevices(list);
     }
 
     boolean paired() {

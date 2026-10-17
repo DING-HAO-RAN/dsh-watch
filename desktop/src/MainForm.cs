@@ -44,6 +44,7 @@ namespace DshRelay
             Controls.Add(fallback);
 
             host = new PanelHost(StartupLog.Write, AppDomain.CurrentDomain.BaseDirectory);
+            host.AttachForm(this);
             host.UrlReady += OnPanelReady;
             host.Failed += OnFailed;
             host.Start();
@@ -210,6 +211,14 @@ namespace DshRelay
         private PublicTunnel tunnel;
         private readonly Action<string> log;
         private readonly string appDirectory;
+        /// <summary>主窗口，用于弹「是否允许配对」的对话框（null 表示还没有窗口）。</summary>
+        private Form uiForm;
+
+        /// <summary>绑定主窗口，配对确认框需要它作为父窗口。</summary>
+        public void AttachForm(Form form)
+        {
+            uiForm = form;
+        }
 
         public event Action<string> UrlReady;
         public event Action<string> Failed;
@@ -346,7 +355,11 @@ namespace DshRelay
                     return;
                 }
 
-                relay = new RelayServer(dsh, RelayServer.DefaultPort, log);
+                // 状态目录随程序走：配对码与令牌存在程序目录的 relay-settings.json 里，
+                // 重启后手表不用重新配对（用户明确要求「密钥不变，除非主动更改」）。
+                relay = new RelayServer(dsh, RelayServer.DefaultPort, log, appDirectory);
+                // 一键配对：手表发起后由界面弹窗让用户确认（决定权在电脑端）。
+                relay.PairingRequested = OnPairingRequested;
                 relay.Start();
                 log("中继已启动，局域网端口：" + relay.Port);
 
@@ -368,6 +381,58 @@ namespace DshRelay
         {
             var handler = UrlReady;
             if (handler != null) handler(url);
+        }
+
+        /// <summary>
+        /// 手表请求一键配对时调用（可能来自网络线程）。
+        ///
+        /// 这里必须切回界面线程弹窗：WinForms 的 MessageBox 只能在 UI 线程用。
+        /// 用户点「同意」后才发放一次性票据，手表凭它换令牌——决定权在电脑端。
+        /// </summary>
+        private void OnPairingRequested(RelayServer.PairRequest request)
+        {
+            try
+            {
+                var form = uiForm;
+                if (form == null || form.IsDisposed)
+                {
+                    log("没有可用窗口确认配对，已忽略（请用配对码方式）");
+                    return;
+                }
+                form.BeginInvoke(new Action(delegate
+                {
+                    try
+                    {
+                        string who = string.IsNullOrEmpty(request.DeviceName)
+                            ? request.From
+                            : (request.DeviceName + "（" + request.From + "）");
+                        string message = "有一台设备请求连接本机的中继：\n\n"
+                            + who + "\n\n"
+                            + "同意后它会自动获得连接地址与访问令牌，"
+                            + "不必再输入配对码。\n\n"
+                            + "只在你确实正在手表上操作时同意。";
+                        DialogResult answer = MessageBox.Show(form, message, "配对请求",
+                            MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                            MessageBoxDefaultButton.Button2);
+                        if (answer == DialogResult.Yes)
+                        {
+                            relay.ApprovePairing(request.Id);
+                        }
+                        else
+                        {
+                            relay.DenyPairing(request.Id);
+                        }
+                    }
+                    catch (Exception error)
+                    {
+                        log("确认配对时出错：" + error.Message);
+                    }
+                }));
+            }
+            catch (Exception error)
+            {
+                log("无法弹出配对确认：" + error.Message);
+            }
         }
 
         private void RaiseFailed(string message)

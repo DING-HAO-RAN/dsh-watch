@@ -245,6 +245,8 @@ final class Api {
         long seq;
         String role = "assistant";
         String text = "";
+        /** AI 的思考内容（DSH 的 reasoning 块）；为空表示这条没有思考。 */
+        String thinking = "";
         final List<String> tools = new ArrayList<>();
         /** 工具内部名（如 pwsh），用于图标化显示。 */
         String name = "";
@@ -338,14 +340,16 @@ final class Api {
      * org.json 的 optString 在字段显式为 null 时会返回 null（而不是默认值），
      * 手表上的文案字段大量来自服务端 JSON，这里必须统一兜底，否则会变成
      * 界面上的 NullPointerException。
+     *
+     * 包级可见：{@link Store} 解析多设备存档时也要用它。
      */
-    private static String text(JSONObject object, String key) {
+    static String text(JSONObject object, String key) {
         String value = object.optString(key, "");
         return value == null ? "" : value;
     }
 
     /** 数组元素版本的同一兜底。 */
-    private static String text(JSONArray array, int index) {
+    static String text(JSONArray array, int index) {
         String value = array.optString(index, "");
         return value == null ? "" : value;
     }
@@ -426,6 +430,7 @@ final class Api {
             step.seq = item.optLong("seq", 0L);
             step.role = text(item, "role");
             step.text = text(item, "text");
+            step.thinking = text(item, "thinking");
             step.name = text(item, "name");
             step.label = text(item, "label");
             step.detail = text(item, "detail");

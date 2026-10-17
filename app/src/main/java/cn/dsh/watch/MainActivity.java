@@ -263,6 +263,8 @@ public class MainActivity extends Activity {
     private String pendingCode = "";
     /** 启动参数要求直接配对（见 applyIntentExtras）。 */
     private boolean autoPair = false;
+    /** 一键配对进行中（界面据此显示「取消」而不是「重试」）。 */
+    private boolean quickPairing = false;
 
     /** 读 JSON 字符串字段，缺失或为 null 时给空串。 */
     private static String textOf(JSONObject object, String key) {
@@ -368,6 +370,26 @@ public class MainActivity extends Activity {
             ui.add(page, current, 0, 10);
         }
 
+        // ---- 已记住的设备：直接切换，不必重新配对 ----
+        final List<Store.Device> remembered = store.devices();
+        if (remembered.size() > 0) {
+            ui.add(page, ui.text("已记住的设备", 11, WatchUi.MUTED), 0, 6);
+            String currentBase = store.base();
+            for (final Store.Device device : remembered) {
+                boolean active = device.base.equals(currentBase);
+                String kind = device.isPublic() ? "公网" : "局域网";
+                String title = device.label.isEmpty() ? device.base : device.label;
+                ui.add(page, ui.row(title, kind + " · " + device.base,
+                        () -> switchToDevice(device)), 0, active ? 8 : 6);
+            }
+            ui.add(page, ui.text("点一条可直接切过去，不用重新配对。", 10, WatchUi.MUTED), 0, 10);
+        }
+
+        // ---- 一键配对：手表主动找局域网里的中继，电脑上确认即可 ----
+        ui.add(page, ui.button("一键配对", true, () -> startQuickPair(page)), 0, 8);
+
+        ui.divider(page);
+
         final EditText hostField = new EditText(this);
         hostField.setHint("地址，如 192.168.1.121 或 https://xxx.com");
         hostField.setText(pendingHost.isEmpty() ? store.base() : pendingHost);
@@ -432,9 +454,209 @@ public class MainActivity extends Activity {
                 else showSession(currentSessionId);
             }), 0, 0);
         }
-        ui.add(page, ui.text("地址可填局域网 IP，也可填公网中转地址（https://…）。配对码由电脑端中继启动时显示，每次配对后会更换。", 11, WatchUi.MUTED), 0, 0);
+        ui.add(page, ui.text("一键配对会发广播找同一 WiFi 下的电脑，电脑上点「同意」即可，"
+                + "地址与令牌自动导入。也可手动填地址与配对码：局域网 IP 或公网地址（https://…）。",
+                10, WatchUi.MUTED), 0, 0);
         render(page);
         hostField.requestFocus();
+    }
+
+    /** 切换到一台已记住的设备。 */
+    private void switchToDevice(final Store.Device device) {
+        if (device == null || !device.valid()) {
+            showToast("这台设备的令牌已失效，请重新配对");
+            return;
+        }
+        store.useDevice(device);
+        // 换设备等同于换了一个世界：会话、展开状态、列表指纹全部要清，
+        // 否则会上一条设备的展开卡片套在新设备的内容上。
+        currentSessionId = "";
+        currentSessionTitle = "";
+        currentAsk = null;
+        currentRunning = false;
+        currentBeforeSeq = 0;
+        currentHasMore = false;
+        currentProject = "";
+        steps.clear();
+        openGroups.clear();
+        openRows.clear();
+        lastListSignature = 0;
+        showToast("已切换到 " + (device.label.isEmpty() ? device.base : device.label));
+        showSessionList();
+    }
+
+    /** 手表上弹一个短提示（没有 Toast 时降级为日志）。 */
+    private void showToast(String message) {
+        try {
+            android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_SHORT).show();
+        } catch (Exception ignored) {
+            // 某些手表系统禁用了 Toast，忽略即可。
+        }
+    }
+
+    /**
+     * 一键配对：找局域网里的中继 → 请它在电脑上弹确认 → 拿到令牌 → 自动记下这台设备。
+     *
+     * 与「输入配对码」的区别只是获取令牌的方式：决定权都在电脑端
+     * （用户要在弹出的框里点同意），手表不能自己把自己配上。
+     */
+    private void startQuickPair(WatchUi.Page page) {
+        quickPairing = true;
+        showPairingProgress("正在局域网里寻找电脑…");
+        discovery.listen(found -> {
+            if (destroyed || !quickPairing) return;
+            if (found.isEmpty()) {
+                quickPairing = false;
+                showPairingProgress("没找到。请确认手表与电脑在同一个 WiFi，且电脑上的中继已启动。");
+                return;
+            }
+            // 优先选已经配对过设备的那台（大概率就是用户常用的电脑）。
+            Discovery.Found target = found.get(0);
+            for (Discovery.Found item : found) {
+                if (item.paired) {
+                    target = item;
+                    break;
+                }
+            }
+            requestPairingFrom(target);
+        });
+    }
+
+    /** 向指定中继发起配对请求，并轮询用户在电脑上的决定。 */
+    private void requestPairingFrom(final Discovery.Found target) {
+        final String base = "http://" + target.host + ":" + target.port;
+        showPairingProgress("已找到 " + (target.name.isEmpty() ? target.host : target.name)
+                + "\n正在请电脑确认…\n（请在电脑上看到提示后点「是」）");
+
+        JSONObject body = new JSONObject();
+        try {
+            body.put("name", android.os.Build.MODEL == null ? "手表" : android.os.Build.MODEL);
+        } catch (Exception ignored) {
+            // 仅字符串，不会失败。
+        }
+
+        api.post(base, "/api/pair/request", "", body, result -> {
+            if (destroyed || !quickPairing) return;
+            if (!result.ok) {
+                quickPairing = false;
+                showPairingProgress("请求配对失败：" + result.error);
+                return;
+            }
+            String requestId = Api.text(result.value, "requestId");
+            if (requestId.isEmpty()) {
+                quickPairing = false;
+                showPairingProgress("配对响应缺少请求号");
+                return;
+            }
+            pollPairingResult(base, target, requestId, 0);
+        });
+    }
+
+    /** 轮询配对结果（最多约 45 秒，给用户足够时间在电脑上点确认）。 */
+    private void pollPairingResult(final String base, final Discovery.Found target,
+                                   final String requestId, final int attempt) {
+        if (destroyed || !quickPairing) return;
+        if (attempt > 45) {
+            quickPairing = false;
+            showPairingProgress("等待确认超时。可以在电脑上重开一次，或用配对码方式。");
+            return;
+        }
+        postDelayed(() -> api.get(base, "/api/pair/result?id=" + Api.urlEncode(requestId), "",
+                result -> {
+                    if (destroyed || !quickPairing) return;
+                    String state = result.ok ? Api.text(result.value, "state") : "";
+                    if ("approved".equals(state)) {
+                        String grant = Api.text(result.value, "grant");
+                        exchangeGrant(base, target, grant);
+                        return;
+                    }
+                    if ("denied".equals(state)) {
+                        quickPairing = false;
+                        showPairingProgress("电脑上拒绝了这次配对。如果还想连，请再点一次。");
+                        return;
+                    }
+                    if ("expired".equals(state)) {
+                        quickPairing = false;
+                        showPairingProgress("这次请求已失效，请再点一次一键配对。");
+                        return;
+                    }
+                    pollPairingResult(base, target, requestId, attempt + 1);
+                }), 1000);
+    }
+
+    /** 用户已同意：用一次性票据换令牌，并记住这台设备。 */
+    private void exchangeGrant(final String base, final Discovery.Found target, final String grant) {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("grant", grant);
+        } catch (Exception ignored) {
+            // 仅字符串，不会失败。
+        }
+        api.post(base, "/api/pair", "", body, result -> {
+            if (destroyed) return;
+            quickPairing = false;
+            if (!result.ok) {
+                showPairingProgress("换取令牌失败：" + result.error);
+                return;
+            }
+            String token = Api.text(result.value, "token");
+            if (token.isEmpty()) {
+                showPairingProgress("配对响应缺少令牌");
+                return;
+            }
+            String address = target.host + ":" + target.port;
+            // 记成一台可切换的设备；同名电脑下次直接切，不用再配对。
+            store.rememberDevice(address, token,
+                    target.name.isEmpty() ? "" : target.name);
+            currentSessionId = "";
+            currentSessionTitle = "";
+            currentAsk = null;
+            steps.clear();
+            showToast("配对成功：" + (target.name.isEmpty() ? address : target.name));
+            showSessionList();
+        });
+    }
+
+    /** 一键配对过程中的进度页（只需简单反馈，不必每帧重绘整屏）。 */
+    private void showPairingProgress(String message) {
+        if (destroyed) return;
+        onSessionPage = false;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "一键配对", "");
+        LinearLayout card = ui.card();
+        TextView text = ui.text(message, 12, WatchUi.FG);
+        card.addView(text);
+        ui.add(page, card, 6, 10);
+        if (quickPairing) {
+            ui.add(page, ui.button("取消", false, () -> {
+                quickPairing = false;
+                discovery.cancel();
+                showConnect();
+            }), 0, 0);
+        } else {
+            ui.add(page, ui.button("重试", true, () -> {
+                quickPairing = true;
+                showPairingProgress("正在局域网里寻找电脑…");
+                discovery.listen(found -> {
+                    if (destroyed || !quickPairing) return;
+                    if (found.isEmpty()) {
+                        quickPairing = false;
+                        showPairingProgress("没找到。请确认手表与电脑在同一个 WiFi，且电脑上的中继已启动。");
+                        return;
+                    }
+                    Discovery.Found target = found.get(0);
+                    for (Discovery.Found item : found) {
+                        if (item.paired) {
+                            target = item;
+                            break;
+                        }
+                    }
+                    requestPairingFrom(target);
+                });
+            }), 0, 8);
+            ui.add(page, ui.button("改用手动填写", false, this::showConnect), 0, 0);
+        }
+        render(page);
     }
 
     /** 用给定地址与配对码完成配对。 */
@@ -459,8 +681,12 @@ public class MainActivity extends Activity {
                 status.setText("配对响应缺少令牌");
                 return;
             }
-            store.setBase(endpoint.display());
-            store.setToken(token);
+            // 记成一台可切换的设备（同一地址会覆盖，不会堆重复项）。
+            store.rememberDevice(endpoint.display(), token, "");
+            currentSessionId = "";
+            currentSessionTitle = "";
+            currentAsk = null;
+            steps.clear();
             status.setTextColor(WatchUi.OK);
             status.setText("配对成功，正在载入会话…");
             showSessionList();
@@ -1167,9 +1393,62 @@ public class MainActivity extends Activity {
                 group = new ArrayList<>();
             }
             addTo(container, stepLabel(step, i + 1), 0, 3);
+            // 思考内容排在正文之前：它是得出这句话之前的推理，顺序与电脑上一致。
+            // 默认折叠成一行，点开才看详细。
+            if (step.thinking != null && !step.thinking.trim().isEmpty()) {
+                addTo(container, thinkingBlock(step), 0, 5);
+            }
             addTo(container, messageBubble(step), 0, 6);
         }
         if (!group.isEmpty()) addTo(container, toolGroup(group), 0, 6);
+    }
+
+    /**
+     * 思考块：默认折叠成一行「思考」，点开看内容。
+     *
+     * 视觉上刻意比正文弱：左侧一条细竖线、灰色小字、无实心底色。
+     * 这样它既能在对话里看得到（用户要求），又不会把正文淹掉。
+     * 展开状态记在 openRows 里——界面是重建整屏刷新，只存在视图上会被下一次刷新收回。
+     */
+    private View thinkingBlock(final Api.Step step) {
+        final String key = "think:" + step.seq;
+        LinearLayout wrap = new LinearLayout(this);
+        wrap.setOrientation(LinearLayout.HORIZONTAL);
+
+        // 左侧竖线：靠 MATCH_PARENT 跟着文字高度走。
+        View bar = new View(this);
+        bar.setBackgroundColor(WatchUi.LINE);
+        LinearLayout.LayoutParams barParams =
+                new LinearLayout.LayoutParams(ui.dp(2), LinearLayout.LayoutParams.MATCH_PARENT);
+        barParams.setMargins(0, ui.dp(2), ui.dp(8), ui.dp(2));
+        wrap.addView(bar, barParams);
+
+        LinearLayout body = new LinearLayout(this);
+        body.setOrientation(LinearLayout.VERTICAL);
+        LinearLayout.LayoutParams bodyParams =
+                new LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        wrap.addView(body, bodyParams);
+
+        TextView header = ui.text("思考", 10, WatchUi.MUTED);
+        body.addView(header);
+
+        final TextView detail = ui.text(cut(step.thinking, 1200), 11, WatchUi.MUTED);
+        detail.setPadding(0, ui.dp(4), 0, 0);
+        boolean open = openRows.contains(key);
+        detail.setVisibility(open ? View.VISIBLE : View.GONE);
+        body.addView(detail);
+        header.setText(open ? "思考 ▾" : "思考 ▸");
+
+        // 折叠状态只挂在标题上；内容区保留可长按复制等系统行为。
+        header.setOnClickListener(v -> {
+            boolean nowOpen = detail.getVisibility() == View.VISIBLE;
+            detail.setVisibility(nowOpen ? View.GONE : View.VISIBLE);
+            header.setText(nowOpen ? "思考 ▸" : "思考 ▾");
+            if (nowOpen) openRows.remove(key);
+            else openRows.add(key);
+            lastInteractionAt = System.currentTimeMillis();
+        });
+        return wrap;
     }
 
     /** 正文气泡：按 Markdown 渲染，用户消息用强调色。 */

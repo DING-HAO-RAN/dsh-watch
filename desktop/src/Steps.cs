@@ -18,6 +18,8 @@ namespace DshRelay
         private const int MaxTextChars = 4000;
         private const int StepTextChars = 1500;
         private const int StepResultChars = 2000;
+        /// <summary>思考内容的截断上限。用户要求能看到思考，但手表屏幕小，留一段足够判断思路。</summary>
+        private const int StepThinkingChars = 1200;
 
         /// <summary>工具名到显示标签的映射（手表上是短标签，不需要原始英文名）。</summary>
         private static readonly Dictionary<string, string> ToolLabels = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -79,8 +81,9 @@ namespace DshRelay
 
                 if (type == "assistant/message")
                 {
-                    string text = TextOfContent(ContentOf(data));
-                    var calls = ToolsOfContent(ContentOf(data));
+                    var content = ContentOf(data);
+                    string text = TextOfContent(content);
+                    string thinking = ThinkingOfContent(content);
                     var last = messages.Count > 0 ? messages[messages.Count - 1] as Dictionary<string, object> : null;
                     bool canAppend = last != null && Convert.ToString(last["role"]) == "assistant";
                     if (!canAppend)
@@ -89,6 +92,7 @@ namespace DshRelay
                         last["seq"] = RelayServer.GetLong(evt, "seq");
                         last["role"] = "assistant";
                         last["text"] = "";
+                        last["thinking"] = "";
                         last["tools"] = new List<object>();
                         last["time"] = RelayServer.GetLong(evt, "time");
                         messages.Add(last);
@@ -98,6 +102,14 @@ namespace DshRelay
                         string existing = Convert.ToString(last["text"]);
                         last["text"] = existing.Length == 0 ? text : existing + "\n\n" + text;
                     }
+                    if (thinking.Length > 0)
+                    {
+                        string existingThought = Convert.ToString(last["thinking"]);
+                        last["thinking"] = existingThought.Length == 0
+                            ? thinking
+                            : existingThought + "\n\n" + thinking;
+                    }
+                    var calls = ToolsOfContent(content);
                     // tools 是本方法自己创建的 List<object>，不是 JSON 反序列化的结果；
                     // 但 canAppend 时上一条可能来自别处，取不到就补一个，避免空引用。
                     var list = last["tools"] as List<object>;
@@ -156,11 +168,19 @@ namespace DshRelay
                 {
                     var content = ContentOf(data);
                     string text = TextOfContent(content);
+                    string thinking = ThinkingOfContent(content);
                     if (pendingAssistant == null) pendingAssistant = MessageStep(evt, "assistant", "");
                     if (text.Trim().Length > 0)
                     {
                         string existing = Convert.ToString(pendingAssistant["text"]);
                         pendingAssistant["text"] = existing.Length == 0 ? text : existing + "\n\n" + text;
+                    }
+                    if (thinking.Length > 0)
+                    {
+                        string existingThought = Convert.ToString(pendingAssistant["thinking"]);
+                        pendingAssistant["thinking"] = existingThought.Length == 0
+                            ? thinking
+                            : existingThought + "\n\n" + thinking;
                     }
                     pendingAssistant["seq"] = RelayServer.GetLong(evt, "seq");
                     pendingAssistant["time"] = RelayServer.GetLong(evt, "time");
@@ -248,7 +268,8 @@ namespace DshRelay
                 }
             }
 
-            // 收尾：正文可能超过上限，统一截断。
+            // 收尾：正文与思考都可能超过上限，统一截断。
+            // 思考给更小的上限：它通常很长，而手表屏幕只有几百像素。
             foreach (var raw in steps)
             {
                 var step = raw as Dictionary<string, object>;
@@ -256,6 +277,10 @@ namespace DshRelay
                 if (Convert.ToString(step["kind"]) == "message")
                 {
                     step["text"] = Clip(Convert.ToString(step["text"]), StepTextChars);
+                    if (step.ContainsKey("thinking"))
+                    {
+                        step["thinking"] = Clip(Convert.ToString(step["thinking"]), StepThinkingChars);
+                    }
                 }
             }
             return steps;
@@ -269,6 +294,8 @@ namespace DshRelay
             step["time"] = RelayServer.GetLong(evt, "time");
             step["role"] = role;
             step["text"] = text;
+            // 思考内容与正文分开存：手表端默认折叠、弱化显示，不影响正文可读性。
+            step["thinking"] = "";
             step["tools"] = new List<object>();
             return step;
         }
@@ -304,8 +331,26 @@ namespace DshRelay
             return kind == "user" || kind == "user-question-reply";
         }
 
-        /// <summary>抽取 content 里的纯文本（跳过 reasoning，它通常很长且是内部思考）。</summary>
+        /// <summary>抽取 content 里的正文（只取 type=text，思考走 ThinkingOfContent）。</summary>
         private static string TextOfContent(List<object> content)
+        {
+            return JoinBlocks(content, "text");
+        }
+
+        /// <summary>
+        /// 抽取 content 里的思考内容（type=reasoning）。
+        ///
+        /// 用户要求对话里能看到 AI 的思考过程。实测 DSH 的 content 块里
+        /// reasoning 是数量最多的一类（一条会话里 35 个 reasoning / 59 个 tool-call
+        /// / 5 个 text），字段与 text 块相同（type + text）。
+        /// 这里单独取出来，交给手表端用弱化样式折叠显示。
+        /// </summary>
+        private static string ThinkingOfContent(List<object> content)
+        {
+            return JoinBlocks(content, "reasoning");
+        }
+
+        private static string JoinBlocks(List<object> content, string blockType)
         {
             if (content == null) return "";
             var parts = new List<string>();
@@ -313,9 +358,9 @@ namespace DshRelay
             {
                 var block = raw as Dictionary<string, object>;
                 if (block == null) continue;
-                if (RelayServer.GetString(block, "type") != "text") continue;
+                if (RelayServer.GetString(block, "type") != blockType) continue;
                 string text = RelayServer.GetString(block, "text");
-                if (text.Length > 0) parts.Add(text);
+                if (text.Trim().Length > 0) parts.Add(text);
             }
             return string.Join("\n", parts.ToArray()).Trim();
         }
