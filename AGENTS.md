@@ -41,6 +41,10 @@
 - 程序目录下的 `startup.log` 记录启动全过程（DSH 定位、端口、依赖释放、异常堆栈）。**GUI 程序闪退时这是唯一的诊断线索**，排查先看它。
 - 判断程序是否真的在运行**不要用 `Get-Process -Name 中文名`**（对中文进程名不可靠，会假报"未找到"）。可靠做法：`tasklist /FO CSV` 过滤，或 `Get-CimInstance Win32_Process -Filter "Name='DSH中继.exe'"`。
 - 从命令行启动 GUI 程序时 `Start-Process`/`& exe` 会阻塞到程序退出，**这不代表失败**。要立即返回并拿到 PID，用 `Invoke-CimMethod -ClassName Win32_Process -MethodName Create`。
+- **DPI 感知靠 [app.manifest](<desktop/src/app.manifest>)，不要删**。缺它时进程在 125%/150%/200% 缩放下会被 DWM 按位图拉伸，整个窗口连内嵌网页一起发虚——用户会说「分辨率不够」。清单里 `dpiAware` 与 `dpiAwareness` 两条都要留，前者给 Win10 1703 以前的系统读。`build-app.ps1` 用 `/win32manifest:` 编译进去。
+- 窗口尺寸由 `MainForm.ApplyDisplaySize()` 按**当前显示器工作区的比例**算，夹在 940×660 到 1480×1040 之间，**不要写死像素**：写死时小屏会超出屏幕、高缩放屏会显得又小又挤。
+- 改 `panel.html` 后验证视觉：开发时 `Embedded.ReadText` 优先读程序目录下的同名文件，把 `panel.html` 拷进 `dist/DSH中继/` 再刷新即可，不必重编 exe。核对渲染用无头 Edge（`msedge --headless=new --remote-debugging-port`）截图，注意 **`fetch` 有缓存**时页面会显示旧结果。
+- `NativePanel` 的卡片是**从 `TableLayoutPanel` 派生的**，不是 `Panel`：卡片要「宽度撑满、高度随内容」，只有 TableLayoutPanel 的 AutoSize 能稳妥做到，用 Panel + Dock 会被压成内容固有宽度。地址行同理改用 TableLayoutPanel，**不要用 `FlowLayoutPanel` + 手算像素宽度**，否则换窗口尺寸后行宽不跟随。
 
 ## 中继打包（命令行版，SEA）
 
@@ -129,6 +133,13 @@
 - 手表上验证输入框内容要看截图：`uiautomator dump` 对第三方 `EditText` 常读到空值。
 - 验证「界面是否还在闪」不要靠肉眼看截图：间隔几秒连拍数张，比对文件哈希；哈希一致即画面稳定。
 
+## 对外语言（需求方明确要求）
+
+- **凡是仓库外的人能看见的文本一律写英文**：commit message、branch 名、PR/issue 标题与正文、Release 标题与说明、tag、仓库简介里英文那半。**代码、命令、变量名保持英文**这条本来就成立，不再赘述。
+- **README 出中英两版**，中文是默认版：[README.md](<README.md>) 为中文（GitHub 首屏展示它），[README.en.md](<README.en.md>) 为英文。两版**首行都要有 `[中文](README.md) | [English](README.en.md)`**（英文版把顺序反过来写）。改内容时**两份一起改**，不要只更新一份——两份内容长期不同步会误导外部使用者。
+- 仓库简介（GitHub 的 description）写成**英文 + 中文**，英文在前：外边检索的人看英文，中文给熟客。改简介用 Node 的 `fetch`，改完**必须拉回来核对含中文**——接口返回 200 不代表没被转义成 `?`（见「发布」一节同样的坑）。
+- 仓库内部的文档（`AGENTS.md`、[B站投稿文案](<docs/B站投稿文案.md>)）是给需求方与后续会话看的，**保持中文**，不要跟着改成英文。
+- 发出来的资产名沿用 `DSH-Relay.exe` / `DSH-Watch.apk`（英文），与上面的要求一致。
 
 ## 介绍片素材
 

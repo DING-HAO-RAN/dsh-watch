@@ -1,3 +1,5 @@
+[中文](README.md) | [English](README.en.md)
+
 # 手表 DSH
 
 在智能手表上查看和操作电脑上的 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 会话。
@@ -203,6 +205,7 @@ node tests/probe-shapes.mjs                   # 查看 DSH 实际返回的字段
 - **单文件分发**：桌面程序把 WebView2 的托管程序集与原生加载器都嵌进 exe——托管程序集在启动时**从内存装入**，原生加载器释放到程序目录。这样分发只需一个文件，也不会往用户配置目录里堆东西。
 - **圆屏适配**：按圆的内接矩形统一留边（左右 15%、上下 18%），四角到圆心约 0.474 < 半径 0.5，整个滚动区都在圆内，因此不需要为每个页面单独算边距。
 - **界面永远可用**：桌面程序有两层界面——内嵌浏览器的网页控制台（好看、信息密度高）和纯 WinForms 的原生界面（零依赖）。前者依赖 WebView2 运行时，精简版 Windows 上可能没有，此时自动降级到后者，配对码与地址照常显示。
+- **高分屏不模糊**：程序带 DPI 感知清单（PerMonitor V2），在 125%/150%/200% 缩放的屏幕上按真实分辨率渲染，文字与边框不发虚；窗口初始尺寸按当前显示器工作区的比例算出，小屏不超出、大屏不空旷。
 
 ## 项目结构
 
@@ -221,9 +224,10 @@ node tests/probe-shapes.mjs                   # 查看 DSH 实际返回的字段
 │       └── res/
 ├── desktop/                   电脑端桌面程序（C#，单文件 exe）
 │   ├── src/
-│   │   ├── MainForm.cs         窗口与内嵌浏览器
+│   │   ├── MainForm.cs         窗口、内嵌浏览器与开窗尺寸
 │   │   ├── NativePanel.cs      零依赖原生界面（降级目标）
 │   │   ├── panel.html          网页控制台
+│   │   ├── app.manifest        DPI 感知清单（高分屏不模糊）
 │   │   ├── RelayServer.cs      中继服务
 │   │   ├── DshClient.cs        DSH 鉴权与 RPC
 │   │   ├── DshLocator.cs       查找本机 DSH 与凭据
