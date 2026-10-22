@@ -32,11 +32,11 @@ namespace DshRelay
         public MainForm()
         {
             Text = "DSH 中继";
-            ClientSize = new Size(920, 720);
-            MinimumSize = new Size(560, 480);
+            AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
-            BackColor = Color.FromArgb(13, 17, 23);
+            BackColor = Color.FromArgb(11, 13, 16);
             Font = new Font("Microsoft YaHei UI", 9f);
+            ApplyDisplaySize();
 
             // 先摆好原生界面：它同时也是内嵌浏览器失败时的后备。
             fallback = new NativePanel();
@@ -48,6 +48,34 @@ namespace DshRelay
             host.UrlReady += OnPanelReady;
             host.Failed += OnFailed;
             host.Start();
+        }
+
+        /// <summary>
+        /// 按当前显示器的可用区域决定窗口大小。
+        ///
+        /// 不能写死像素：在 150%/200% 缩放的屏幕上，同一个 920×720 会显得又小又挤，
+        /// 而在 1366×768 的小屏上又会超出屏幕。这里按工作区比例取值并夹在合理区间内，
+        /// 同时把初值取在「本窗口所在屏幕」的 DPI 上，WebView2 里的 CSS 像素才是等比的。
+        /// </summary>
+        private void ApplyDisplaySize()
+        {
+            Rectangle area = Screen.PrimaryScreen == null
+                ? new Rectangle(0, 0, 1920, 1080)
+                : Screen.PrimaryScreen.WorkingArea;
+
+            int width = Clamp((int)(area.Width * 0.72), 940, 1480);
+            int height = Clamp((int)(area.Height * 0.84), 660, 1040);
+
+            ClientSize = new Size(width, height);
+            MinimumSize = new Size(660, 560);
+            MaximumSize = new Size(area.Width, area.Height);
+        }
+
+        private static int Clamp(int value, int min, int max)
+        {
+            if (value < min) return min;
+            if (value > max) return max;
+            return value;
         }
 
         private void OnPanelReady(string url)

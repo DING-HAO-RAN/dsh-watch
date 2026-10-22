@@ -120,6 +120,11 @@ try {
     $lines.Add('/reference:"System.Web.Extensions.dll"')
     $lines.Add('/reference:"' + $coreDll + '"')
     $lines.Add('/reference:"' + $formsDll + '"')
+    # DPI 感知：不嵌这张清单，进程在 125%/150% 缩放下会被系统按位图拉伸，
+    # 界面对应"模糊的 100%"——这是"分辨率不够"的真正原因。
+    $manifest = Join-Path $src 'app.manifest'
+    if (-not (Test-Path -LiteralPath $manifest)) { throw "缺少清单文件：$manifest" }
+    $lines.Add('/win32manifest:"' + $manifest + '"')
     # 全部资源都嵌进 exe，产出**单个文件**：靠 Bootstrap 在启动时释放。
     # WebView2 的原生加载器不能只放一边——用户拷文件时漏一个就打不开。
     $lines.Add('/resource:"' + (Join-Path $src 'panel.html') + '",panel.html')

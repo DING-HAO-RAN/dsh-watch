@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    DPI 感知清单。
+
+    不写这份清单时，进程在 125%/150%/200% 缩放的屏幕上会被 DWM 按位图拉伸：
+    整个窗口（含内嵌控件里的网页）先按 100% 渲染再放大，文字和圆点边缘发虚，
+    这就是「分辨率不够」的由来。声明 PerMonitorV2 之后，系统按显示器各自的
+    缩放比例交给程序，WebView2 里的 CSS 像素随之按物理比例渲染，文字是清晰的。
+
+    dpiAware/dpiAwareness 两条都写是刻意的：前者给 Windows 10 1703 以前读，
+    后者给更新的系统读，互不冲突（系统取认识的那条）。
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <assemblyIdentity version="1.0.0.0" name="DshRelay.app" type="win32" />
+
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2, PerMonitor</dpiAwareness>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 / 11 支持声明：有了它，版本相关的 API 才会按真实系统版本返回。 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}" />
+    </application>
+  </compatibility>
+</assembly>

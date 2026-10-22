@@ -2,86 +2,386 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>DSH 中继</title>
+<link rel="icon" href="data:,">
 <style>
-  :root { color-scheme: dark; }
-  body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    background: #0b0e14; color: #e8eef8;
-    font: 15px/1.7 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  /* 与桌面程序的 panel.html 共用一套设计语言：单一琥珀强调色、冷调中性色、
+     极淡的环境光与噪点。命令行版没有令牌列表与操作按钮，布局更简单。 */
+  :root {
+    color-scheme: dark;
+
+    --bg: #0b0d10;
+    --bg-elev: #101318;
+    --surface: #14181e;
+    --surface-2: #191e25;
+    --surface-3: #1f242c;
+    --line: rgba(255, 255, 255, .07);
+    --line-strong: rgba(255, 255, 255, .13);
+
+    --fg: #e9edf2;
+    --fg-soft: #b6c0cc;
+    --muted: #7d8895;
+    --faint: #5c666f;
+
+    --accent: #f0b64b;
+    --ok: #4cc38a;
+    --warn: #f0b64b;
+    --bad: #f2777a;
+
+    --radius-lg: 18px;
+    --radius-md: 12px;
+
+    --font: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    --font-display: "Segoe UI Variable Display", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif;
+    --mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, "SFMono-Regular", monospace;
   }
-  main { width: min(680px, 92vw); padding: 32px 0; }
-  h1 { font-size: 24px; margin: 0 0 4px; }
-  .sub { color: #7f8ea6; margin-bottom: 24px; }
-  .card { background: #161b24; border-radius: 12px; padding: 18px 20px; margin-bottom: 14px; }
-  .card h2 { font-size: 14px; margin: 0 0 12px; color: #7abeff; font-weight: 600; }
-  .row { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; }
-  .row .k { color: #8a99b0; }
-  .row .v { font-family: ui-monospace, Consolas, monospace; text-align: right; word-break: break-all; }
-  .code { font-size: 30px; letter-spacing: 8px; color: #fab860; font-family: ui-monospace, Consolas, monospace; }
-  ol { margin: 0; padding-left: 20px; }
-  ol li { margin: 6px 0; }
-  code { background: #222a36; padding: 1px 6px; border-radius: 4px; font-family: ui-monospace, Consolas, monospace; }
-  .ok { color: #7ed9a0; } .warn { color: #fab860; }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html { height: 100%; }
+
+  body {
+    min-height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--font);
+    font-size: 15px;
+    line-height: 1.62;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body::before {
+    content: "";
+    position: fixed;
+    inset: -20% -10% auto -10%;
+    height: 150%;
+    pointer-events: none;
+    z-index: 0;
+    background:
+      radial-gradient(52em 30em at 12% -8%, rgba(240, 182, 75, .075), transparent 62%),
+      radial-gradient(46em 26em at 92% 2%, rgba(96, 132, 180, .085), transparent 64%);
+  }
+
+  .app { position: relative; z-index: 1; width: 100%; max-width: 880px; margin: 0 auto; padding: clamp(24px, 5vw, 56px) clamp(18px, 4vw, 32px) 48px; }
+
+  header { display: flex; align-items: center; gap: 14px; margin-bottom: 26px; }
+
+  .mark {
+    flex: none;
+    width: 38px;
+    height: 38px;
+    border-radius: 11px;
+    display: grid;
+    place-items: center;
+    background: linear-gradient(160deg, #23282f, #14181e);
+    box-shadow: inset 0 0 0 1px var(--line-strong), 0 1px 2px rgba(0, 0, 0, .5);
+  }
+
+  .brand { min-width: 0; flex: 1 1 auto; }
+
+  h1 {
+    margin: 0;
+    font-family: var(--font-display);
+    font-size: 19px;
+    line-height: 1.3;
+    font-weight: 600;
+    letter-spacing: -.01em;
+    white-space: nowrap;
+  }
+
+  .sub { margin: 1px 0 0; font-size: 13px; line-height: 1.5; color: var(--muted); }
+
+  .pill {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: 999px;
+    font-size: 12.5px;
+    font-weight: 600;
+    white-space: nowrap;
+    background: var(--surface-2);
+    color: var(--muted);
+    box-shadow: inset 0 0 0 1px var(--line);
+    transition: color 200ms ease, background-color 200ms ease, box-shadow 200ms ease;
+  }
+  .pill .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; box-shadow: 0 0 0 3px rgba(125, 136, 149, .16); }
+  .pill.on { background: rgba(76, 195, 138, .12); color: var(--ok); box-shadow: inset 0 0 0 1px rgba(76, 195, 138, .30); }
+  .pill.off { background: rgba(242, 119, 122, .12); color: var(--bad); box-shadow: inset 0 0 0 1px rgba(242, 119, 122, .30); }
+
+  @keyframes slide-in {
+    from { opacity: 0; transform: translateY(7px); }
+    to { opacity: 1; transform: none; }
+  }
+
+  .card {
+    background: var(--surface);
+    border-radius: var(--radius-lg);
+    box-shadow: inset 0 0 0 1px var(--line), 0 1px 2px rgba(0, 0, 0, .40), 0 12px 32px -18px rgba(0, 0, 0, .72);
+    animation: slide-in 320ms cubic-bezier(.2, .8, .2, 1) both;
+  }
+  .card + .card { margin-top: 16px; }
+
+  .card-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 14px;
+    padding: 16px 20px 0;
+  }
+  .card-body { padding: 14px 20px 18px; }
+
+  .eyebrow {
+    margin: 0;
+    font-size: 12px;
+    font-weight: 600;
+    letter-spacing: .10em;
+    text-transform: uppercase;
+    color: var(--faint);
+    white-space: nowrap;
+  }
+
+  /* 配对码是这一页的主角：物理单位放大的数字配一块极淡的底光。 */
+  .code-card {
+    padding: 22px 24px 22px;
+    background:
+      radial-gradient(120% 90% at 50% 0%, rgba(240, 182, 75, .10), transparent 62%),
+      var(--surface);
+  }
+  .code-stage { display: grid; place-items: center; padding: 16px 0 14px; min-height: 118px; }
+  .code {
+    display: block;
+    font-family: var(--mono);
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    font-size: clamp(40px, 9vw, 68px);
+    line-height: 1;
+    letter-spacing: .14em;
+    padding-left: .14em;
+    color: var(--accent);
+    text-shadow: 0 0 44px rgba(240, 182, 75, .26);
+    white-space: nowrap;
+    user-select: all;
+  }
+  .code-foot { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding-top: 14px; box-shadow: inset 0 1px 0 var(--line); }
+
+  .kv { display: grid; margin: 0; }
+  .kv-row { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; padding: 11px 0; font-size: 13.5px; }
+  .kv-row + .kv-row { box-shadow: inset 0 1px 0 var(--line); }
+  .kv-row dt { flex: none; margin: 0; color: var(--muted); }
+  .kv-row dd {
+    margin: 0;
+    min-width: 0;
+    text-align: right;
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.5;
+    font-variant-numeric: tabular-nums;
+    color: var(--fg);
+    overflow-wrap: anywhere;
+  }
+  .kv-row dd.ok { color: var(--ok); }
+  .kv-row dd.warn { color: var(--warn); }
+
+  .hint { margin: 0; font-size: 12.5px; line-height: 1.65; color: var(--muted); text-wrap: pretty; }
+
+  .steps { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+  .step { display: flex; align-items: flex-start; gap: 13px; padding: 13px 0; font-size: 13.5px; }
+  .step + .step { box-shadow: inset 0 1px 0 var(--line); }
+  .step:first-child { padding-top: 4px; }
+  .step-no {
+    flex: none;
+    width: 24px;
+    height: 24px;
+    margin-top: 1px;
+    border-radius: 8px;
+    background: var(--surface-2);
+    box-shadow: inset 0 0 0 1px var(--line-strong);
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 24px;
+    text-align: center;
+  }
+  .step-body { min-width: 0; }
+  .step-body b { display: block; color: var(--fg); font-weight: 600; line-height: 1.5; }
+  .step-body span { display: block; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+
+  code {
+    padding: 1px 6px;
+    border-radius: 5px;
+    background: var(--surface-3);
+    box-shadow: inset 0 0 0 1px var(--line-strong);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--fg-soft);
+  }
+
+  footer { margin-top: 26px; font-size: 12px; line-height: 1.6; color: var(--faint); }
+  footer .sep { opacity: .45; padding: 0 6px; }
+
+  @media (max-width: 560px) {
+    .sub { display: none; }
+    .code { font-size: clamp(34px, 13vw, 50px); }
+    .code-foot { flex-direction: column; align-items: flex-start; gap: 6px; }
+    .card-head { padding: 14px 16px 0; }
+    .card-body { padding: 12px 16px 16px; }
+    .code-card { padding: 18px 16px 18px; }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
+  }
 </style>
 </head>
 <body>
-<main>
-  <h1>DSH 中继</h1>
-  <div class="sub">把本机 DSH 桌面版桥接给手表</div>
+<div class="app">
+  <header>
+    <span class="mark" aria-hidden="true">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="#f0b64b" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="12" cy="12" r="8.4"></circle>
+        <path d="M12 7.6V12l3 1.8"></path>
+      </svg>
+    </span>
+    <div class="brand">
+      <h1>DSH 中继</h1>
+      <p class="sub">把本机 DSH 桌面版桥接给手表</p>
+    </div>
+    <span class="pill" id="statePill"><span class="dot"></span><span id="stateText">读取中</span></span>
+  </header>
 
-  <div class="card">
-    <h2>状态</h2>
-    <div class="row"><span class="k">服务</span><span class="v" id="state">读取中…</span></div>
-    <div class="row"><span class="k">已运行</span><span class="v" id="uptime">—</span></div>
-    <div class="row"><span class="k">公网地址</span><span class="v" id="public">—</span></div>
-  </div>
+  <section class="card code-card">
+    <div class="card-head" style="padding:0">
+      <p class="eyebrow">配对码</p>
+      <span class="hint">手表连接时输入这 6 位数字</span>
+    </div>
+    <div class="code-stage">
+      <span class="code" id="code">••••••</span>
+    </div>
+    <div class="code-foot">
+      <span class="hint">配对成功后不会自动更换，下次连接直接用同一个码</span>
+    </div>
+  </section>
 
-  <div class="card">
-    <h2>手表怎么连</h2>
-    <div class="row"><span class="k">局域网地址</span><span class="v" id="lan">—</span></div>
-    <div class="row"><span class="k">配对码</span><span class="v code" id="code">——————</span></div>
-    <ol>
-      <li>手表上打开「DSH 手表」→ 左滑 →「设置」</li>
-      <li>地址填上面这个（同一 WiFi 用局域网地址，否则用公网地址）</li>
-      <li>配对码填上面的 6 位数字，点「配对并连接」</li>
-    </ol>
-  </div>
+  <section class="card" style="animation-delay:50ms">
+    <div class="card-head"><h2 class="eyebrow">连接地址</h2></div>
+    <div class="card-body">
+      <dl class="kv">
+        <div class="kv-row"><dt>局域网</dt><dd id="lan">—</dd></div>
+        <div class="kv-row"><dt>公网</dt><dd id="public">—</dd></div>
+        <div class="kv-row"><dt>已运行</dt><dd id="uptime">—</dd></div>
+      </dl>
+    </div>
+  </section>
 
-  <div class="card">
-    <h2>说明</h2>
-    <div class="row"><span class="k">配对码</span><span class="v">每次配对成功后会更换</span></div>
-    <div class="row"><span class="k">关闭窗口</span><span class="v">中继停止，手表即断开</span></div>
-  </div>
-</main>
+  <section class="card" style="animation-delay:100ms">
+    <div class="card-head"><h2 class="eyebrow">手表怎么连</h2></div>
+    <div class="card-body">
+      <ol class="steps">
+        <li class="step">
+          <span class="step-no">1</span>
+          <span class="step-body">
+            <b>在手表上打开「DSH 手表」</b>
+            <span>右滑返回、左滑呼出菜单，进入「设置」</span>
+          </span>
+        </li>
+        <li class="step">
+          <span class="step-no">2</span>
+          <span class="step-body">
+            <b>填入上面那条地址</b>
+            <span>同一个 WiFi 用局域网地址，外网用公网地址</span>
+          </span>
+        </li>
+        <li class="step">
+          <span class="step-no">3</span>
+          <span class="step-body">
+            <b>输入 6 位配对码，点「配对并连接」</b>
+            <span>成功后手表会记住这台电脑，之后打开即用</span>
+          </span>
+        </li>
+      </ol>
+    </div>
+  </section>
+
+  <section class="card" style="animation-delay:150ms">
+    <div class="card-head"><h2 class="eyebrow">说明</h2></div>
+    <div class="card-body">
+      <dl class="kv">
+        <div class="kv-row"><dt>关闭窗口</dt><dd>中继停止，手表即断开</dd></div>
+        <div class="kv-row"><dt>公网地址</dt><dd id="publicNote">未开启</dd></div>
+        <div class="kv-row"><dt>配对码不变</dt><dd>重启后沿用同一个</dd></div>
+      </dl>
+      <p class="hint" style="margin-top:14px">公网地址由 <code>cloudflared</code> 临时隧道提供，每次启动都会变；不打算跨网络访问时保持关闭即可。</p>
+    </div>
+  </section>
+
+  <footer>
+    <span>命令行中继<span class="sep">·</span>控制面板仅本机可访问<span class="sep">·</span><span id="version"></span></span>
+  </footer>
+</div>
+
 <script>
+  const el = (id) => document.getElementById(id);
+  let alive = true;
+
+  function fmt(ms) {
+    if (!ms) return '—';
+    const total = Math.floor(ms / 1000);
+    if (total < 60) return total + ' 秒';
+    const minutes = Math.floor(total / 60);
+    if (minutes < 60) return minutes + ' 分 ' + (total % 60) + ' 秒';
+    const hours = Math.floor(minutes / 60);
+    return hours + ' 小时 ' + (minutes % 60) + ' 分';
+  }
+
+  function markOnline() {
+    el('statePill').className = 'pill on';
+    el('stateText').textContent = '运行中';
+  }
+
+  function markOffline() {
+    el('statePill').className = 'pill off';
+    el('stateText').textContent = '已停止';
+  }
+
   // 每秒刷新一次状态：这里读的是本机 loopback，页面本身不对外暴露。
   async function refresh() {
     try {
-      const status = await (await fetch('/api/status')).json();
-      const local = await (await fetch('/local/state')).json();
-      document.getElementById('state').textContent = '运行中';
-      document.getElementById('state').className = 'v ok';
-      document.getElementById('uptime').textContent = fmt(status.uptimeMs);
-      document.getElementById('code').textContent = local.pairingCode ?? '——————';
-      document.getElementById('lan').textContent = local.lanAddresses?.[0] ?? '—';
-      const pub = status.publicUrl;
-      document.getElementById('public').textContent = pub ?? '未开启（加 --tunnel 可开）';
-      document.getElementById('public').className = pub ? 'v ok' : 'v warn';
+      const status = await (await fetch('/api/status', { cache: 'no-store' })).json();
+      const local = await (await fetch('/local/state', { cache: 'no-store' })).json();
+      if (!alive) return;
+
+      markOnline();
+      el('uptime').textContent = fmt(status.uptimeMs);
+
+      const code = local.pairingCode ?? '';
+      el('code').textContent = code === '' ? '••••••' : code;
+
+      const lan = Array.isArray(local.lanAddresses) && local.lanAddresses.length > 0 ? local.lanAddresses[0] : '';
+      el('lan').textContent = lan === '' ? '尚未取得' : lan;
+      el('lan').className = lan === '' ? 'warn' : '';
+
+      const pub = status.publicUrl ?? '';
+      el('public').textContent = pub === '' ? '未开启' : pub;
+      el('public').className = pub === '' ? 'warn' : 'ok';
+      el('publicNote').textContent = pub === '' ? '需要时加 --tunnel 启动' : '隧道已开启';
+      el('version').textContent = status.name ? status.name : '';
     } catch (error) {
-      document.getElementById('state').textContent = '已停止';
-      document.getElementById('state').className = 'v warn';
+      if (!alive) return;
+      markOffline();
     }
   }
-  function fmt(ms) {
-    if (!ms) return '—';
-    const s = Math.floor(ms / 1000);
-    if (s < 60) return s + ' 秒';
-    if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
-    return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
-  }
+
   refresh();
-  setInterval(refresh, 1000);
+  const timer = setInterval(refresh, 1000);
+  window.addEventListener('beforeunload', () => { alive = false; clearInterval(timer); });
 </script>
 </body>
 </html>
