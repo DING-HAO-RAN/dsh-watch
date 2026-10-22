@@ -413,9 +413,68 @@ namespace DshRelay
         /// 手表上不可能展示完整 JSON，因此按工具类型挑关键字段：
         /// 命令类给命令，文件类给路径。
         /// </summary>
-        public static string DescribeToolCall(string name, string rawArguments)
+        /// <summary>
+        /// 从一次工具调用的参数里取出它碰到的文件路径。
+        ///
+        /// 手表只允许打开「这次会话里真正出现过的文件」：白名单来自这里，
+        /// 而不是让手表任意指定路径——那样等于把整台电脑的文件系统交给手表。
+        /// 读、写、编辑、列目录的参数名并不统一，所以按常见键名逐个找。
+        /// </summary>
+        public static List<string> ToolPaths(string rawArguments)
         {
-            if (string.IsNullOrEmpty(rawArguments)) return "";
+            var paths = new List<string>();
+            if (string.IsNullOrEmpty(rawArguments)) return paths;
+            object parsed = null;
+            try
+            {
+                var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+                parsed = serializer.DeserializeObject(rawArguments);
+            }
+            catch
+            {
+                return paths;
+            }
+
+            var map = parsed as Dictionary<string, object>;
+            if (map == null) return paths;
+
+            string[] keys = new string[]
+            {
+                "file_path", "path", "notebook_path", "target_file", "file",
+                "path1", "path2", "source", "destination",
+            };
+            foreach (string key in keys)
+            {
+                if (!map.ContainsKey(key)) continue;
+                AddPath(paths, Convert.ToString(map[key]));
+            }
+
+            // 批量操作（如 multi_edit / read_many）会把路径放在数组里。
+            string[] arrayKeys = new string[] { "paths", "files" };
+            foreach (string key in arrayKeys)
+            {
+                if (!map.ContainsKey(key)) continue;
+                var list = RelayServer.AsList(map[key]);
+                if (list == null) continue;
+                foreach (var item in list) AddPath(paths, Convert.ToString(item));
+            }
+            return paths;
+        }
+
+        private static void AddPath(List<string> paths, string value)
+        {
+            if (string.IsNullOrEmpty(value)) return;
+            string text = value.Trim();
+            if (text.Length == 0 || text.Length > 1024) return;
+            // 只要看起来像文件路径的：带扩展名或带目录分隔符。
+            bool looksLikePath = text.IndexOf('/') >= 0 || text.IndexOf('\\') >= 0
+                || Path.HasExtension(text);
+            if (!looksLikePath) return;
+            if (!paths.Contains(text)) paths.Add(text);
+        }
+
+        public static string DescribeToolCall(string name, string rawArguments)
+        {            if (string.IsNullOrEmpty(rawArguments)) return "";
             object parsed = null;
             try
             {

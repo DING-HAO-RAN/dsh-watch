@@ -15,6 +15,8 @@ param(
     [string]$WorkRoot = (Split-Path -Parent $PSScriptRoot),
     [string]$BuildRoot = $env:WATCH_BUILD_ROOT,
     [string]$OutputDir = '',
+    # 设置文件与配对存档的目录；默认跟输出目录）。调试第二个实例时指到别处。
+    [string]$StateDir = '',
     [string]$WebView2Version = '1.0.2903.40',
     # 内嵌依赖按这个版本号分目录释放；换了 WebView2 版本就要跟着改。
     [string]$AppVersion = '1.0.0',
@@ -100,6 +102,10 @@ try {
     $sources = @(Get-ChildItem $src -Filter *.cs | ForEach-Object FullName)
     if ($sources.Count -eq 0) { throw "源码目录里没有 .cs 文件" }
     Write-Host "编译 $($sources.Count) 个源文件…"
+
+    # 允许把输出与状态目录指到别处：调试新版本时可以不打断正在运行的那份中继
+    # （它占着 19390 端口和 data\ 里的配对存档）。
+    $appDir = if ($StateDir) { [IO.Path]::GetFullPath($StateDir) } else { $OutputDir }
 
     $target = if ($Console) { 'exe' } else { 'winexe' }
     $out = Join-Path $build 'DSH中继.exe'

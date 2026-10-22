@@ -105,11 +105,96 @@ namespace DshRelay
                 if (now - pair.Value <= TokenTtlMs) tokens[pair.Key] = pair.Value;
             }
 
+            this.trusted = settings.TrustedDevices;
+            this.StartWithWindows = settings.StartWithWindows;
+            this.FollowDsh = settings.FollowDsh;
+            this.AutoTunnel = settings.AutoTunnel;
+            this.Theme = settings.Theme;
+
             Persist();
             if (tokens.Count > 0)
             {
                 log("已恢复 " + tokens.Count + " 个配对令牌，配对码沿用 " + this.PairingCode);
             }
+            if (trusted.Count > 0)
+            {
+                log("已记住 " + trusted.Count + " 台常用设备，它们再来配对会自动同意");
+            }
+        }
+
+        /// <summary>已记住的常用设备（按设备标识索引）。</summary>
+        private readonly Dictionary<string, RelaySettings.TrustedDevice> trusted;
+        private readonly object trustedGate = new object();
+
+        /// <summary>是否随 Windows 登录自启（从设置读出，供界面显示）。</summary>
+        public bool StartWithWindows { get; private set; }
+        /// <summary>是否跟随 DSH 启停（从设置读出，供界面显示）。</summary>
+        public bool FollowDsh { get; private set; }
+        /// <summary>是否自动开启公网访问。</summary>
+        public bool AutoTunnel { get; private set; }
+        /// <summary>界面主题：dark / light。</summary>
+        public string Theme { get; private set; }
+
+        /// <summary>当前记住的设备数。</summary>
+        public int TrustedCount { get { lock (trustedGate) { return trusted.Count; } } }
+
+        /// <summary>列出已记住的设备（供控制台展示与撤销）。</summary>
+        public List<RelaySettings.TrustedDevice> TrustedDevices()
+        {
+            lock (trustedGate)
+            {
+                return new List<RelaySettings.TrustedDevice>(trusted.Values);
+            }
+        }
+
+        /// <summary>是否已经记住这台设备。</summary>
+        public bool IsTrusted(string deviceId)
+        {
+            if (string.IsNullOrEmpty(deviceId)) return false;
+            lock (trustedGate) { return trusted.ContainsKey(deviceId); }
+        }
+
+        /// <summary>记住一台设备，之后它的一键配对会自动同意。</summary>
+        public void TrustDevice(string deviceId, string name, string address)
+        {
+            if (string.IsNullOrEmpty(deviceId)) return;
+            lock (trustedGate)
+            {
+                RelaySettings.TrustedDevice device;
+                if (!trusted.TryGetValue(deviceId, out device))
+                {
+                    device = new RelaySettings.TrustedDevice();
+                    device.DeviceId = deviceId;
+                    device.Since = NowMs();
+                    trusted[deviceId] = device;
+                }
+                if (!string.IsNullOrEmpty(name)) device.Name = name;
+                if (!string.IsNullOrEmpty(address)) device.LastAddress = address;
+                device.LastSeen = NowMs();
+            }
+            log("已记住设备" + (string.IsNullOrEmpty(name) ? "" : "「" + name + "」") + "，以后它配对会自动同意");
+            Persist();
+        }
+
+        /// <summary>忘掉一台设备：它下次配对会重新弹窗确认。</summary>
+        public void ForgetDevice(string deviceId)
+        {
+            if (string.IsNullOrEmpty(deviceId)) return;
+            bool removed;
+            lock (trustedGate) { removed = trusted.Remove(deviceId); }
+            if (!removed) return;
+            log("已忘掉一台常用设备，它下次配对需要重新确认");
+            Persist();
+        }
+
+        /// <summary>改一项设置并立刻落盘。</summary>
+        public void SetOptions(bool startWithWindows, bool followDsh, bool autoTunnel, string theme)
+        {
+            StartWithWindows = startWithWindows;
+            FollowDsh = followDsh;
+            AutoTunnel = autoTunnel;
+            if (!string.IsNullOrEmpty(theme)) Theme = theme == "light" ? "light" : "dark";
+            Persist();
         }
 
         /// <summary>
@@ -134,6 +219,10 @@ namespace DshRelay
             public string From = "";
             /// <summary>手表自报的名字（可能为空）。</summary>
             public string DeviceName = "";
+            /// <summary>手表自己生成的设备标识（可为空：老版本手表不带这个字段）。</summary>
+            public string DeviceId = "";
+            /// <summary>这台设备是否已被记住（记住时会自动同意，不需要弹窗）。</summary>
+            public bool Trusted;
             public long CreatedAt;
         }
 
@@ -190,7 +279,32 @@ namespace DshRelay
             entry.Id = Guid.NewGuid().ToString("N");
             entry.From = from;
             entry.DeviceName = body != null && body.ContainsKey("name") ? Convert.ToString(body["name"]) : "";
+            entry.DeviceId = body != null && body.ContainsKey("deviceId") ? Convert.ToString(body["deviceId"]) : "";
             entry.CreatedAt = now;
+            entry.Trusted = IsTrusted(entry.DeviceId);
+
+            if (entry.Trusted)
+            {
+                // 常用设备：直接放行，不弹窗。仍然生成独立票据、仍然只能换一次令牌，
+                // 所以「记住」只是省掉确认这一步，不改变配对本身的安全模型。
+                var remembered = new PairRequest();
+                remembered.Id = entry.Id;
+                remembered.From = entry.From;
+                remembered.DeviceName = entry.DeviceName;
+                remembered.DeviceId = entry.DeviceId;
+                remembered.Trusted = true;
+                remembered.CreatedAt = now;
+                ApprovePairing(entry.Id);
+                TouchTrusted(entry.DeviceId, entry.From);
+                log("常用设备「" + (string.IsNullOrEmpty(entry.DeviceName) ? entry.From : entry.DeviceName)
+                    + "」请求配对，已自动同意");
+
+                var auto = new Dictionary<string, object>();
+                auto["ok"] = true;
+                auto["requestId"] = entry.Id;
+                auto["trusted"] = true;
+                return Http.Json(200, auto);
+            }
 
             lock (gate) { pairingRequests[entry.Id] = entry; }
             log("收到手表的一键配对请求（来自 " + entry.From + "），等待在电脑上确认");
@@ -209,7 +323,21 @@ namespace DshRelay
             var result = new Dictionary<string, object>();
             result["ok"] = true;
             result["requestId"] = entry.Id;
+            result["trusted"] = false;
             return Http.Json(200, result);
+        }
+
+        /// <summary>更新常用设备的最近出现时间与地址。</summary>
+        private void TouchTrusted(string deviceId, string address)
+        {
+            if (string.IsNullOrEmpty(deviceId)) return;
+            lock (trustedGate)
+            {
+                RelaySettings.TrustedDevice device;
+                if (!trusted.TryGetValue(deviceId, out device)) return;
+                device.LastSeen = NowMs();
+                if (!string.IsNullOrEmpty(address)) device.LastAddress = address;
+            }
         }
 
         /// <summary>手表轮询配对结果：等待 / 已同意（返回 grant）/ 被拒绝。</summary>
@@ -380,6 +508,14 @@ namespace DshRelay
             {
                 foreach (var pair in tokens) settings.Tokens[pair.Key] = pair.Value;
             }
+            lock (trustedGate)
+            {
+                foreach (var pair in trusted) settings.TrustedDevices[pair.Key] = pair.Value;
+            }
+            settings.StartWithWindows = StartWithWindows;
+            settings.FollowDsh = FollowDsh;
+            settings.AutoTunnel = AutoTunnel;
+            settings.Theme = Theme;
             settings.Save(stateDirectory);
         }
 
@@ -631,7 +767,39 @@ namespace DshRelay
             result["port"] = Port;
             result["lanAddresses"] = ToObjectList(LanAddresses());
             result["paired"] = PairedDevices > 0;
+            // 公网地址随每次启动变化，手表连上后据此更新自己记的那一条，
+            // 这样「一次配对」在公网与内网都能长期使用，不必重配。
+            string publicUrl = NormalizePublicUrl(PublicUrl);
+            result["publicUrl"] = publicUrl;
             return Http.Json(200, result);
+        }
+
+        /// <summary>
+        /// 本次请求实际到达的局域网基地址（如 http://192.168.1.7:19390）。
+        ///
+        /// 用请求来源地址而不是遍历网卡：多网卡时只有这一条**确实能通到手表**，
+        /// 把「虚拟网卡」「公网出口」一并交给手表只会让它试错。
+        /// 来源是 loopback 时（本机测试）退回第一条局域网地址。
+        /// </summary>
+        private string PublicBaseFor(Http.Request request)
+        {
+            string from = request == null ? "" : (request.ClientAddress ?? "");
+            if (from.Length > 0 && !from.StartsWith("127.") && from != "::1")
+            {
+                return "http://" + from + ":" + Port.ToString(CultureInfo.InvariantCulture);
+            }
+            List<string> lan = LanAddresses();
+            if (lan.Count > 0) return "http://" + lan[0] + ":" + Port.ToString(CultureInfo.InvariantCulture);
+            return "";
+        }
+
+        /// <summary>规范化公网地址：去掉末尾斜杠，空值返回空串。</summary>
+        public static string NormalizePublicUrl(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return "";
+            string text = value.Trim();
+            while (text.EndsWith("/")) text = text.Substring(0, text.Length - 1);
+            return text;
         }
 
         private static List<object> ToObjectList(List<string> values)
@@ -723,11 +891,25 @@ namespace DshRelay
                 // 配对码**保持不变**（用户要求「密钥不变，除非主动更改」），
                 // 只把令牌存下来，重启后手表不用重配。
                 Persist();
+
+                // 手表用同一个令牌既能走局域网也能走公网，因此一次配对就把两种入口
+                // 都交出去：局域网地址是本次请求实际到达的那条，公网地址来自隧道。
+                // 公网地址每次重启都会变，手表连上后会通过 /api/identity 再同步一次。
+                string deviceId = body != null && body.ContainsKey("deviceId") ? Convert.ToString(body["deviceId"]) : "";
+                if (!string.IsNullOrEmpty(deviceId))
+                {
+                    // 已记住的设备在这一步刷新「最近见过」，供控制台显示。
+                    TouchTrusted(deviceId, request.ClientAddress);
+                }
+
                 log("新设备已配对（当前共 " + PairedDevices + " 台），配对码仍是 " + PairingCode);
                 var ok = new Dictionary<string, object>();
                 ok["ok"] = true;
                 ok["token"] = token;
                 ok["expiresInMs"] = TokenTtlMs;
+                ok["lanBase"] = PublicBaseFor(request);
+                string publicUrl = NormalizePublicUrl(PublicUrl);
+                if (publicUrl.Length > 0) ok["publicUrl"] = publicUrl;
                 return Http.Json(200, ok);
             }
 
@@ -747,6 +929,7 @@ namespace DshRelay
             {
                 if (path == "/api/sessions" && request.Method == "GET") return Sessions();
                 if (path == "/api/session" && request.Method == "GET") return Session(request);
+                if (path == "/api/file" && request.Method == "GET") return FileView(request);
                 if (path == "/api/send" && request.Method == "POST") return Send(request);
                 if (path == "/api/cancel" && request.Method == "POST") return Cancel(request);
                 if (path == "/api/create" && request.Method == "POST") return Create();
@@ -768,15 +951,15 @@ namespace DshRelay
             return Http.Json(404, Simple("未知接口"));
         }
 
-        private Dictionary<string, object> StatusObject()
-        {
+        private Dictionary<string, object> StatusObject()        {
             var result = new Dictionary<string, object>();
             result["service"] = ServiceTag;
             result["name"] = "DSH 手表中继";
             result["version"] = 2;
             result["needsPairing"] = true;
             result["uptimeMs"] = (long)(DateTime.Now - StartedAt).TotalMilliseconds;
-            if (!string.IsNullOrEmpty(PublicUrl)) result["publicUrl"] = PublicUrl;
+            string publicUrl = NormalizePublicUrl(PublicUrl);
+            if (publicUrl.Length > 0) result["publicUrl"] = publicUrl;
             return result;
         }
 
@@ -996,7 +1179,216 @@ namespace DshRelay
 
             var question = ActiveQuestion(values);
             if (question != null) result["question"] = question;
+            result["files"] = StepFiles(records);
             return Http.Json(200, result);
+        }
+
+        /// <summary>
+        /// 从本次取到的步骤里收集「碰到的文件」，给手表的文件列表用。
+        ///
+        /// 只认这次返回的步骤，不额外扫描磁盘：手表要看的正是对话里出现的那些
+        /// md / txt / 代码文件，范围与白名单也就此确定（见 FileView）。
+        /// </summary>
+        private List<object> StepFiles(List<object> records)
+        {
+            var seen = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+            var items = new List<object>();
+            List<object> steps = Steps.NormalizeSteps(records);
+            if (steps == null) return items;
+            foreach (var raw in steps)
+            {
+                var step = raw as Dictionary<string, object>;
+                if (step == null) continue;
+                var files = ListField(step, "files");
+                if (files == null) continue;
+                foreach (var entry in files)
+                {
+                    string file = Convert.ToString(entry);
+                    if (string.IsNullOrEmpty(file) || seen.ContainsKey(file)) continue;
+                    seen[file] = true;
+                    var item = new Dictionary<string, object>();
+                    item["path"] = file;
+                    item["name"] = FileName(file);
+                    item["language"] = LanguageOf(file);
+                    item["kind"] = DocumentKind(file);
+                    item["size"] = SafeSize(file);
+                    items.Add(item);
+                }
+            }
+            return items;
+        }
+
+        private static string FileName(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            int cut = Math.Max(path.LastIndexOf('/'), path.LastIndexOf('\\'));
+            return cut >= 0 ? path.Substring(cut + 1) : path;
+        }
+
+        private static long SafeSize(string path)
+        {
+            try
+            {
+                var info = new FileInfo(path);
+                return info.Exists ? info.Length : 0L;
+            }
+            catch
+            {
+                return 0L;
+            }
+        }
+
+        /// <summary>文件类型：markdown / text / code / other。</summary>
+        private static string DocumentKind(string path)
+        {
+            string ext = (Path.GetExtension(path) ?? "").ToLowerInvariant();
+            if (ext == ".md" || ext == ".markdown" || ext == ".mdown") return "markdown";
+            if (ext == ".txt" || ext == ".log" || ext == ".csv" || ext == ".tsv"
+                || ext == ".ini" || ext == ".cfg" || ext == ".conf" || ext == ".env") return "text";
+            if (LanguageOf(path).Length > 0) return "code";
+            return "other";
+        }
+
+        /// <summary>代码语言标识（由扩展名推断，用于手表上的高亮）。</summary>
+        private static string LanguageOf(string path)
+        {
+            switch ((Path.GetExtension(path) ?? "").ToLowerInvariant())
+            {
+                case ".cs": return "csharp";
+                case ".java": return "java";
+                case ".kt": return "kotlin";
+                case ".js": case ".mjs": case ".cjs": return "javascript";
+                case ".ts": case ".mts": case ".cts": return "typescript";
+                case ".tsx": case ".jsx": return "tsx";
+                case ".py": return "python";
+                case ".go": return "go";
+                case ".rs": return "rust";
+                case ".c": case ".h": return "c";
+                case ".cpp": case ".cc": case ".hpp": case ".cxx": return "cpp";
+                case ".html": case ".htm": return "html";
+                case ".css": case ".scss": case ".less": return "css";
+                case ".json": return "json";
+                case ".yml": case ".yaml": return "yaml";
+                case ".xml": return "xml";
+                case ".sh": case ".bash": return "bash";
+                case ".ps1": return "powershell";
+                case ".sql": return "sql";
+                case ".lua": return "lua";
+                case ".php": return "php";
+                case ".rb": return "ruby";
+                case ".swift": return "swift";
+                case ".dart": return "dart";
+                default: return "";
+            }
+        }
+
+        /// <summary>单个文件允许读取的上限：手表屏幕小，再长也读不完。</summary>
+        private const int MaxFileBytes = 256 * 1024;
+
+        /// <summary>
+        /// 读取一个文件给手表看。
+        ///
+        /// 安全边界：**只允许读这次会话里出现过的文件**。白名单来自 session/page
+        /// 里工具步骤携带的 files，而不是让调用方任意指定路径——否则任何拿到
+        /// 令牌的设备都能读遍这台电脑。
+        /// </summary>
+        private Http.Response FileView(Http.Request request)
+        {
+            string sessionId = request.Query.ContainsKey("session") ? request.Query["session"] : "";
+            string path = request.Query.ContainsKey("path") ? request.Query["path"] : "";
+            if (string.IsNullOrEmpty(path)) return Http.Json(400, Simple("缺少 path 参数"));
+            if (string.IsNullOrEmpty(sessionId)) return Http.Json(400, Simple("缺少 session 参数"));
+
+            string full = "";
+            try { full = Path.GetFullPath(path); }
+            catch { return Http.Json(400, Simple("路径不合法")); }
+
+            if (!SessionTouches(sessionId, full) && !SessionTouches(sessionId, path))
+            {
+                return Http.Json(403, Simple("只看这次会话里出现过的文件"));
+            }
+
+            try
+            {
+                var info = new FileInfo(full);
+                if (!info.Exists) return Http.Json(404, Simple("文件不存在或已被移走"));
+
+                var result = new Dictionary<string, object>();
+                result["ok"] = true;
+                result["path"] = full;
+                result["name"] = FileName(full);
+                result["kind"] = DocumentKind(full);
+                result["language"] = LanguageOf(full);
+                result["size"] = info.Length;
+                result["truncated"] = info.Length > MaxFileBytes;
+
+                if (info.Length > MaxFileBytes)
+                {
+                    // 只读前一段，避免把几 MB 的日志推给手表。
+                    using (var stream = info.OpenRead())
+                    {
+                        var buffer = new byte[MaxFileBytes];
+                        int read = stream.Read(buffer, 0, buffer.Length);
+                        result["text"] = Encoding.UTF8.GetString(buffer, 0, read);
+                    }
+                }
+                else
+                {
+                    result["text"] = File.ReadAllText(full, Encoding.UTF8);
+                }
+                return Http.Json(200, result);
+            }
+            catch (Exception error)
+            {
+                return Http.Json(500, Simple("读取失败：" + error.Message));
+            }
+        }
+
+        /// <summary>这个文件是否在这次会话里被工具碰到过。</summary>
+        private bool SessionTouches(string sessionId, string candidate)
+        {
+            if (string.IsNullOrEmpty(candidate)) return false;
+            try
+            {
+                var projectionArgs = new Dictionary<string, object>();
+                var projectionRequest = new Dictionary<string, object>();
+                projectionRequest["sessionId"] = sessionId;
+                projectionArgs["request"] = projectionRequest;
+                var projection = dsh.Rpc("session/projections", projectionArgs) as Dictionary<string, object>;
+                long asOfSeq = projection != null ? GetLong(projection, "asOfSeq") : 0;
+
+                var pageArgs = new Dictionary<string, object>();
+                var pageRequest = new Dictionary<string, object>();
+                var address = new Dictionary<string, object>();
+                address["kind"] = "session";
+                address["sessionId"] = sessionId;
+                pageRequest["address"] = address;
+                pageRequest["throughSeq"] = asOfSeq;
+                pageRequest["maxMessages"] = MaxMessages;
+                pageArgs["request"] = pageRequest;
+                var page = dsh.Rpc("session/page", pageArgs) as Dictionary<string, object>;
+
+                foreach (var raw in Steps.NormalizeSteps(ListField(page, "records")))
+                {
+                    var step = raw as Dictionary<string, object>;
+                    if (step == null) continue;
+                    var files = ListField(step, "files");
+                    if (files == null) continue;
+                    foreach (var entry in files)
+                    {
+                        string file = Convert.ToString(entry);
+                        if (string.IsNullOrEmpty(file)) continue;
+                        if (string.Equals(file, candidate, StringComparison.OrdinalIgnoreCase)) return true;
+                        try
+                        {
+                            if (string.Equals(Path.GetFullPath(file), candidate, StringComparison.OrdinalIgnoreCase)) return true;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return false;
         }
 
         private Http.Response Send(Http.Request request)

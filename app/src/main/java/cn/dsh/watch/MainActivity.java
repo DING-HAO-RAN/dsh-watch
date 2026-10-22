@@ -154,6 +154,10 @@ public class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         ui = new WatchUi(this);
         store = new Store(this);
+        // 主题与圆屏优化必须在建任何页面之前应用：它们决定颜色常量与安全区，
+        // 晚一步就会先画一屏旧样式再跳变。
+        WatchUi.applyTheme(store.theme());
+        WatchUi.roundOptimized = store.roundOptimized();
         api = new Api();
         discovery = new Discovery();
         // 允许从外部带入地址与配对码（例如电脑端生成一条命令让手表直接配对），
@@ -457,6 +461,30 @@ public class MainActivity extends Activity {
         ui.add(page, ui.text("一键配对会发广播找同一 WiFi 下的电脑，电脑上点「同意」即可，"
                 + "地址与令牌自动导入。也可手动填地址与配对码：局域网 IP 或公网地址（https://…）。",
                 10, WatchUi.MUTED), 0, 0);
+
+        // ---- 外观：主题与圆屏优化 ----
+        ui.divider(page);
+        ui.add(page, ui.text("外观", 11, WatchUi.MUTED), 0, 6);
+
+        boolean light = store.theme().equals(Theme.LIGHT);
+        ui.add(page, ui.row("界面主题", light ? "浅色 · 点一下切回深色" : "深色 · 点一下切到浅色",
+                () -> {
+                    store.setTheme(light ? Theme.DARK : Theme.LIGHT);
+                    WatchUi.applyTheme(store.theme());
+                    showConnect();
+                }), 0, 6);
+
+        boolean round = store.roundOptimized();
+        ui.add(page, ui.row("圆屏优化",
+                round ? "已开启 · 内容避开圆弧" : "已关闭 · 方屏可用满整屏",
+                () -> {
+                    store.setRoundOptimized(!round);
+                    WatchUi.roundOptimized = store.roundOptimized();
+                    showConnect();
+                }), 0, 10);
+        ui.add(page, ui.text("圆屏优化开启时按圆形内接矩形留边，内容不会被圆弧切掉；"
+                + "方屏手表或偏好满屏可以关掉。", 10, WatchUi.MUTED), 0, 0);
+
         render(page);
         hostField.requestFocus();
     }
@@ -531,6 +559,8 @@ public class MainActivity extends Activity {
         JSONObject body = new JSONObject();
         try {
             body.put("name", android.os.Build.MODEL == null ? "手表" : android.os.Build.MODEL);
+            // 设备标识：中继用它认出「这台手表」，勾过「保存为常用设备」后不再弹窗。
+            body.put("deviceId", store.deviceId());
         } catch (Exception ignored) {
             // 仅字符串，不会失败。
         }
@@ -608,6 +638,8 @@ public class MainActivity extends Activity {
             // 记成一台可切换的设备；同名电脑下次直接切，不用再配对。
             store.rememberDevice(address, token,
                     target.name.isEmpty() ? "" : target.name);
+            // 配对响应里同时给了公网地址：一并记下，出门时不必重配。
+            store.rememberAlternate(address, Api.text(result.value, "publicUrl"), store.deviceId());
             currentSessionId = "";
             currentSessionTitle = "";
             currentAsk = null;
@@ -683,6 +715,8 @@ public class MainActivity extends Activity {
             }
             // 记成一台可切换的设备（同一地址会覆盖，不会堆重复项）。
             store.rememberDevice(endpoint.display(), token, "");
+            // 配对响应同时给了局域网与公网两条入口，一并记下。
+            store.rememberAlternate(endpoint.display(), Api.text(result.value, "publicUrl"), store.deviceId());
             currentSessionId = "";
             currentSessionTitle = "";
             currentAsk = null;
@@ -712,6 +746,9 @@ public class MainActivity extends Activity {
         refresh.removeCallbacks(listTicker);
         renderSessionListPage();
 
+        // 进列表页说明已经连上中继了：顺手同步一次公网地址。
+        syncPublicAddress();
+
         // 首次进入需要真实数据；已有数据时后台静默刷新即可。
         if (sessions.isEmpty() && projects.isEmpty()) {
             loadSessions(false, true);
@@ -719,6 +756,27 @@ public class MainActivity extends Activity {
             loadSessions(true, false);
         }
         refresh.postDelayed(listTicker, LIST_REFRESH_MS);
+    }
+
+    /**
+     * 同步当前中继的公网地址。
+     *
+     * cloudflared 的临时地址每次重启都会变，如果手表只记着配对那一刻的地址，
+     * 中继重启后就再也连不上了。这里用**不需要令牌**的 /api/identity 取最新地址：
+     * 走局域网连上时能顺便拿到公网入口，走公网连上时则确认自己记的那条仍然有效。
+     * 失败静默处理——这只是锦上添花，不能影响正常使用。
+     */
+    private void syncPublicAddress() {
+        if (!store.paired()) return;
+        final String current = store.base();
+        api.get(baseUrl(), "/api/identity", store.token(), result -> {
+            if (destroyed || !result.ok || result.value == null) return;
+            String publicUrl = Api.text(result.value, "publicUrl");
+            if (publicUrl.isEmpty()) return;
+            // 当前用的就是这条公网地址：无需改动。
+            if (publicUrl.equals(current)) return;
+            store.rememberAlternate(current, publicUrl, "");
+        });
     }
 
     /** 只渲染当前列表页，不发请求、不安排定时器。 */
@@ -999,6 +1057,16 @@ public class MainActivity extends Activity {
             String title = result.value.optString("title", "");
             if (!title.isEmpty()) currentSessionTitle = title;
 
+            // 会话里出现过的文件：文件页用它列表，也是中继允许读取的白名单来源。
+            sessionFiles.clear();
+            JSONArray fileArray = result.value.optJSONArray("files");
+            if (fileArray != null) {
+                for (int i = 0; i < fileArray.length(); i++) {
+                    Api.FileEntry entry = Api.FileEntry.from(fileArray.optJSONObject(i));
+                    if (entry != null) sessionFiles.add(entry);
+                }
+            }
+
             // 只在内容真的变了才更新。
             //
             // 这里曾经写成「静默刷新时只要状态不是运行中就重建」，结果空闲会话每 4 秒
@@ -1191,6 +1259,9 @@ public class MainActivity extends Activity {
         }));
         items.add(new MenuItem("用量", "Token 与耗时", this::showUsage));
         items.add(new MenuItem("模型", "切换模型与推理强度", this::showModelPicker));
+        if (!sessionFiles.isEmpty()) {
+            items.add(new MenuItem("查看文件", sessionFiles.size() + " 个 md / 代码文件", this::showFileList));
+        }
         if (currentHasMore) {
             items.add(new MenuItem("看更早的内容", "往前翻历史", this::loadOlder));
         }
@@ -1717,6 +1788,129 @@ public class MainActivity extends Activity {
     private void addTo(LinearLayout container, View view, int top, int bottom) {
         ui.addTo(container, view, top, bottom);
     }
+
+    // ------------------------------------------------------------ 文件查看
+
+    /** 会话里出现过的文件（由中继在 session 响应里给出）。 */
+    private final List<Api.FileEntry> sessionFiles = new ArrayList<>();
+    /** 当前是否停留在文件页（决定定时刷新要不要跳过）。 */
+    private boolean onFilePage;
+
+    /**
+     * 文件列表页：列出这次会话里碰到的 md / txt / 代码文件。
+     *
+     * 只列「这次会话里出现过的」，不提供目录浏览——手表屏幕小，翻目录不如直接点，
+     * 而且这样中继就不必把整台电脑的文件系统暴露出去。
+     */
+    private void showFileList() {
+        onFilePage = true;
+        onSessionPage = false;
+        editing = true;
+        refreshFiles("");
+    }
+
+    private void refreshFiles(String hint) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "文件", currentSessionTitle.isEmpty() ? "" : clipLine(currentSessionTitle, 12));
+        if (!hint.isEmpty()) ui.add(page, ui.text(hint, 11, WatchUi.MUTED), 0, 8);
+
+        if (sessionFiles.isEmpty()) {
+            ui.add(page, ui.text("这次会话里还没有出现文件。", 11, WatchUi.MUTED), 0, 10);
+        } else {
+            for (final Api.FileEntry file : sessionFiles) {
+                LinearLayout card = ui.card();
+                card.addView(ui.text(file.name, 12, WatchUi.FG));
+                String meta = file.kindText() + (file.size > 0 ? " · " + formatSize(file.size) : "");
+                card.addView(ui.text(meta, 10, WatchUi.MUTED));
+                card.setOnClickListener(v -> openFile(file));
+                card.setFocusable(true);
+                card.setClickable(true);
+                ui.add(page, card, 0, 6);
+            }
+        }
+        ui.add(page, ui.button("返回", false, () -> {
+            onFilePage = false;
+            editing = false;
+            renderSession("");
+        }), 6, 0);
+        page.setOnSwipeRight(() -> {
+            onFilePage = false;
+            editing = false;
+            renderSession("");
+        });
+        render(page);
+    }
+
+    /** 打开一个文件并渲染其内容。 */
+    private void openFile(final Api.FileEntry file) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, clipLine(file.name, 16), "正在读取…");
+        render(page);
+
+        api.get(baseUrl(), "/api/file?session=" + Api.urlEncode(currentSessionId)
+                + "&path=" + Api.urlEncode(file.path), store.token(), result -> {
+                    if (destroyed || !onFilePage) return;
+                    if (!result.ok) {
+                        WatchUi.Page failed = ui.page();
+                        ui.heading(failed, clipLine(file.name, 16), "读取失败");
+                        ui.add(failed, ui.text(result.error, 11, WatchUi.DANGER), 0, 8);
+                        ui.add(failed, ui.button("返回", false, this::showFileList), 4, 0);
+                        render(failed);
+                        return;
+                    }
+                    showFileContent(file, result.value);
+                });
+    }
+
+    /** 按文件类型选渲染器：markdown 走 Markdown，代码走 CodeView，纯文本原样。 */
+    private void showFileContent(Api.FileEntry file, JSONObject value) {
+        String kind = Api.text(value, "kind");
+        String language = Api.text(value, "language");
+        String text = Api.text(value, "text");
+        boolean truncated = value != null && value.optBoolean("truncated", false);
+
+        WatchUi.Page page = ui.page();
+        String subtitle = language.isEmpty() ? file.kindText() : language;
+        ui.heading(page, clipLine(file.name, 16), subtitle);
+
+        if (truncated) {
+            ui.add(page, ui.text("文件较长，只显示前一部分", 10, WatchUi.WARN), 0, 6);
+        }
+
+        TextView view = new TextView(this);
+        view.setTextSize(11);
+        view.setLineSpacing(ui.dp(2), 1f);
+        if ("markdown".equals(kind)) {
+            // md 用 Markdown 渲染：标题、列表、代码块、链接才有结构感。
+            view.setText(Markdown.render(text, WatchUi.FG, WatchUi.ACCENT, WatchUi.MUTED, WatchUi.SURFACE_HI));
+        } else if ("code".equals(kind)) {
+            // 代码用带行号与高亮的渲染器：缩进与行号对读代码是刚需。
+            view.setText(CodeView.render(text, WatchUi.FG, WatchUi.MUTED, WatchUi.OK,
+                    WatchUi.ACCENT, WatchUi.WARN, WatchUi.SURFACE_HI, 1));
+            // 代码不能自动折行：折行后缩进层级全乱，改为横向滚动由外层容器承担。
+            view.setHorizontallyScrolling(true);
+        } else {
+            view.setText(CodeView.plain(text, WatchUi.FG, WatchUi.SURFACE_HI));
+        }
+        view.setTextColor(WatchUi.FG);
+        ui.add(page, view, 0, 8);
+
+        ui.add(page, ui.button("返回文件列表", false, this::showFileList), 4, 4);
+        ui.add(page, ui.button("返回会话", true, () -> {
+            onFilePage = false;
+            editing = false;
+            renderSession("");
+        }), 0, 0);
+        page.setOnSwipeRight(this::showFileList);
+        render(page);
+    }
+
+    private static String formatSize(long bytes) {
+        if (bytes < 1024) return bytes + " B";
+        if (bytes < 1024 * 1024) return (bytes / 1024) + " KB";
+        return String.format(java.util.Locale.US, "%.1f MB", bytes / 1024.0 / 1024.0);
+    }
+
 
     /** 步骤小标题：区分「你」和「AI」，并标出步号。 */
     private TextView stepLabel(Api.Step step, int index) {

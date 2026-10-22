@@ -261,6 +261,38 @@ final class Api {
         boolean isError;
     }
 
+    /** 会话里出现过的一个可查看文件。 */
+    static final class FileEntry {
+        String path = "";
+        String name = "";
+        /** markdown / text / code / other。 */
+        String kind = "text";
+        /** 代码语言标识（csharp / java / …），非代码为空。 */
+        String language = "";
+        long size;
+
+        static FileEntry from(JSONObject object) {
+            if (object == null) return null;
+            FileEntry entry = new FileEntry();
+            entry.path = text(object, "path");
+            entry.name = text(object, "name");
+            if (entry.name.isEmpty()) entry.name = entry.path;
+            entry.kind = text(object, "kind");
+            if (entry.kind.isEmpty()) entry.kind = "text";
+            entry.language = text(object, "language");
+            entry.size = object.optLong("size", 0L);
+            return entry.path.isEmpty() ? null : entry;
+        }
+
+        /** 中文类型标签，用于列表里的副标题。 */
+        String kindText() {
+            if ("markdown".equals(kind)) return "Markdown";
+            if ("code".equals(kind)) return language.isEmpty() ? "代码" : language;
+            if ("text".equals(kind)) return "文本";
+            return "文件";
+        }
+    }
+
     /** 用量与运行统计。 */
     static final class Usage {
         long inputTokens;

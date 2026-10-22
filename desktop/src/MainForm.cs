@@ -28,26 +28,151 @@ namespace DshRelay
         private NativePanel fallback;
         private string panelUrl;
         private bool browserFailed;
+        private NotifyIcon tray;
+        private bool reallyClosing;
 
-        public MainForm()
+        /// <summary>以 --background 启动（开机自启）时，窗口不显示，只驻留托盘。</summary>
+        private readonly bool startHidden;
+
+        public MainForm(bool background)
         {
+            startHidden = background;
             Text = "DSH 中继";
             AutoScaleMode = AutoScaleMode.Dpi;
             StartPosition = FormStartPosition.CenterScreen;
-            BackColor = Color.FromArgb(11, 13, 16);
+            // 先按存档里的主题定下整组颜色，再创建控件，
+            // 否则会先画一屏深色再跳成浅色（就是「闪一下旧界面」）。
+            Theme.Apply(RelaySettings.Load(AppDomain.CurrentDomain.BaseDirectory).Theme);
+            BackColor = Theme.Bg;
             Font = new Font("Microsoft YaHei UI", 9f);
             ApplyDisplaySize();
 
-            // 先摆好原生界面：它同时也是内嵌浏览器失败时的后备。
-            fallback = new NativePanel();
-            fallback.Dock = DockStyle.Fill;
-            Controls.Add(fallback);
+            // 原生面板**不预先摆出来**。
+            //
+            // 以前它一创建就填满窗口，等 WebView2 就绪再盖上去，于是每次启动都会
+            // 先看到一屏旧的 WinForms 界面、随后闪一下换成新界面。那既是「显示旧界面」
+            // 的 bug，也是所谓的切换过程。现在只在浏览器真的起不来时才创建它。
+            loading = new Label();
+            loading.Text = "正在启动中继…";
+            loading.Dock = DockStyle.Fill;
+            loading.TextAlign = ContentAlignment.MiddleCenter;
+            loading.ForeColor = Theme.Muted;
+            loading.Font = new Font("Microsoft YaHei UI", 11f);
+            loading.BackColor = Theme.Bg;
+            Controls.Add(loading);
+
+            BuildTray();
 
             host = new PanelHost(StartupLog.Write, AppDomain.CurrentDomain.BaseDirectory);
             host.AttachForm(this);
             host.UrlReady += OnPanelReady;
             host.Failed += OnFailed;
+            host.ThemeChanged += ApplyWindowTheme;
             host.Start();
+        }
+
+        /// <summary>浏览器就绪前的占位文字（不是旧界面，只是「正在启动」）。</summary>
+        private Label loading;
+
+        /// <summary>按主题给自己的底色与占位文字换色，避免切主题时窗口边框仍是旧色。</summary>
+        private void ApplyWindowTheme(bool light)
+        {
+            Theme.Apply(light ? "light" : "dark");
+            BackColor = Theme.Bg;
+            if (loading != null)
+            {
+                loading.BackColor = Theme.Bg;
+                loading.ForeColor = Theme.Muted;
+            }
+            // 原生降级界面用的是 Theme 里的静态色，重建一次才能全部换过来。
+            if (fallback != null)
+            {
+                Controls.Remove(fallback);
+                fallback.Dispose();
+                fallback = null;
+                EnsureFallback();
+            }
+        }
+
+        /// <summary>
+        /// 托盘图标。
+        ///
+        /// 「开机自启」与「随 DSH 启动」都要让程序在后台活着，那就必须有一个
+        /// 用户能看见、能唤回窗口、能真正退出的入口——否则用户只能去任务管理器
+        /// 里结束进程。关闭按钮也改成「收进托盘」，退出走托盘菜单。
+        /// </summary>
+        private void BuildTray()
+        {
+            tray = new NotifyIcon();
+            tray.Text = "DSH 中继";
+            tray.Icon = MakeTrayIcon();
+            tray.Visible = true;
+
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("打开窗口", null, delegate { RestoreWindow(); });
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("退出", null, delegate
+            {
+                reallyClosing = true;
+                Close();
+            });
+            tray.ContextMenuStrip = menu;
+            tray.DoubleClick += delegate { RestoreWindow(); };
+        }
+
+        /// <summary>画一个简单的托盘图标，避免依赖外部 .ico 文件。</summary>
+        private static Icon MakeTrayIcon()
+        {
+            try
+            {
+                using (var bitmap = new Bitmap(32, 32))
+                using (var g = Graphics.FromImage(bitmap))
+                {
+                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.Clear(Color.Transparent);
+                    using (var ring = new Pen(Color.FromArgb(240, 182, 75), 3.2f))
+                    {
+                        g.DrawEllipse(ring, 4f, 4f, 24f, 24f);
+                    }
+                    using (var hand = new Pen(Color.FromArgb(240, 182, 75), 3.2f))
+                    {
+                        g.DrawLine(hand, 16f, 16f, 16f, 9f);
+                        g.DrawLine(hand, 16f, 16f, 21.5f, 19f);
+                    }
+                    IntPtr handle = bitmap.GetHicon();
+                    return Icon.FromHandle(handle);
+                }
+            }
+            catch
+            {
+                // 画不出来也不能让托盘缺位，退回系统默认图标。
+                return SystemIcons.Application;
+            }
+        }
+
+        private void RestoreWindow()
+        {
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        protected override void OnShown(EventArgs e)
+        {
+            base.OnShown(e);
+            if (!startHidden) return;
+            // 开机自启不该在登录后弹窗，这里隐藏到托盘。
+            StartupLog.Write("以 --background 启动，窗口收进托盘");
+            Hide();
+        }
+
+        protected override void OnResize(EventArgs e)
+        {
+            base.OnResize(e);
+            if (WindowState == FormWindowState.Minimized && tray != null)
+            {
+                Hide();
+            }
         }
 
         /// <summary>
@@ -83,10 +208,31 @@ namespace DshRelay
             panelUrl = url;
             BeginInvoke(new Action(delegate
             {
-                // 原生界面从一开始就在跑，这里只让浏览器盖到它上面。
-                fallback.Attach(host);
                 TryBrowser();
             }));
+        }
+
+        /// <summary>
+        /// 取出（必要时创建）原生降级面板。
+        ///
+        /// 只在浏览器确实不可用时调用——这样正常启动的路径上完全不会出现旧界面，
+        /// 「先闪旧界面再换新」的问题也就没有发生的机会。
+        /// </summary>
+        private NativePanel EnsureFallback()
+        {
+            if (fallback != null) return fallback;
+            if (loading != null)
+            {
+                Controls.Remove(loading);
+                loading.Dispose();
+                loading = null;
+            }
+            fallback = new NativePanel();
+            fallback.Dock = DockStyle.Fill;
+            Controls.Add(fallback);
+            fallback.Attach(host);
+            fallback.BringToFront();
+            return fallback;
         }
 
         /// <summary>
@@ -190,9 +336,9 @@ namespace DshRelay
                         webView.Dispose();
                         webView = null;
                     }
-                    fallback.SetNote(note);
-                    fallback.BringToFront();
-                    fallback.StartPolling();
+                    NativePanel panel = EnsureFallback();
+                    panel.SetNote(note);
+                    panel.StartPolling();
                 }));
             }
             catch { }
@@ -207,9 +353,8 @@ namespace DshRelay
                 {
                     if (webView != null) { Controls.Remove(webView); webView.Dispose(); webView = null; }
                     browserFailed = true;
-                    fallback.Attach(host);
-                    fallback.SetError(message);
-                    fallback.BringToFront();
+                    NativePanel panel = EnsureFallback();
+                    panel.SetError(message);
                 }));
             }
             catch { }
@@ -217,8 +362,23 @@ namespace DshRelay
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            // 点右上角关闭只收进托盘：程序在后台替手表提供服务，
+            // 关掉窗口就等于手表断开，这与「随 DSH 启动」的预期相反。
+            // 真正退出走托盘菜单，那里会置 reallyClosing。
+            if (!reallyClosing)
+            {
+                e.Cancel = true;
+                Hide();
+                return;
+            }
+            if (tray != null)
+            {
+                tray.Visible = false;
+                tray.Dispose();
+                tray = null;
+            }
             host.Stop();
-            fallback.StopPolling();
+            if (fallback != null) fallback.StopPolling();
             base.OnFormClosing(e);
         }
     }
@@ -250,6 +410,8 @@ namespace DshRelay
 
         public event Action<string> UrlReady;
         public event Action<string> Failed;
+        /// <summary>主题变了：参数为 true 表示切到了浅色。</summary>
+        public event Action<bool> ThemeChanged;
 
         public bool TunnelBusy { get; private set; }
 
@@ -285,6 +447,14 @@ namespace DshRelay
             log("配对码已更换：" + relay.PairingCode);
         }
 
+        /// <summary>切换一项设置并落盘（原生界面复选框用）。</summary>
+        public void SetOptions(bool startWithWindows, bool followDsh, bool autoTunnel, string theme)
+        {
+            if (relay == null) return;
+            relay.SetOptions(startWithWindows, followDsh, autoTunnel, theme);
+            ApplyAutostart();
+        }
+
         /// <summary>
         /// 开/关公网访问（原生界面按钮用）。
         /// @returns 需要提示给用户的文本；正常时返回空串。
@@ -301,7 +471,21 @@ namespace DshRelay
                     log("已关闭公网访问");
                     return "";
                 }
+                return StartTunnel("");
+            }
+            finally
+            {
+                TunnelBusy = false;
+            }
+        }
 
+        /// <summary>开启公网访问；失败时返回可展示的原因（成功返回空串）。</summary>
+        private string StartTunnel(string unused)
+        {
+            if (relay == null) return "中继尚未启动";
+            TunnelBusy = true;
+            try
+            {
                 string binary = PublicTunnel.FindBinary(null, appDirectory);
                 if (tunnel == null) tunnel = new PublicTunnel(binary, relay.Port, log);
                 if (!tunnel.Available())
@@ -309,9 +493,9 @@ namespace DshRelay
                     return "找不到 cloudflared，无法开启公网访问。\n"
                         + "请把 cloudflared.exe 放到本程序同一目录后重试。";
                 }
-                TunnelBusy = true;
                 string url = tunnel.Start(60000);
                 relay.PublicUrl = url;
+                log("公网访问已开启：" + url + "（手表连上后会自动换成这个地址）");
                 return "";
             }
             catch (Exception error)
@@ -325,6 +509,9 @@ namespace DshRelay
                 TunnelBusy = false;
             }
         }
+
+        /// <summary>最近一次成功连接 DSH 时用的端口（供监视线程复用）。</summary>
+        private int dshPortHint;
 
         public PanelHost(Action<string> log, string appDirectory)
         {
@@ -368,6 +555,7 @@ namespace DshRelay
                 }
 
                 log("已连接 DSH（127.0.0.1:" + instance.Port + "），配置目录：" + instance.Home);
+                dshPortHint = instance.Port;
                 dsh = new DshClient(instance.Home, instance.Port, instance.Secret, instance.SecretRaw);
 
                 // 先验证一次鉴权是否可用，避免界面显示「已运行」但实际连不上。
@@ -385,11 +573,25 @@ namespace DshRelay
 
                 // 状态目录随程序走：配对码与令牌存在程序目录的 relay-settings.json 里，
                 // 重启后手表不用重新配对（用户明确要求「密钥不变，除非主动更改」）。
-                relay = new RelayServer(dsh, RelayServer.DefaultPort, log, appDirectory);
+                // 端口可由环境变量覆盖：调试第二份程序时原版仍占着 19390，
+                // 不换端口就只能看到「套接字地址只允许使用一次」。
+                int listenPort = RelayServer.DefaultPort;
+                try
+                {
+                    string overridePort = Environment.GetEnvironmentVariable("DSH_RELAY_PORT");
+                    int parsedPort;
+                    if (!string.IsNullOrEmpty(overridePort)
+                        && int.TryParse(overridePort, out parsedPort)
+                        && parsedPort > 0 && parsedPort <= 65535)
+                    {
+                        listenPort = parsedPort;
+                        log("使用环境变量指定的端口：" + listenPort);
+                    }
+                }
+                catch { }
+                relay = new RelayServer(dsh, listenPort, log, appDirectory);
                 // 一键配对：手表发起后由界面弹窗让用户确认（决定权在电脑端）。
                 relay.PairingRequested = OnPairingRequested;
-                relay.Start();
-                log("中继已启动，局域网端口：" + relay.Port);
 
                 listener.Start();
                 int port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -397,11 +599,117 @@ namespace DshRelay
                 log("控制台：" + url);
                 RaiseReady(url);
 
+                StartServing();
+                StartWatchdog();
+                ApplyAutostart();
                 AcceptLoop();
             }
             catch (Exception error)
             {
                 RaiseFailed("启动失败：" + error.Message);
+            }
+        }
+
+        /// <summary>开始对外提供服务（中继 + 默认的公网通道）。</summary>
+        private void StartServing()
+        {
+            if (relay == null || relay.Running) return;
+            if (followingPaused)
+            {
+                log("跟随 DSH 模式：DSH 未运行，暂不对外服务");
+                return;
+            }
+            relay.Start();
+            log("中继已启动，局域网端口：" + relay.Port);
+            if (relay.AutoTunnel)
+            {
+                StartTunnelInBackground();
+            }
+        }
+
+        /// <summary>暂停对外服务（DSH 退出时）。</summary>
+        private void StopServing()
+        {
+            if (relay == null || !relay.Running) return;
+            try { if (tunnel != null) tunnel.Stop(); } catch { }
+            if (relay != null) relay.PublicUrl = null;
+            relay.Stop();
+            log("跟随 DSH 模式：DSH 已退出，暂停对外服务（重新启动 DSH 会自动恢复）");
+        }
+
+        /// <summary>
+        /// 公网通道在后台线程开：cloudflared 首次连接要几秒，偶遇限流还要退避重试，
+        /// 不能卡住启动流程——局域网功能不该等它。
+        /// </summary>
+        private void StartTunnelInBackground()
+        {
+            if (TunnelBusy) return;
+            var worker = new Thread(delegate ()
+            {
+                try
+                {
+                    string result = StartTunnel("");
+                    if (!string.IsNullOrEmpty(result)) log("公网访问未开启：" + result);
+                }
+                catch (Exception error)
+                {
+                    log("开启公网访问失败：" + error.Message);
+                }
+            });
+            worker.IsBackground = true;
+            worker.Name = "relay-tunnel";
+            worker.Start();
+        }
+
+        /// <summary>
+        /// 监视 DSH 是否还在。
+        ///
+        /// 只在「跟随 DSH」模式下生效：DSH 退出就暂停对外服务，DSH 回来后自动恢复。
+        /// 这样开机自启 + 随 DSH 启动同时勾选时，程序始终只有一个进程，
+        /// 由这里负责在两种状态间切换，不会出现两个实例抢端口。
+        /// </summary>
+        private void StartWatchdog()
+        {
+            var timer = new System.Threading.Timer(delegate (object unused)
+            {
+                try
+                {
+                    if (stopping || relay == null || !relay.FollowDsh) return;
+                    bool alive = DshLocator.IsRunning(dshPortHint);
+                    if (alive && !relay.Running)
+                    {
+                        followingPaused = false;
+                        StartServing();
+                    }
+                    else if (!alive && relay.Running)
+                    {
+                        followingPaused = true;
+                        StopServing();
+                    }
+                }
+                catch { }
+            }, null, 5000, 5000);
+            watchdog = timer;
+        }
+
+        private System.Threading.Timer watchdog;
+        private volatile bool followingPaused;
+
+        /// <summary>按设置写入/移除开机自启项。</summary>
+        private void ApplyAutostart()
+        {
+            try
+            {
+                bool want = relay != null && relay.StartWithWindows;
+                bool changed = Autostart.SetEnabled(want, Application.ExecutablePath);
+                if (changed)
+                {
+                    log(want ? "已设置开机自启" : "已取消开机自启");
+                }
+            }
+            catch (Exception error)
+            {
+                log("设置开机自启失败：" + error.Message);
             }
         }
 
@@ -434,21 +742,31 @@ namespace DshRelay
                         string who = string.IsNullOrEmpty(request.DeviceName)
                             ? request.From
                             : (request.DeviceName + "（" + request.From + "）");
+                        // 三选一：只同意一次 / 同意并记住 / 拒绝。
+                        // 「记住」让这台手表以后再来配对时不再弹窗，所以它必须是
+                        // 用户主动选的，不能做成默认。
                         string message = "有一台设备请求连接本机的中继：\n\n"
                             + who + "\n\n"
-                            + "同意后它会自动获得连接地址与访问令牌，"
-                            + "不必再输入配对码。\n\n"
+                            + "同意后它会自动获得局域网与公网的连接地址、以及访问令牌。\n\n"
+                            + "选择「是并记住」会把这台设备保存为常用设备，"
+                            + "以后它再配对时自动同意、不再弹窗。\n\n"
                             + "只在你确实正在手表上操作时同意。";
-                        DialogResult answer = MessageBox.Show(form, message, "配对请求",
-                            MessageBoxButtons.YesNo, MessageBoxIcon.Question,
-                            MessageBoxDefaultButton.Button2);
-                        if (answer == DialogResult.Yes)
+                        using (var dialog = new PairingDialog(who, message))
                         {
-                            relay.ApprovePairing(request.Id);
-                        }
-                        else
-                        {
-                            relay.DenyPairing(request.Id);
+                            dialog.ShowDialog(form);
+                            if (dialog.Choice == PairingDialog.Answer.Approve
+                                || dialog.Choice == PairingDialog.Answer.Remember)
+                            {
+                                relay.ApprovePairing(request.Id);
+                                if (dialog.Choice == PairingDialog.Answer.Remember)
+                                {
+                                    relay.TrustDevice(request.DeviceId, request.DeviceName, request.From);
+                                }
+                            }
+                            else
+                            {
+                                relay.DenyPairing(request.Id);
+                            }
                         }
                     }
                     catch (Exception error)
@@ -512,6 +830,15 @@ namespace DshRelay
             if (path.Length == 0) return Panel();
             if (path == "state") return State();
             if (path == "rotate-code" && request.Method == "POST") return RotateCode();
+            if (path == "settings")
+            {
+                // 控制台只绑 127.0.0.1，外部设备碰不到这两个端点。
+                if (request.Method == "POST" || request.Method == "GET") return Settings(request);
+            }
+            if (path == "trusted")
+            {
+                if (request.Method == "GET" || request.Method == "POST") return TrustedDevices(request);
+            }
             if (path == "tunnel")
             {
                 if (request.Method == "POST") return StartTunnel();
@@ -559,6 +886,27 @@ namespace DshRelay
                 }
             }
             state["tokens"] = tokens;
+            state["startWithWindows"] = relay != null && relay.StartWithWindows;
+            state["followDsh"] = relay != null && relay.FollowDsh;
+            state["autoTunnel"] = relay == null || relay.AutoTunnel;
+            state["trustedCount"] = relay == null ? 0 : relay.TrustedCount;
+            state["paused"] = followingPaused;
+            state["theme"] = relay == null ? "dark" : relay.Theme;
+            var trustedList = new List<object>();
+            if (relay != null)
+            {
+                foreach (RelaySettings.TrustedDevice device in relay.TrustedDevices())
+                {
+                    var entry = new Dictionary<string, object>();
+                    entry["deviceId"] = device.DeviceId;
+                    entry["name"] = device.Name ?? "";
+                    entry["lastAddress"] = device.LastAddress ?? "";
+                    entry["since"] = device.Since;
+                    entry["lastSeen"] = device.LastSeen;
+                    trustedList.Add(entry);
+                }
+            }
+            state["trustedDevices"] = trustedList;
             return Http.Json(200, state);
         }
 
@@ -622,6 +970,109 @@ namespace DshRelay
             if (relay != null) relay.PublicUrl = null;
             var result = new Dictionary<string, object>();
             result["ok"] = true;
+            return Http.Json(200, result);
+        }
+
+        /// <summary>读取/写入设置（开机自启、跟随 DSH、自动开公网）。</summary>
+        private Http.Response Settings(Http.Request request)
+        {
+            if (relay == null) return Fail("中继尚未启动");
+
+            if (request.Method == "POST")
+            {
+                string body = request.BodyText ?? "";
+                bool startWithWindows = relay.StartWithWindows;
+                bool followDsh = relay.FollowDsh;
+                bool autoTunnel = relay.AutoTunnel;
+                ReadFlag(body, "startWithWindows", ref startWithWindows);
+                ReadFlag(body, "followDsh", ref followDsh);
+                ReadFlag(body, "autoTunnel", ref autoTunnel);
+
+                string theme = ParseString(ParseJsonSafe(body), "theme");
+                relay.SetOptions(startWithWindows, followDsh, autoTunnel, theme);
+                ApplyAutostart();
+                // 网页自己会切，但窗口边框与降级界面也要跟着换，否则浅色页面
+                // 被一块深色边框框住，看起来像没换成功。
+                var handler = ThemeChanged;
+                if (handler != null) handler(relay.Theme == "light");
+                log("设置已更新：开机自启=" + (startWithWindows ? "开" : "关")
+                    + "，随 DSH 启动=" + (followDsh ? "开" : "关")
+                    + "，自动开公网=" + (autoTunnel ? "开" : "关"));
+            }
+
+            var result = new Dictionary<string, object>();
+            result["ok"] = true;
+            result["startWithWindows"] = relay.StartWithWindows;
+            result["followDsh"] = relay.FollowDsh;
+            result["autoTunnel"] = relay.AutoTunnel;
+            result["theme"] = relay.Theme;
+            result["autostartRegistered"] = Autostart.IsEnabled();
+            return Http.Json(200, result);
+        }
+
+        /// <summary>从 JSON 里读一个布尔字段；没给就保持原值。</summary>
+        private static void ReadFlag(string body, string name, ref bool target)
+        {
+            if (string.IsNullOrEmpty(body)) return;
+            var data = ParseJsonSafe(body);
+            if (data == null) return;
+            object value;
+            if (!data.TryGetValue(name, out value) || value == null) return;
+            bool parsed;
+            if (bool.TryParse(Convert.ToString(value), out parsed)) target = parsed;
+        }
+
+        private static Dictionary<string, object> ParseJsonSafe(string body)
+        {
+            try
+            {
+                var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+                return serializer.DeserializeObject(body) as Dictionary<string, object>;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>从解析好的 JSON 里读一个字符串字段；缺失返回空串。</summary>
+        private static string ParseString(Dictionary<string, object> data, string name)
+        {
+            if (data == null) return "";
+            object value;
+            if (!data.TryGetValue(name, out value) || value == null) return "";
+            string text = Convert.ToString(value);
+            return text == null ? "" : text;
+        }
+
+        /// <summary>常用设备：列表与撤销（忘记后该设备下次配对会重新弹窗）。</summary>
+        private Http.Response TrustedDevices(Http.Request request)
+        {
+            if (relay == null) return Fail("中继尚未启动");
+
+            if (request.Method == "POST")
+            {
+                string body = request.BodyText ?? "";
+                var data = ParseJsonSafe(body);
+                string id = data != null && data.ContainsKey("deviceId") ? Convert.ToString(data["deviceId"]) : "";
+                if (string.IsNullOrEmpty(id)) return Fail("缺少设备标识");
+                relay.ForgetDevice(id);
+            }
+
+            var items = new List<object>();
+            foreach (RelaySettings.TrustedDevice device in relay.TrustedDevices())
+            {
+                var entry = new Dictionary<string, object>();
+                entry["deviceId"] = device.DeviceId;
+                entry["name"] = device.Name ?? "";
+                entry["lastAddress"] = device.LastAddress ?? "";
+                entry["since"] = device.Since;
+                entry["lastSeen"] = device.LastSeen;
+                items.Add(entry);
+            }
+            var result = new Dictionary<string, object>();
+            result["ok"] = true;
+            result["items"] = items;
             return Http.Json(200, result);
         }
 
@@ -709,7 +1160,8 @@ namespace DshRelay
 
             try
             {
-                Application.Run(new MainForm());
+                // --background 由开机自启项传入：启动后只驻留托盘，不弹窗。
+                Application.Run(new MainForm(Autostart.LaunchedInBackground(args)));
                 StartupLog.Write("窗口已关闭，程序退出。");
             }
             catch (Exception error)

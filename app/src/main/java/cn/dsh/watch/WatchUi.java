@@ -33,29 +33,66 @@ final class WatchUi {
     private static final float SIDE_RATIO = 0.15f;
     /** 圆屏上下安全边距（屏高的 18%）。 */
     private static final float VERTICAL_RATIO = 0.18f;
-    static final int BG = Color.rgb(9, 12, 18);
-    static final int SURFACE = Color.rgb(23, 29, 40);
-    static final int SURFACE_HI = Color.rgb(35, 44, 58);
-    static final int FG = Color.rgb(238, 242, 248);
-    static final int MUTED = Color.rgb(150, 165, 186);
-    static final int ACCENT = Color.rgb(122, 190, 255);
-    static final int ON_ACCENT = Color.rgb(9, 12, 18);
-    static final int WARN = Color.rgb(250, 184, 96);
-    static final int OK = Color.rgb(126, 217, 160);
-    static final int DANGER = Color.rgb(248, 132, 132);
+
+    /**
+     * 当前配色。
+     *
+     * 这些字段**故意不是 final**：主题需要在不重启的情况下切换，而全项目有九十余处
+     * 通过 `WatchUi.BG` 这类静态引用取色。把配色做成可变字段，那些调用点一行都不用改，
+     * 重绘整屏时自然取到新值。
+     */
+    static int BG = Theme.dark().bg;
+    static int SURFACE = Theme.dark().surface;
+    static int SURFACE_HI = Theme.dark().surfaceHi;
+    static int FG = Theme.dark().fg;
+    static int MUTED = Theme.dark().muted;
+    static int ACCENT = Theme.dark().accent;
+    static int ON_ACCENT = Theme.dark().onAccent;
+    static int WARN = Theme.dark().warn;
+    static int OK = Theme.dark().ok;
+    static int DANGER = Theme.dark().danger;
+    static int LINE = Theme.dark().line;
 
     /** 卡片顶部的浅一档颜色，与 SURFACE 组成几乎察觉不到、但能拉出厚度的垂直渐变。 */
-    private static final int CARD_TOP = Color.rgb(27, 34, 47);
+    private static int CARD_TOP = Theme.dark().cardTop;
     /** 主按钮渐变的高光一档；底端仍落在 ACCENT，主色不偏离用户已熟悉的蓝。 */
-    private static final int ACCENT_TOP = Color.rgb(150, 207, 255);
+    private static int ACCENT_TOP = Theme.dark().accentTop;
     /** 页面顶部一层极弱的聚光：整屏纯平底色在圆屏上会显得发闷。 */
-    private static final int BACKDROP_TOP = Color.rgb(13, 18, 27);
+    private static int BACKDROP_TOP = Theme.dark().backdropTop;
     /** 面板描边：低不透明度的浅蓝灰，只负责把边界勾出来，不参与配色。 */
-    private static final int STROKE = Color.argb(40, 152, 180, 216);
-    /** 分隔线，比正文弱两档；也用于「左侧细竖线」这类弱化标记。 */
-    static final int LINE = Color.rgb(36, 45, 60);
+    private static int STROKE = Theme.dark().stroke;
     /** 按下波纹。 */
-    private static final int RIPPLE = Color.argb(46, 206, 228, 255);
+    private static int RIPPLE = Theme.dark().ripple;
+
+    /**
+     * 是否启用圆屏安全区。
+     *
+     * 默认开启（与既有效果完全一致）。方屏设备或用户在设置里关掉时，
+     * 页面改用普通边距把整块屏幕用满——圆屏安全区在方屏上等于白扔两侧空间。
+     */
+    static boolean roundOptimized = true;
+
+    /** 按主题名切换配色。传入未知值时保持当前主题不变。 */
+    static void applyTheme(String name) {
+        Theme theme = Theme.named(name);
+        if (theme == null) return;
+        BG = theme.bg;
+        SURFACE = theme.surface;
+        SURFACE_HI = theme.surfaceHi;
+        FG = theme.fg;
+        MUTED = theme.muted;
+        ACCENT = theme.accent;
+        ON_ACCENT = theme.onAccent;
+        WARN = theme.warn;
+        OK = theme.ok;
+        DANGER = theme.danger;
+        LINE = theme.line;
+        CARD_TOP = theme.cardTop;
+        ACCENT_TOP = theme.accentTop;
+        BACKDROP_TOP = theme.backdropTop;
+        STROKE = theme.stroke;
+        RIPPLE = theme.ripple;
+    }
 
     final Activity activity;
 
@@ -132,9 +169,10 @@ final class WatchUi {
         root.addOnLayoutChangeListener((v, l, t, r, b, ol, ot, or, ob) -> {
             int width = r - l;
             int height = b - t;
-            boolean round = activity.getResources().getConfiguration().isScreenRound();
-            // 圆屏侧边留出内接矩形之外的部分；上下留白略大于左右，
-            // 因为顶部状态栏与底部圆角都会压到内容。
+            // 圆屏且用户没关掉圆屏优化时才留内接矩形边距；方屏 / 关闭优化时
+            // 只留一点点常规边距，把整块屏幕用满。
+            boolean round = roundOptimized
+                    && activity.getResources().getConfiguration().isScreenRound();
             int side = round ? Math.round(width * SIDE_RATIO) : dp(8);
             int vertical = round ? Math.round(height * VERTICAL_RATIO) : dp(8);
             FrameLayout.LayoutParams current = (FrameLayout.LayoutParams) scroll.getLayoutParams();

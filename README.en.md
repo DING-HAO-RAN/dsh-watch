@@ -96,7 +96,7 @@ adb shell am start -n cn.dsh.watch/.MainActivity `
 
 Two ways; the first is recommended.
 
-**One-tap pairing (easiest)**: on the watch open "Settings" → tap "One-tap pairing" → the watch finds the computer on the same WiFi → a confirmation dialog appears on the computer, tap "Yes" → address and token are imported automatically.
+**One-tap pairing (easiest)**: on the watch open "Settings" → tap "One-tap pairing" → the watch finds the computer on the same WiFi → a confirmation dialog appears on the computer → tap "Approve". Tick "Remember this device" before approving and this watch will be approved automatically next time, with no dialog — you can remove it again under "Saved devices" on the computer at any time.
 
 **Manual entry**: the computer window shows a **6-digit pairing code** and **one or more addresses**. On the watch's "Settings":
 
@@ -104,11 +104,34 @@ Two ways; the first is recommended.
 - **Pairing code**: the 6 digits from the window
 - Tap "Pair and connect"
 
+**Pair once, connect on LAN and internet**: when pairing succeeds the relay hands out the **LAN and public addresses together**. The watch stores both on that one device, sharing a single token: at home it connects over the LAN directly, out of the house it switches to the public address — no re-pairing. The public address changes every time the relay restarts, and the watch syncs the latest one whenever it connects.
+
 Once paired, the watch remembers it and opens straight to the session list from then on. **Both the pairing code and the token are stored on the computer**, so restarting the relay or even upgrading the program won't change them and you won't have to pair again. To change the code, tap "New pairing code" in the window.
 
 ### 4. Switching between devices
 
 The watch remembers every device it has connected to (computer name and address). In "Settings" → "Saved devices", tap an entry to switch to it without pairing again. Public tunnel when you're out, LAN at home, another computer — all in this list.
+
+### 5. Autostart and following DSH on the computer
+
+The desktop app's "Settings" card has two switches you can enable together:
+
+| Switch | Effect |
+|---|---|
+| Start with Windows | Runs after you log in, with the window tucked into the tray (writes the current user's Run key, no admin rights needed) |
+| Start with DSH | Only serves while DSH is running; pauses when DSH exits and resumes automatically when it comes back |
+
+Enabling both does not conflict: after login the app waits in the tray, and starts serving as soon as DSH appears — there is always exactly one instance.
+
+**Public tunnel is on by default**: "Open the public tunnel on startup" is checked out of the box, so the app starts cloudflared and gets a public address immediately — pair once and the watch works from anywhere. Turn it off if you never need access from outside your network.
+
+**Closing the window is not quitting**: the close button only tucks the app into the tray and the relay keeps serving the watch. To really quit, use "Quit" in the tray icon's right-click menu.
+
+### 6. Reading files from a session
+
+When a session touches md, txt or code files, the session's left-swipe menu gains "View files": it lists the files that session touched and opens the full content. Markdown renders as headings, lists and code blocks; code gets line numbers and keyword highlighting.
+
+The watch can only open **files that actually appeared in that session** — the relay whitelists paths taken from the session's own tool steps and never accepts an arbitrary path, so other files on the computer are never exposed to the watch.
 
 ## Everyday use
 
@@ -120,6 +143,7 @@ The watch remembers every device it has connected to (computer name and address)
 | Read a conversation | Tap a session card; it opens at the newest content |
 | See the AI's reasoning | Each reply has "Thinking ▸" above it; tap to read the reasoning behind that reply |
 | See each operation | Tool calls between two replies collapse into one group (labelled "N items"); tap once for the list, then tap an entry for its arguments and result |
+| Read files from the session | Swipe left → "View files": md / txt / code, with Markdown and code rendering |
 | Just the conversation | Swipe left → "Conversation only" |
 | Send a message | On a session, tap "Send message" → type → "Send" |
 | Stop generating | On a session, tap "Stop" |
@@ -127,8 +151,9 @@ The watch remembers every device it has connected to (computer name and address)
 | Change model | Swipe left → "Model": the current model shows first, then pick provider → model → reasoning effort |
 | Check usage | Swipe left → "Usage": token spend, context occupancy, timing |
 | Scroll back | Swipe left → "Load older content" |
+| Change theme / round-screen fit | Swipe left → "Settings" → "Appearance": dark or light, and round-screen optimisation can be turned off |
 | Switch computer / device | Swipe left → "Settings": tap a saved device to switch |
-| Connect a new computer | On the settings page tap "One-tap pairing", then tap "Yes" on the computer |
+| Connect a new computer | On the settings page tap "One-tap pairing", then tap "Approve" on the computer |
 
 ## Building from source
 
@@ -205,7 +230,11 @@ For changes that affect UI behavior, also walk through the real entry points on 
 - **Single-file distribution**: the desktop app embeds both the WebView2 managed assemblies and the native loader into the exe — the managed assemblies are **loaded from memory** at startup, the native loader is written to the program directory. Distribution is one file, and nothing piles up in the user's config directory.
 - **Round screen**: padding comes from the circle's inscribed rectangle (15% left and right, 18% top and bottom); the corners sit about 0.474 from the center against a radius of 0.5, so the whole scroll area stays inside the circle and no page needs its own margins.
 - **The UI always works**: the desktop app has two UI layers — a web console in an embedded browser (nicer, denser) and a pure WinForms native UI (zero dependencies). The first needs the WebView2 runtime, which a trimmed-down Windows install may lack; the app then falls back to the second, and the pairing code and address still show.
+- **Only the new UI**: the native panel is no longer laid down first for the browser to cover later — that made every launch flash the old styling. A normal launch now shows only the new console; the native UI is created only when the browser really cannot start. The console supports dark and light themes, applied immediately and remembered.
 - **Sharp on HiDPI**: the app ships a DPI awareness manifest (PerMonitor V2), so it renders at true resolution on screens scaled to 125%/150%/200% — text and borders stay crisp. The initial window size is derived from the current display's working area, so it never overflows a small screen or looks empty on a large one.
+- **One pairing, two entry points**: the pairing response carries both the LAN and the public address; the watch stores both on that device under a single token. The public address changes on every restart, so the watch syncs the latest one through the token-free `/api/identity` whenever it connects.
+- **Remembered devices**: the watch generates a random device id on first pairing and keeps it. When the user ticks "Remember this device", the relay stores it against that id and auto-approves later requests. Remembering does not weaken the model — a one-shot grant is still issued and can still be redeemed only once — and the entry can be removed from the console at any time.
+- **File-view whitelist**: `/api/file` only accepts paths that appeared in this session's tool steps. The list is extracted by the relay from the session records itself; an arbitrary caller-supplied path is refused.
 
 ## Project layout
 
@@ -216,15 +245,19 @@ For changes that affect UI behavior, also walk through the real entry points on 
 │       ├── AndroidManifest.xml
 │       ├── java/cn/dsh/watch/
 │       │   ├── MainActivity.java    all pages and interaction logic
-│       │   ├── WatchUi.java         round-screen widgets and safe area
+│       │   ├── WatchUi.java         round-screen widgets, safe area, theme colours
+│       │   ├── Theme.java           dark and light semantic palettes
 │       │   ├── Markdown.java        rich-text rendering for text and tool results
+│       │   ├── CodeView.java        code rendering (line numbers + highlighting)
 │       │   ├── Api.java             HTTP client
 │       │   ├── Store.java           address and token storage
 │       │   └── Discovery.java       UDP auto-discovery
 │       └── res/
 ├── desktop/                   desktop app (C#, single-file exe)
 │   ├── src/
-│   │   ├── MainForm.cs         window, embedded browser, initial size
+│   │   ├── MainForm.cs         window, embedded browser, tray, initial size
+│   │   ├── PairingDialog.cs    pairing dialog (with remember-this-device)
+│   │   ├── Autostart.cs        start with Windows (current-user Run key)
 │   │   ├── NativePanel.cs      zero-dependency native UI (fallback target)
 │   │   ├── panel.html          web console
 │   │   ├── app.manifest        DPI awareness manifest (sharp on HiDPI)
@@ -258,7 +291,7 @@ For changes that affect UI behavior, also walk through the real entry points on 
 
 - The relay serves the LAN over **plain HTTP** (public access uses HTTPS) and relies on the 6-digit pairing code for protection. Run it only on a network you trust, and close it when you're done.
 - The watch shows at most 40 messages / 60 sessions at a time; older history loads in batches through "Load older content".
-- The relay needs DSH desktop running on the computer; **close the relay window and the watch is disconnected**.
+- The relay needs DSH desktop running on the computer; **closing the window only tucks it into the tray and the watch stays connected** — the service stops only on a real quit.
 - The public address is a temporary cloudflared tunnel and changes on every start; for a fixed address you need your own domain or reverse proxy.
 - **Cloudflare rate-limits unregistered tunnels**, so toggling one on and off repeatedly in a short window returns a rate-limit error. Wait a few minutes and try again; LAN is unaffected.
 - The watch accepts all certificates over HTTPS — there's no convenient way to install a certificate on a watch, so access control rests on the pairing token.
@@ -282,7 +315,10 @@ Check that the watch and the computer are on the same WiFi. Windows Firewall may
 No. It only reads DSH's login credentials for local communication; it changes no configuration file and installs no plugin.
 
 **Can the watch still connect after I close the window?**
-No. The relay runs inside that window; closing it stops the relay.
+Yes. The close button only tucks the app into the tray and the relay keeps serving. To really stop it, right-click the tray icon and choose "Quit".
+
+**The watch connects at home but not when I'm out?**
+Check that "Open the public tunnel on startup" is ticked on the computer and that a "Public" entry appears in the address list. The watch receives both addresses when pairing and switches to the public one when needed; if the relay has restarted and the public address changed, the watch syncs the new one the next time it connects.
 
 **The desktop app won't open or closes immediately?**
 `startup.log` in the program directory records the whole startup (DSH lookup, ports, dependency extraction, exception stack) — that's the first thing to read when troubleshooting.

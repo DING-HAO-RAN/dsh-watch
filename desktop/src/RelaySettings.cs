@@ -28,6 +28,42 @@ namespace DshRelay
         /// <summary>已发放的令牌：令牌 → 发放时间（Unix 毫秒）。</summary>
         public Dictionary<string, long> Tokens = new Dictionary<string, long>();
 
+        /// <summary>
+        /// 已验证过的「常用设备」：设备标识 → 设备信息。
+        ///
+        /// 手表第一次一键配对时可以选择「以后自动同意」。被记住的设备再来请求时
+        /// 直接放行，不再弹窗——但**仍受过期与撤销约束**（见 TrustedDevice）。
+        /// 识别用设备自己生成的随机 ID，不用 IP：换 WiFi 后 IP 会变，
+        /// 而按 IP 记忆等于把「记住这台设备」变成了「记住这个网络」。
+        /// </summary>
+        public Dictionary<string, TrustedDevice> TrustedDevices = new Dictionary<string, TrustedDevice>();
+
+        /// <summary>是否随 Windows 登录自动启动。</summary>
+        public bool StartWithWindows;
+
+        /// <summary>是否跟随 DSH 的启停自动开始/暂停对外服务。</summary>
+        public bool FollowDsh;
+
+        /// <summary>是否在启动时自动开启公网访问（需求方要求默认开启）。</summary>
+        public bool AutoTunnel = true;
+
+        /// <summary>控制台与窗口的界面主题：dark / light。默认深色。</summary>
+        public string Theme = "dark";
+
+        /// <summary>一条被记住的设备。</summary>
+        public class TrustedDevice
+        {
+            public string DeviceId = "";
+            /// <summary>手表自报的型号，用于在界面上说明「谁被记住了」。</summary>
+            public string Name = "";
+            /// <summary>最近一次成功配对的 IP，仅供展示与排查。</summary>
+            public string LastAddress = "";
+            /// <summary>记住的时间（Unix 毫秒）。</summary>
+            public long Since;
+            /// <summary>最近一次自动同意的时间（Unix 毫秒）。</summary>
+            public long LastSeen;
+        }
+
         private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
 
         /// <summary>
@@ -41,6 +77,19 @@ namespace DshRelay
         /// </summary>
         public static string PathFor(string directory)
         {
+            // 显式覆盖优先：调试第二份程序时（原版仍在跑、正在用 %LOCALAPPDATA% 那份存档），
+            // 用一个环境变量就能让它们各用各的配对码与令牌，不会互相覆盖。
+            try
+            {
+                string overrideDirectory = Environment.GetEnvironmentVariable("DSH_RELAY_STATE_DIR");
+                if (!string.IsNullOrEmpty(overrideDirectory))
+                {
+                    Directory.CreateDirectory(overrideDirectory);
+                    return Path.Combine(overrideDirectory, "relay-settings.json");
+                }
+            }
+            catch { }
+
             try
             {
                 string root = Path.Combine(
@@ -119,6 +168,32 @@ namespace DshRelay
                                 }
                             }
                         }
+                        object trusted;
+                        if (data.TryGetValue("trustedDevices", out trusted))
+                        {
+                            var map = trusted as Dictionary<string, object>;
+                            if (map != null)
+                            {
+                                foreach (var pair in map)
+                                {
+                                    var item = pair.Value as Dictionary<string, object>;
+                                    if (item == null) continue;
+                                    var device = new TrustedDevice();
+                                    device.DeviceId = pair.Key;
+                                    device.Name = ReadString(item, "name");
+                                    device.LastAddress = ReadString(item, "lastAddress");
+                                    device.Since = ReadLong(item, "since");
+                                    device.LastSeen = ReadLong(item, "lastSeen");
+                                    if (device.DeviceId.Length > 0) settings.TrustedDevices[device.DeviceId] = device;
+                                }
+                            }
+                        }
+                        settings.StartWithWindows = ReadBool(data, "startWithWindows");
+                        settings.FollowDsh = ReadBool(data, "followDsh");
+                        // 缺省视为开启：需求方要求「默认打开公网模式」。
+                        settings.AutoTunnel = !data.ContainsKey("autoTunnel") || ReadBool(data, "autoTunnel");
+                        string theme = ReadString(data, "theme");
+                        settings.Theme = theme == "light" ? "light" : "dark";
                         return settings;
                     }
                 }
@@ -184,12 +259,52 @@ namespace DshRelay
                 var tokens = new Dictionary<string, object>();
                 foreach (var pair in Tokens) tokens[pair.Key] = pair.Value;
                 data["tokens"] = tokens;
+
+                var trusted = new Dictionary<string, object>();
+                foreach (var pair in TrustedDevices)
+                {
+                    var item = new Dictionary<string, object>();
+                    item["name"] = pair.Value.Name ?? "";
+                    item["lastAddress"] = pair.Value.LastAddress ?? "";
+                    item["since"] = pair.Value.Since;
+                    item["lastSeen"] = pair.Value.LastSeen;
+                    trusted[pair.Key] = item;
+                }
+                data["trustedDevices"] = trusted;
+                data["startWithWindows"] = StartWithWindows;
+                data["followDsh"] = FollowDsh;
+                data["autoTunnel"] = AutoTunnel;
+                data["theme"] = Theme;
+
                 File.WriteAllText(PathFor(directory), Json.Serialize(data), Encoding.UTF8);
             }
             catch (Exception error)
             {
                 StartupLog.Write("保存设置失败：" + error.Message);
             }
+        }
+
+        private static string ReadString(Dictionary<string, object> data, string key)
+        {
+            object value;
+            if (!data.TryGetValue(key, out value) || value == null) return "";
+            return Convert.ToString(value) ?? "";
+        }
+
+        private static long ReadLong(Dictionary<string, object> data, string key)
+        {
+            object value;
+            if (!data.TryGetValue(key, out value) || value == null) return 0L;
+            long parsed;
+            return long.TryParse(Convert.ToString(value), out parsed) ? parsed : 0L;
+        }
+
+        private static bool ReadBool(Dictionary<string, object> data, string key)
+        {
+            object value;
+            if (!data.TryGetValue(key, out value) || value == null) return false;
+            bool parsed;
+            return bool.TryParse(Convert.ToString(value), out parsed) && parsed;
         }
     }
 }

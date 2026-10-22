@@ -40,6 +40,17 @@ final class Store {
         /** 是否为公网地址（决定显示「公网」还是「局域网」）。 */
         long lastUsed = 0L;
 
+        /**
+         * 同一台电脑的另一种入口。
+         *
+         * 一次配对会同时拿到局域网地址与公网地址，两者共用同一个令牌：
+         * 在家走近路（局域网），出门走公网。只存一条地址的话，换个网络就得重配。
+         */
+        String alternateBase = "";
+
+        /** 这台设备对应的中继给过我们的设备标识（用于「常用设备」自动同意）。 */
+        String deviceId = "";
+
         boolean valid() {
             return base != null && !base.isEmpty() && token != null && !token.isEmpty();
         }
@@ -48,7 +59,6 @@ final class Store {
         boolean isPublic() {
             return base != null && base.startsWith("https://");
         }
-
         JSONObject toJson() {
             JSONObject object = new JSONObject();
             try {
@@ -56,6 +66,8 @@ final class Store {
                 object.put("token", token == null ? "" : token);
                 object.put("label", label == null ? "" : label);
                 object.put("lastUsed", lastUsed);
+                object.put("alternateBase", alternateBase == null ? "" : alternateBase);
+                object.put("deviceId", deviceId == null ? "" : deviceId);
             } catch (Exception ignored) {
                 // 值都是字符串与数字，不会失败。
             }
@@ -69,6 +81,8 @@ final class Store {
             device.token = Api.text(object, "token");
             device.label = Api.text(object, "label");
             device.lastUsed = object.optLong("lastUsed", 0L);
+            device.alternateBase = Api.text(object, "alternateBase");
+            device.deviceId = Api.text(object, "deviceId");
             return device.valid() ? device : null;
         }
     }
@@ -153,7 +167,9 @@ final class Store {
         List<Device> list = devices();
         Device target = null;
         for (Device device : list) {
-            if (device.base.equals(address)) {
+            // 同一台设备的两个入口（局域网 / 公网）视为同一台：命中任一条就更新这一条，
+            // 否则一次配对会堆出两条记录，切换设备时还会互相顶掉令牌。
+            if (device.base.equals(address) || device.alternateBase.equals(address)) {
                 target = device;
                 break;
             }
@@ -172,6 +188,41 @@ final class Store {
                 .putString(KEY_BASE, target.base)
                 .putString(KEY_TOKEN, target.token)
                 .apply();
+    }
+
+    /**
+     * 记下这台设备的另一个入口（另一次配对拿到的另一种地址）。
+     *
+     * 配对响应里同时给了局域网与公网地址，两个入口共用一个令牌；
+     * 记下另一条之后，用户换网络时界面可以提示「改用另一条」而不是重新配对。
+     */
+    void rememberAlternate(String currentBase, String alternateBase, String deviceId) {
+        if (currentBase == null || currentBase.trim().isEmpty()) return;
+        String address = currentBase.trim();
+        List<Device> list = devices();
+        Device target = null;
+        for (Device device : list) {
+            if (device.base.equals(address) || device.alternateBase.equals(address)) {
+                target = device;
+                break;
+            }
+        }
+        if (target == null) return;
+        if (alternateBase != null && !alternateBase.trim().isEmpty()
+                && !alternateBase.trim().equals(target.base)) {
+            target.alternateBase = alternateBase.trim();
+        }
+        if (deviceId != null && !deviceId.trim().isEmpty()) target.deviceId = deviceId.trim();
+        saveDevices(list);
+    }
+
+    /** 某台设备上的另一个可用地址（没有则返回空串）。 */
+    String alternateFor(String base) {
+        if (base == null) return "";
+        for (Device device : devices()) {
+            if (device.base.equals(base)) return device.alternateBase == null ? "" : device.alternateBase;
+        }
+        return "";
     }
 
     /** 切换到一台已记住的设备。 */
@@ -273,6 +324,59 @@ final class Store {
 
     boolean paired() {
         return !base().isEmpty() && !token().isEmpty();
+    }
+
+    // ------------------------------------------------------------ 外观偏好
+
+    private static final String KEY_THEME = "theme";
+    private static final String KEY_ROUND = "roundOptimized";
+    private static final String KEY_DEVICE_ID = "deviceId";
+
+    /** 界面主题名（dark / light）。默认深色。 */
+    String theme() {
+        String value = prefs.getString(KEY_THEME, "");
+        return value == null || value.isEmpty() ? Theme.DARK : value;
+    }
+
+    void setTheme(String name) {
+        prefs.edit().putString(KEY_THEME, Theme.LIGHT.equals(name) ? Theme.LIGHT : Theme.DARK).apply();
+    }
+
+    /** 是否启用圆屏安全区。默认开启（与既有效果一致）。 */
+    boolean roundOptimized() {
+        return prefs.getBoolean(KEY_ROUND, true);
+    }
+
+    void setRoundOptimized(boolean enabled) {
+        prefs.edit().putBoolean(KEY_ROUND, enabled).apply();
+    }
+
+    /**
+     * 本机的设备标识。
+     *
+     * 首次取用时生成并永久保存：中继用它认出「这台手表」，
+     * 用户勾过「保存为常用设备」之后，它再来配对就不必弹窗。
+     * 用随机值而不是机型名：两块同型号的手表不该被当成同一台。
+     */
+    String deviceId() {
+        String value = prefs.getString(KEY_DEVICE_ID, "");
+        if (value != null && !value.isEmpty()) return value;
+        String generated = randomId();
+        prefs.edit().putString(KEY_DEVICE_ID, generated).apply();
+        return generated;
+    }
+
+    private static String randomId() {
+        try {
+            java.security.SecureRandom random = new java.security.SecureRandom();
+            byte[] bytes = new byte[12];
+            random.nextBytes(bytes);
+            StringBuilder builder = new StringBuilder();
+            for (byte value : bytes) builder.append(String.format("%02x", value));
+            return builder.toString();
+        } catch (Exception error) {
+            return "dev-" + System.currentTimeMillis();
+        }
     }
 
     /** 一个解析好的中继地址。 */

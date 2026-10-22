@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="dark">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
@@ -11,8 +11,9 @@
   /* ------------------------------------------------------------------
      设计变量。
 
-     只有一组中性色 + 一个强调色（琥珀）。绿/红仅用于状态语义，不参与装饰，
-     因此界面上不会出现第三种"品牌色"。中性色统一偏冷，避免冷暖灰混用。
+     只有一组中性色 + 一个强调色（琥珀）。绿/红仅用于状态语义，不参与装饰。
+     浅色主题不是把深色取反，而是重新给每个语义角色一个合适的明度：
+     底色近白、卡片纯白、正文深灰蓝。两套共用同一套变量名，切换只改模板。
      ------------------------------------------------------------------ */
   :root {
     color-scheme: dark;
@@ -47,6 +48,41 @@
     --mono: "Cascadia Mono", "Cascadia Code", Consolas, ui-monospace, "SFMono-Regular", monospace;
 
     --shadow-card: 0 1px 2px rgba(0, 0, 0, .40), 0 12px 32px -18px rgba(0, 0, 0, .72);
+    --topbar-bg: rgba(11, 13, 16, .78);
+    --ambient: radial-gradient(52em 30em at 12% -8%, rgba(240, 182, 75, .075), transparent 62%),
+               radial-gradient(46em 26em at 92% 2%, rgba(96, 132, 180, .085), transparent 64%);
+    --noise-opacity: .035;
+  }
+
+  html[data-theme="light"] {
+    color-scheme: light;
+
+    --bg: #f6f7fa;
+    --bg-elev: #ffffff;
+    --surface: #ffffff;
+    --surface-2: #f1f3f7;
+    --surface-3: #e7ebf1;
+    --line: rgba(20, 32, 50, .09);
+    --line-strong: rgba(20, 32, 50, .17);
+
+    --fg: #1a2130;
+    --fg-soft: #46536b;
+    --muted: #6a7789;
+    --faint: #8b96a6;
+
+    --accent: #c98a12;
+    --accent-ink: #fffdf7;
+    --accent-line: rgba(201, 138, 18, .45);
+    --accent-glow: rgba(201, 138, 18, .14);
+
+    --ok: #12854b;
+    --bad: #c62e3a;
+
+    --shadow-card: 0 1px 2px rgba(22, 36, 58, .06), 0 10px 26px -18px rgba(22, 36, 58, .28);
+    --topbar-bg: rgba(246, 247, 250, .82);
+    --ambient: radial-gradient(52em 30em at 12% -8%, rgba(201, 138, 18, .10), transparent 62%),
+               radial-gradient(46em 26em at 92% 2%, rgba(70, 110, 170, .10), transparent 64%);
+    --noise-opacity: .018;
   }
 
   *, *::before, *::after { box-sizing: border-box; }
@@ -58,6 +94,7 @@
     margin: 0;
     background: var(--bg);
     color: var(--fg);
+    transition: background-color 220ms ease, color 220ms ease;
     font-family: var(--font);
     font-size: 15px;
     line-height: 1.62;
@@ -76,9 +113,7 @@
     inset: -20% -10% auto -10%;
     height: 150%;
     pointer-events: none;
-    background:
-      radial-gradient(52em 30em at 12% -8%, rgba(240, 182, 75, .075), transparent 62%),
-      radial-gradient(46em 26em at 92% 2%, rgba(96, 132, 180, .085), transparent 64%);
+    background: var(--ambient);
     z-index: 0;
   }
 
@@ -89,7 +124,7 @@
     inset: 0;
     pointer-events: none;
     z-index: 0;
-    opacity: .035;
+    opacity: var(--noise-opacity);
     mix-blend-mode: overlay;
     background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)'/%3E%3C/svg%3E");
   }
@@ -112,7 +147,7 @@
     top: 0;
     z-index: 20;
     flex: none;
-    background: rgba(11, 13, 16, .78);
+    background: var(--topbar-bg);
     backdrop-filter: saturate(150%) blur(16px);
     -webkit-backdrop-filter: saturate(150%) blur(16px);
     box-shadow: inset 0 -1px 0 var(--line);
@@ -662,6 +697,65 @@
     color: var(--fg-soft);
   }
 
+  /* ------------------------------------------------------------- 设置 */
+
+  .settings-card { margin-top: 18px; }
+
+  .toggle-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 13px;
+    padding: 13px 0;
+    cursor: pointer;
+  }
+  .toggle-row + .toggle-row { box-shadow: inset 0 1px 0 var(--line); }
+
+  .toggle-row input {
+    flex: none;
+    width: 18px;
+    height: 18px;
+    margin: 3px 0 0;
+    accent-color: var(--accent);
+    cursor: pointer;
+  }
+
+  .toggle-text { min-width: 0; }
+  .toggle-text b { display: block; color: var(--fg); font-size: 13.5px; font-weight: 600; line-height: 1.5; }
+  .toggle-text span { display: block; color: var(--muted); font-size: 12.5px; line-height: 1.6; }
+
+  /* 主题切换：两个小按钮拼成一段，选中态用强调色实心。 */
+  .theme-switch {
+    flex: none;
+    display: inline-flex;
+    padding: 3px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    box-shadow: inset 0 0 0 1px var(--line);
+    gap: 2px;
+  }
+  .theme-switch button {
+    border: 0;
+    border-radius: 999px;
+    padding: 5px 12px;
+    background: transparent;
+    color: var(--muted);
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: background-color 160ms ease, color 160ms ease;
+  }
+  .theme-switch button:hover { color: var(--fg); }
+  .theme-switch button.active {
+    background: var(--accent);
+    color: var(--accent-ink);
+    font-weight: 600;
+  }
+
+  .device-row { align-items: center; }
+  .device-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+  .device-name { font-size: 13.5px; color: var(--fg); font-weight: 500; }
+  .device-meta { font-size: 11.5px; color: var(--faint); font-variant-numeric: tabular-nums; }
+
   /* ------------------------------------------------------------- 页脚 */
 
   footer {
@@ -835,10 +929,65 @@
               <span class="step-no">3</span>
               <span class="step-body">
                 <b>输入 6 位配对码，点「配对并连接」</b>
-                <span>成功后令牌自动出现在左侧；也可以直接点「一键配对」，在电脑上确认</span>
+                <span>成功后会同时拿到局域网与公网地址，出门在外也能直接用</span>
               </span>
             </li>
           </ol>
+        </div>
+      </section>
+    </div>
+
+    <div class="cols" style="margin-top:18px">
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">常用设备</h2>
+          <span class="count" id="trustedCount">0</span>
+        </div>
+        <div class="card-body">
+          <div class="list" id="trusted">
+            <div class="empty">正在读取…</div>
+          </div>
+          <p class="hint" style="margin-top:14px">配对时勾选「保存为常用设备」的手表会出现在这里，它们下次配对会自动同意、不再弹窗。删掉一条，那台手表就会重新需要你确认。</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2 class="card-title">设置</h2>
+        </div>
+        <div class="card-body">
+          <label class="toggle-row">
+            <input type="checkbox" id="optStartWithWindows">
+            <span class="toggle-text">
+              <b>开机自启</b>
+              <span>登录 Windows 后自动运行，窗口收进托盘，不打扰你</span>
+            </span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="optFollowDsh">
+            <span class="toggle-text">
+              <b>随 DSH 启动而启动</b>
+              <span>只在 DSH 运行时对外服务；DSH 退出就暂停，回来后自动恢复</span>
+            </span>
+          </label>
+          <label class="toggle-row">
+            <input type="checkbox" id="optAutoTunnel">
+            <span class="toggle-text">
+              <b>启动时自动开启公网访问</b>
+              <span>让手表在外面也能连；关掉后只能在同一 WiFi 使用</span>
+            </span>
+          </label>
+          <div class="toggle-row" style="cursor:default">
+            <span class="toggle-text">
+              <b>界面主题</b>
+              <span>深色与浅色都在这一处切换，立即生效并记住</span>
+            </span>
+            <div class="theme-switch" id="themeSwitch" style="margin-left:auto">
+              <button type="button" data-theme="dark">深色</button>
+              <button type="button" data-theme="light">浅色</button>
+            </div>
+          </div>
+          <p class="hint" style="margin-top:12px" id="settingsNote">两项自启可以同时选：开机后先待在托盘里，DSH 一启动就自动开始服务，始终只有一个程序实例。</p>
         </div>
       </section>
     </div>
@@ -1206,6 +1355,8 @@
 
     renderAddresses();
     renderTokens();
+    renderTrustedFromState();
+    renderSettings();
     updateTunnelUi();
   }
 
@@ -1323,6 +1474,175 @@
     $('notice').hidden = true;
     if (noticeTimer) clearTimeout(noticeTimer);
   });
+
+  // ---------------------------------------------------------------- 设置
+
+  var settingsBound = false;
+
+  function renderSettings() {
+    if (!state) return;
+    if (!settingsBound) {
+      settingsBound = true;
+      $('optStartWithWindows').checked = !!state.startWithWindows;
+      $('optFollowDsh').checked = !!state.followDsh;
+      $('optAutoTunnel').checked = !!state.autoTunnel;
+    }
+    // 用户正在动某个开关时不要覆盖它（轮询每 2 秒一次）。
+    if (document.activeElement && document.activeElement.tagName === 'INPUT') return;
+    $('optStartWithWindows').checked = !!state.startWithWindows;
+    $('optFollowDsh').checked = !!state.followDsh;
+    $('optAutoTunnel').checked = !!state.autoTunnel;
+    if (state.paused) {
+      $('settingsNote').textContent = '跟随 DSH 模式：DSH 当前未运行，已暂停对外服务，DSH 启动后会自动恢复。';
+    }
+    // 主题函数在文件末尾定义，首次渲染时可能还没就绪，用运行时检测兜住。
+    syncThemeFromState();
+  }
+
+  // ---------------------------------------------------------------- 主题
+
+  var currentTheme = '';
+  // 用户刚点过主题、还没等到服务端回显的这段时间，轮询不许覆盖它。
+  // 否则会出现「点了浅色又跳回深色」——正是这个标志要拦的情况。
+  var themeTouchedUntil = 0;
+
+  function applyTheme(name) {
+    if (!name) return;
+    currentTheme = name;
+    var root = document.documentElement;
+    if (root.getAttribute('data-theme') !== name) root.setAttribute('data-theme', name);
+    var buttons = document.querySelectorAll('#themeSwitch button');
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].classList.toggle('active', buttons[i].dataset.theme === name);
+    }
+  }
+
+  function chooseTheme(name) {
+    themeTouchedUntil = Date.now() + 3000;
+    applyTheme(name);
+    saveSettings();
+  }
+
+  /** 服务端状态里的主题：用户没有正在操作时才跟随。 */
+  function syncThemeFromState() {
+    if (Date.now() < themeTouchedUntil) return;
+    if (!state) return;
+    applyTheme(state.theme === 'light' ? 'light' : 'dark');
+  }
+
+  function saveSettings() {
+    fetch('settings', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        startWithWindows: $('optStartWithWindows').checked,
+        followDsh: $('optFollowDsh').checked,
+        autoTunnel: $('optAutoTunnel').checked,
+        theme: currentTheme
+      })
+    })
+      .then(function (response) {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        notify('设置已保存', false);
+      })
+      .catch(function (error) { notify('保存设置失败：' + error.message, true); })
+      .then(function () { poll(); });
+  }
+
+  ['optStartWithWindows', 'optFollowDsh', 'optAutoTunnel'].forEach(function (id) {
+    $(id).addEventListener('change', saveSettings);
+  });
+
+  (function bindThemeButtons() {
+    var buttons = document.querySelectorAll('#themeSwitch button');
+    for (var i = 0; i < buttons.length; i++) {
+      buttons[i].addEventListener('click', function () {
+        chooseTheme(this.dataset.theme);
+      });
+    }
+  })();
+
+  // ------------------------------------------------------------ 常用设备
+
+  var trustedSig = null;
+
+  function fmtDate(stamp) {
+    if (!stamp) return '';
+    try {
+      return new Date(stamp).toLocaleDateString('zh-CN');
+    } catch (error) {
+      return '';
+    }
+  }
+
+  /** 常用设备来自 /state（页面已经每 2 秒取一次），不必再发请求。 */
+  function renderTrustedFromState() {
+    renderTrusted(state && Array.isArray(state.trustedDevices) ? state.trustedDevices : []);
+  }
+
+  function renderTrusted(items) {
+    var host = $('trusted');
+    var signature = items.map(function (item) {
+      return item.deviceId + '|' + item.name + '|' + item.lastSeen;
+    }).join('\n');
+    if (signature === trustedSig) return;
+    trustedSig = signature;
+    setText($('trustedCount'), items.length);
+
+    host.textContent = '';
+    if (items.length === 0) {
+      host.appendChild(emptyBlock('还没有常用设备', '配对时勾选「保存为常用设备」，那台手表以后就不必再确认。'));
+      return;
+    }
+
+    var frag = document.createDocumentFragment();
+    items.forEach(function (item) {
+      var row = document.createElement('div');
+      row.className = 'row device-row';
+
+      var main = document.createElement('div');
+      main.className = 'device-main';
+
+      var name = document.createElement('span');
+      name.className = 'device-name';
+      name.textContent = item.name || '未命名手表';
+
+      var meta = document.createElement('span');
+      meta.className = 'device-meta';
+      var seen = fmtAgo(item.lastSeen);
+      var parts = [];
+      if (item.lastAddress) parts.push(item.lastAddress);
+      if (seen) parts.push('最近 ' + seen);
+      else if (item.since) parts.push(fmtDate(item.since) + ' 起');
+      meta.textContent = parts.join(' · ');
+
+      main.appendChild(name);
+      main.appendChild(meta);
+      row.appendChild(main);
+
+      var remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'btn mini danger';
+      remove.textContent = '删除';
+      remove.addEventListener('click', function () {
+        remove.disabled = true;
+        fetch('trusted', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ deviceId: item.deviceId })
+        })
+          .then(function () {
+            notify('已删除「' + (item.name || '这台手表') + '」，它下次配对需要重新确认', false);
+            trustedSig = null;
+          })
+          .catch(function (error) { notify('删除失败：' + error.message, true); })
+          .then(function () { poll(); });
+      });
+      row.appendChild(remove);
+      frag.appendChild(row);
+    });
+    host.appendChild(frag);
+  }
 
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) poll();

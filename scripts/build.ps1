@@ -117,7 +117,8 @@ try {
     if ($code -ne 0) { Read-Log 'javac'; throw "javac 失败（退出码 $code）" }
 
     # 逐类核对：缺一个都会在手表上变成 NoClassDefFoundError，必须在这里挡住。
-    $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api', 'Discovery')
+    $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api', 'Discovery', 
+                      'Theme', 'CodeView')
     $classesDir = Join-Path $build 'classes'
     foreach ($name in $expected) {
         $file = Join-Path $classesDir ('cn/dsh/watch/' + $name + '.class')

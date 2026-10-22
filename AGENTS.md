@@ -12,12 +12,14 @@
 
 - 桌面程序的配对码与令牌存在 [RelaySettings](<desktop/src/RelaySettings.cs>)：优先 `%LOCALAPPDATA%\dsh-relay\relay-settings.json`，不可写时用程序目录的 `data\`。**`build-app.ps1` 会保留 `data\`**，否则每次重建就丢一次配对（实测过）。
 - **配对码配对成功时不更换**：换了手表下次就得重输，与需求方要求相反。需要换码时由用户点界面上的按钮。
-- 一键配对的链路：手表发 UDP 查询 → 中继单播回复 → 手表 `POST /api/pair/request` → 电脑弹窗 → 用户点「是」→ 中继发放一次性票据 → 手表轮询 `GET /api/pair/result` 拿到 grant → `POST /api/pair {grant}` 换令牌。
+- 一键配对的链路：手表发 UDP 查询 → 中继单播回复 → 手表 `POST /api/pair/request` → 电脑弹窗 → 用户点「同意」→ 中继发放一次性票据 → 手表轮询 `GET /api/pair/result` 拿到 grant → `POST /api/pair {grant}` 换令牌。
 - **`/api/pair/request` 与 `/api/pair/result` 必须先于鉴权判断**（手表这时还没有令牌）。安全边界靠电脑端弹窗，因此这三条防护不能删：
   1. 同 IP 15 秒冷却 + 待确认请求上限 3（防弹窗轰炸）；
   2. **grant 必须是独立随机值**，不能复用 `requestId`——requestId 明文回给请求方，复用它等于把用户确认环节架空；
   3. grant 2 分钟过期并定期清理（`PruneGrants`），否则旧票据永久有效。
-- 手表端 [Store](<app/src/main/java/cn/dsh/watch/Store.java>) 存的是**设备列表**（地址 + 令牌 + 备注 + 最后使用时间），`base()`/`token()` 语义不变仍指「当前设备」，因此三十余处调用点不用改。切换设备时必须清空会话、`steps`、`openGroups`、`openRows` 与 `lastListSignature`，否则上一台设备的状态会套到新界面上。
+- **常用设备自动同意**：手表首次配对生成随机 `deviceId` 永久保存（`Store.deviceId()`），请求把它放进 body；用户勾「保存为常用设备」后中继 `TrustDevice` 按这个 id 记住，下次 `RequestPairing` 看到 `IsTrusted` 就直接 `ApprovePairing` 并返回 `trusted:true`，不弹窗。**记住不等于放宽安全模型**——仍然发放独立一次性票据、仍然只能换一次令牌。用 `deviceId` 而不是 IP：换 WiFi 后 IP 会变，按 IP 记忆等于「记住这个网络」。撤销走控制台「常用设备」的删除按钮（`ForgetDevice`）。
+- **一次配对交付两个入口**：`/api/pair` 的响应带 `lanBase`（本次请求实际到达的那条，来源是 loopback 时退回第一条局域网地址）与 `publicUrl`；手表把两条都存进同一台设备的 `base` 与 `alternateBase`，共用同一个令牌。**公网地址每次重启都会变**，所以手表每次进列表页都用无需鉴权的 `/api/identity`（已带 `publicUrl`）同步一次，不这么做中继一重启手表就再也连不上。
+- 手表端 [Store](<app/src/main/java/cn/dsh/watch/Store.java>) 存的是**设备列表**（地址 + 令牌 + 备注 + 最后使用时间 + 备用地址 + 设备 id），`base()`/`token()` 语义不变仍指「当前设备」，因此三十余处调用点不用改。切换设备时必须清空会话、`steps`、`openGroups`、`openRows` 与 `lastListSignature`，否则上一台设备的状态会套到新界面上。`rememberDevice` 命中 `base` 或 `alternateBase` 都算同一台，否则一次配对会堆出两条并互相顶掉令牌。
 - 局域网发现是**双向**的：中继既周期广播也响应手表的查询，且要按网段算定向广播地址（部分路由器丢弃 `255.255.255.255`）。**收发必须用两个独立 socket**——共用一个时，bind 到固定端口后再 Send 在部分 Windows 配置下会静默失败。
 
 ## 思考内容
@@ -33,6 +35,13 @@
   1. **WebView2 网页界面**（[panel.html](<desktop/src/panel.html>) + [MainForm.cs](<desktop/src/MainForm.cs>)）：好看、信息密度高，但依赖 WebView2 运行时；
   2. **原生界面**（[NativePanel.cs](<desktop/src/NativePanel.cs>)）：纯 WinForms，零依赖，**永远可用**，同时是内嵌浏览器失败时的自动降级目标。
   这样分层的理由：中继本身不需要浏览器就能工作，精简版 Windows 上可能没有 WebView2；有了第二层，「任何电脑都能打开并显示配对码」才有保证。
+- **原生界面绝不预先摆出来**。以前它一创建就填满窗口、等 WebView2 就绪再盖上去，于是每次启动都先闪一屏旧的 WinForms 界面（用户报的「显示旧的 UI 界面」就是这个）。现在窗口里只有一个「正在启动中继…」占位标签，`EnsureFallback()` 只在浏览器确实失败时才创建原生面板——正常启动路径上根本不出现旧界面，也就不存在切换过程。
+- **关闭窗口＝收进托盘，不是退出**。`OnFormClosing` 在 `reallyClosing` 为 false 时取消关闭并 `Hide()`；真正的退出走托盘菜单「退出」。托盘图标是自绘的 `Icon`（`MakeTrayIcon`），不依赖外部 .ico。**不要改回「关闭即退出」**——「随 DSH 启动」要求程序在后台常驻。
+- **`--background` 启动时窗口收进托盘**：`Autostart` 写进注册表的命令行带这个参数，`MainForm(startHidden)` 在 `OnShown` 里 `Hide()`。开机自启不能弹窗。
+- **开机自启写当前用户的 Run 键**（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `DshRelay`）：不需要管理员权限，删掉即取消。刻意不用启动文件夹快捷方式（出错时用户看不到任何反馈）也不用计划任务（要提权，会被企业策略拦）。
+- **「开机自启」与「随 DSH 启动」共用一个进程**：后者由 `PanelHost.StartWatchdog()` 每 5 秒问一次 `DshLocator.IsRunning(dshPortHint)`，DSH 没了就 `StopServing()`、回来就 `StartServing()`。两个都勾时先开机待命、DSH 一出现才开始服务，**绝不另起第二个实例**——两个实例会抢 19390 端口。
+- **公网默认开启**：`RelaySettings.AutoTunnel` 缺省为 `true`，`StartServing()` 起中继后在后台线程拉 cloudflared（不能阻塞启动，局域网不该等它）。老存档没有这个键时也按开启处理，否则升级上来的用户会以为功能丢了。
+- **调试第二份实例不要打断正在运行的那份**：`RelaySettings.PathFor` 认 `DSH_RELAY_STATE_DIR` 覆盖状态目录，`PanelHost.Run` 认 `DSH_RELAY_PORT` 覆盖监听端口，`build-app.ps1` 有 `-OutputDir` / `-StateDir`。三者配合就能在原版仍占着 19390 的情况下跑新版验证。
 - **依赖全部嵌进 exe**，分发只有一个文件。挂载方式（[Bootstrap.cs](<desktop/src/Bootstrap.cs>)）分两条路，两者都必须保留：
   - 托管程序集用 `Assembly.Load(byte[])` **从内存装入**（在 `AssemblyResolve` 里实现）；
   - 原生加载器 `WebView2Loader.dll` **必须落盘**（Win32 的 `LoadLibrary` 只接受路径），优先写程序自身目录，失败再退到临时目录。
@@ -93,7 +102,8 @@
   1. 外部命令输出重定向到文件后判退出码——PowerShell 5.1 在 `ErrorActionPreference='Stop'` 下会把 javac 的过时警告当致命错误中断构建，从而**掩盖真正的编译错误**；
   2. 源码与 class 清单写文件后用 `@file` 传参——数组经 shell 展开会被拆坏，导致 d8 静默漏掉大部分类，手表上表现为 `NoClassDefFoundError`；
   3. 用 JDK 的 `jar` 工具把 dex 追加进包——受限语言模式下不可用 .NET 的 ZipFile。
-- `build.ps1` 会逐个核对 `MainActivity` / `WatchUi` / `WatchUi$Page` / `Store` / `Api` / `Discovery` 六个 class 是否存在，这是拦截「类漏编」的最小门禁。
+- `build.ps1` 会逐个核对 `MainActivity` / `WatchUi` / `WatchUi$Page` / `Store` / `Api` / `Discovery` / `Theme` / `CodeView` 八个 class 是否存在，这是拦截「类漏编」的最小门禁。新增顶层类时要同步加进这份清单，否则新类漏编只会在手表上表现为 `NoClassDefFoundError`。
+- 本机可用的 Android SDK 在 `D:\AndroidToolboxEnv\sdk`（`platforms` + `build-tools/35.0.0`），JDK 用 DSH 自带的 `jbr`；两者都用环境变量传入，别写进仓库。
 
 ## 界面
 
@@ -120,6 +130,10 @@
 - 收组监听器只挂标题、摘要与「展开/收起」提示三处，**不要挂整张卡片**：清单区域必须留给单条明细，否则「点这一条」被卡片抢走，变成把整组收起来。清单行整行可点（`rowBox`，`minHeight 48dp`），只挂标题那一小块时点行内空白同样会落到卡片上。
 - 模型选择页三级（供应商 → 模型 → 推理强度）共用 `currentChoice()`：按「会话用量 → 会话摘要 → 目录 default」依次取值，都不存在时不臆造模型名。`usage` 为空（新建会话还没产生回复）时前两者都没有，靠 `Api.parseModelDefault` 兜底。
 - 长路径会占满圆屏，展示前一律经 `shortenPaths` / `shortPath` 压成末两段。
+- **主题靠「可变静态字段」实现，不是重建 View**：[WatchUi](<app/src/main/java/cn/dsh/watch/WatchUi.java>) 的 `BG`/`FG`/`ACCENT` 等都是 `static`（非 final），`applyTheme()` 一次性换掉整组；`Theme` 只负责给出深/浅两套语义色。全项目九十余处 `WatchUi.BG` 这类引用因此一行都不用改。**不要把这些字段改回 final**，也不要让界面代码自己去判断主题色——那会把配色散到几十个地方。切换后重绘整屏即可生效，`onCreate` 里必须在建页面**之前**应用。
+- **圆屏优化是可关的开关**（`WatchUi.roundOptimized`，默认 true，与既有效果完全一致）：关闭时 `page()` 不再按内接矩形留 15%/18%，改用 `dp(8)` 常规边距，方屏设备能把整屏用满。判断条件同时要求「用户开着这个开关」和「系统报告是圆屏」，两者缺一都走方屏分支。
+- **代码与 Markdown 必须用两个渲染器**：[Markdown](<app/src/main/java/cn/dsh/watch/Markdown.java>) 会把 `#`、`*`、`|`、`- ` 当结构语法吃掉，而这些字符在源码里有本义（注释、乘法、位运算），拿它渲染代码等于改坏代码。[CodeView](<app/src/main/java/cn/dsh/watch/CodeView.java>) 保留缩进与行号、每行独立上色、**不做跨行状态机**（状态机一旦出错整屏后续行都会被染成注释色）。代码视图必须 `setHorizontallyScrolling(true)`，自动折行会让缩进层级全乱。
+- **文件查看只认会话里出现过的文件**：手表菜单「查看文件」的数据来自 `session` 响应里的 `files`（中继从工具步骤的 `files` 汇总，已带 `kind`/`language`/`size`）；`/api/file` 只接受这份白名单里的路径，任意路径一律 403。**不要把白名单放宽成「任意路径」**，那等于把整台电脑的文件系统交给任何拿到令牌的设备。
 
 ## 测试
 

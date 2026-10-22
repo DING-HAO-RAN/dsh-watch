@@ -11,18 +11,60 @@ namespace DshRelay
     /// <summary>配色与字体：与网页控制台（panel.html）保持同一套视觉语言。</summary>
     internal static class Theme
     {
-        public static readonly Color Bg = Color.FromArgb(11, 13, 16);
-        public static readonly Color Surface = Color.FromArgb(20, 24, 30);
-        public static readonly Color Surface2 = Color.FromArgb(25, 30, 37);
-        public static readonly Color Inset = Color.FromArgb(16, 19, 24);
-        public static readonly Color Line = Color.FromArgb(40, 45, 53);
-        public static readonly Color Fg = Color.FromArgb(233, 237, 242);
-        public static readonly Color FgSoft = Color.FromArgb(182, 192, 204);
-        public static readonly Color Muted = Color.FromArgb(125, 136, 149);
-        public static readonly Color Faint = Color.FromArgb(92, 102, 111);
-        public static readonly Color Accent = Color.FromArgb(240, 182, 75);
-        public static readonly Color Ok = Color.FromArgb(76, 195, 138);
-        public static readonly Color Bad = Color.FromArgb(242, 119, 122);
+        // 可变而非 readonly：主题要在运行中切换，而界面代码里到处直接引用
+        // Theme.Bg 这类静态字段。做成可赋值字段，那些调用点一行都不用改。
+        public static Color Bg = Color.FromArgb(11, 13, 16);
+        public static Color Surface = Color.FromArgb(20, 24, 30);
+        public static Color Surface2 = Color.FromArgb(25, 30, 37);
+        public static Color Inset = Color.FromArgb(16, 19, 24);
+        public static Color Line = Color.FromArgb(40, 45, 53);
+        public static Color Fg = Color.FromArgb(233, 237, 242);
+        public static Color FgSoft = Color.FromArgb(182, 192, 204);
+        public static Color Muted = Color.FromArgb(125, 136, 149);
+        public static Color Faint = Color.FromArgb(92, 102, 111);
+        public static Color Accent = Color.FromArgb(240, 182, 75);
+        public static Color Ok = Color.FromArgb(76, 195, 138);
+        public static Color Bad = Color.FromArgb(242, 119, 122);
+
+        /// <summary>当前是否浅色主题。</summary>
+        public static bool Light;
+
+        /// <summary>按主题名切换整套语义色。</summary>
+        public static void Apply(string name)
+        {
+            bool light = name == "light";
+            Light = light;
+            if (light)
+            {
+                Bg = Color.FromArgb(246, 247, 250);
+                Surface = Color.FromArgb(255, 255, 255);
+                Surface2 = Color.FromArgb(241, 243, 247);
+                Inset = Color.FromArgb(252, 253, 255);
+                Line = Color.FromArgb(222, 227, 235);
+                Fg = Color.FromArgb(26, 33, 48);
+                FgSoft = Color.FromArgb(70, 83, 107);
+                Muted = Color.FromArgb(106, 119, 137);
+                Faint = Color.FromArgb(139, 150, 166);
+                Accent = Color.FromArgb(201, 138, 18);
+                Ok = Color.FromArgb(18, 133, 75);
+                Bad = Color.FromArgb(198, 46, 58);
+            }
+            else
+            {
+                Bg = Color.FromArgb(11, 13, 16);
+                Surface = Color.FromArgb(20, 24, 30);
+                Surface2 = Color.FromArgb(25, 30, 37);
+                Inset = Color.FromArgb(16, 19, 24);
+                Line = Color.FromArgb(40, 45, 53);
+                Fg = Color.FromArgb(233, 237, 242);
+                FgSoft = Color.FromArgb(182, 192, 204);
+                Muted = Color.FromArgb(125, 136, 149);
+                Faint = Color.FromArgb(92, 102, 111);
+                Accent = Color.FromArgb(240, 182, 75);
+                Ok = Color.FromArgb(76, 195, 138);
+                Bad = Color.FromArgb(242, 119, 122);
+            }
+        }
 
         public static Font Ui(float size, FontStyle style)
         {

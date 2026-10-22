@@ -564,6 +564,26 @@ namespace DshRelay
         private static extern int GetExtendedTcpTable(
             IntPtr pTcpTable, ref int pdwSize, bool bOrder, int ulAf, int tableClass, uint reserved);
 
+        /// <summary>
+        /// DSH 是否还在运行（供「随 DSH 启停」的监视线程使用）。
+        ///
+        /// 先看已知端口是否仍在监听——DSH 重启后端口可能变，端口不通时再做一次
+        /// 完整定位（较慢，所以只在需要时做）。找不到配置也当作「没在运行」。
+        /// </summary>
+        public static bool IsRunning(int knownPort)
+        {
+            try
+            {
+                if (knownPort > 0 && IsListening(knownPort)) return true;
+                DshInstance instance = Locate(null, delegate { });
+                return instance != null && instance.Port > 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         /// <summary>端口是否在本机监听。</summary>
         public static bool IsListening(int port)
         {
