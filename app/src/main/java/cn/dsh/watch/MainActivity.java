@@ -389,6 +389,28 @@ public class MainActivity extends Activity {
             ui.add(page, ui.text("点一条可直接切过去，不用重新配对。", 10, WatchUi.MUTED), 0, 10);
         }
 
+        // ---- 外观：主题与圆屏优化 ----
+        ui.divider(page);
+        ui.add(page, ui.text("外观", 11, WatchUi.MUTED), 0, 6);
+
+        boolean light = store.theme().equals(Theme.LIGHT);
+        ui.add(page, ui.row("界面主题", light ? "浅色 · 点一下切回深色" : "深色 · 点一下切到浅色",
+                () -> {
+                    store.setTheme(light ? Theme.DARK : Theme.LIGHT);
+                    WatchUi.applyTheme(store.theme());
+                    showConnect();
+                }), 0, 6);
+
+        boolean round = store.roundOptimized();
+        ui.add(page, ui.row("圆屏优化",
+                round ? "已开启 · 内容避开圆弧" : "已关闭 · 方屏可用满整屏",
+                () -> {
+                    store.setRoundOptimized(!round);
+                    WatchUi.roundOptimized = store.roundOptimized();
+                    showConnect();
+                }), 0, 10);
+        ui.add(page, ui.text("圆屏优化开启时按圆形内接矩形留边，内容不会被圆弧切掉；"
+                + "方屏手表或偏好满屏可以关掉。", 10, WatchUi.MUTED), 0, 0);
         // ---- 一键配对：手表主动找局域网里的中继，电脑上确认即可 ----
         ui.add(page, ui.button("一键配对", true, () -> startQuickPair(page)), 0, 8);
 
@@ -462,28 +484,6 @@ public class MainActivity extends Activity {
                 + "地址与令牌自动导入。也可手动填地址与配对码：局域网 IP 或公网地址（https://…）。",
                 10, WatchUi.MUTED), 0, 0);
 
-        // ---- 外观：主题与圆屏优化 ----
-        ui.divider(page);
-        ui.add(page, ui.text("外观", 11, WatchUi.MUTED), 0, 6);
-
-        boolean light = store.theme().equals(Theme.LIGHT);
-        ui.add(page, ui.row("界面主题", light ? "浅色 · 点一下切回深色" : "深色 · 点一下切到浅色",
-                () -> {
-                    store.setTheme(light ? Theme.DARK : Theme.LIGHT);
-                    WatchUi.applyTheme(store.theme());
-                    showConnect();
-                }), 0, 6);
-
-        boolean round = store.roundOptimized();
-        ui.add(page, ui.row("圆屏优化",
-                round ? "已开启 · 内容避开圆弧" : "已关闭 · 方屏可用满整屏",
-                () -> {
-                    store.setRoundOptimized(!round);
-                    WatchUi.roundOptimized = store.roundOptimized();
-                    showConnect();
-                }), 0, 10);
-        ui.add(page, ui.text("圆屏优化开启时按圆形内接矩形留边，内容不会被圆弧切掉；"
-                + "方屏手表或偏好满屏可以关掉。", 10, WatchUi.MUTED), 0, 0);
 
         render(page);
         hostField.requestFocus();
@@ -1259,9 +1259,10 @@ public class MainActivity extends Activity {
         }));
         items.add(new MenuItem("用量", "Token 与耗时", this::showUsage));
         items.add(new MenuItem("模型", "切换模型与推理强度", this::showModelPicker));
-        if (!sessionFiles.isEmpty()) {
-            items.add(new MenuItem("查看文件", sessionFiles.size() + " 个 md / 代码文件", this::showFileList));
-        }
+        // 文件列表要等会话数据回来才有，所以入口**始终显示**：点进去再按需拉取。
+        // 之前按 sessionFiles 是否为空来决定显示，而菜单在会话数据回来之前就建好了，
+        // 结果入口根本不出现（点了也永远看不到文件）。
+        items.add(new MenuItem("查看文件", "会话里出现的 md / 代码文件", this::showFileList));
         if (currentHasMore) {
             items.add(new MenuItem("看更早的内容", "往前翻历史", this::loadOlder));
         }
@@ -1806,7 +1807,28 @@ public class MainActivity extends Activity {
         onFilePage = true;
         onSessionPage = false;
         editing = true;
-        refreshFiles("");
+        refreshFiles("正在读取文件列表…");
+
+        // 主动拉一次：菜单可能在会话数据回来之前就建好了，本地缓存的 sessionFiles
+        // 此时还是空的。用当前会话的响应刷新它，再重画列表。
+        if (!store.paired() || currentSessionId.isEmpty()) {
+            refreshFiles("");
+            return;
+        }
+        api.get(baseUrl(), "/api/session?id=" + Api.urlEncode(currentSessionId), store.token(), result -> {
+            if (destroyed || !onFilePage) return;
+            if (result.ok && result.value != null) {
+                sessionFiles.clear();
+                JSONArray fileArray = result.value.optJSONArray("files");
+                if (fileArray != null) {
+                    for (int i = 0; i < fileArray.length(); i++) {
+                        Api.FileEntry entry = Api.FileEntry.from(fileArray.optJSONObject(i));
+                        if (entry != null) sessionFiles.add(entry);
+                    }
+                }
+            }
+            refreshFiles("");
+        });
     }
 
     private void refreshFiles(String hint) {
@@ -1828,17 +1850,18 @@ public class MainActivity extends Activity {
                 ui.add(page, card, 0, 6);
             }
         }
-        ui.add(page, ui.button("返回", false, () -> {
-            onFilePage = false;
-            editing = false;
-            renderSession("");
-        }), 6, 0);
-        page.setOnSwipeRight(() -> {
-            onFilePage = false;
-            editing = false;
-            renderSession("");
-        });
+        ui.add(page, ui.button("返回", false, this::backToSessionFromFiles), 6, 0);
+        page.setOnSwipeRight(this::backToSessionFromFiles);
         render(page);
+    }
+
+    /** 从文件页回到会话页：必须恢复 onSessionPage，否则会话页的静默刷新会全部被丢弃。 */
+    private void backToSessionFromFiles() {
+        onFilePage = false;
+        editing = false;
+        onSessionPage = true;
+        renderSession("");
+        loadSession(currentSessionId, false);
     }
 
     /** 打开一个文件并渲染其内容。 */
@@ -1896,11 +1919,7 @@ public class MainActivity extends Activity {
         ui.add(page, view, 0, 8);
 
         ui.add(page, ui.button("返回文件列表", false, this::showFileList), 4, 4);
-        ui.add(page, ui.button("返回会话", true, () -> {
-            onFilePage = false;
-            editing = false;
-            renderSession("");
-        }), 0, 0);
+        ui.add(page, ui.button("返回会话", true, this::backToSessionFromFiles), 0, 0);
         page.setOnSwipeRight(this::showFileList);
         render(page);
     }
