@@ -1,8 +1,8 @@
 # 构建产物（体积大，按需重新生成，不进版本库）
 # 手表安装包：scripts/build.ps1
 dist/*.apk
-# 中继桌面程序：scripts/build-app.ps1
-dist/DSH中继/
+# 中继桌面程序：scripts/build-app.ps1（-OutputDir 的临时目录同样忽略）
+dist/DSH中继*/
 # 中继命令行版：scripts/pack-relay.ps1（含 Node 运行时，单文件近 90MB）
 dist/中继命令行版/
 build/
