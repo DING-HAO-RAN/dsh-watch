@@ -38,6 +38,10 @@
 - **原生界面绝不预先摆出来**。以前它一创建就填满窗口、等 WebView2 就绪再盖上去，于是每次启动都先闪一屏旧的 WinForms 界面（用户报的「显示旧的 UI 界面」就是这个）。现在窗口里只有一个「正在启动中继…」占位标签，`EnsureFallback()` 只在浏览器确实失败时才创建原生面板——正常启动路径上根本不出现旧界面，也就不存在切换过程。
 - **关闭窗口＝收进托盘，不是退出**。`OnFormClosing` 在 `reallyClosing` 为 false 时取消关闭并 `Hide()`；真正的退出走托盘菜单「退出」。托盘图标是自绘的 `Icon`（`MakeTrayIcon`），不依赖外部 .ico。**不要改回「关闭即退出」**——「随 DSH 启动」要求程序在后台常驻。
 - **`--background` 启动时窗口收进托盘**：`Autostart` 写进注册表的命令行带这个参数，`MainForm(startHidden)` 在 `OnShown` 里 `Hide()`。开机自启不能弹窗。
+- **托盘图标必须用 `Icon.Clone()`，不能直接用 `Icon.FromHandle(bitmap.GetHicon())`**：后者是「借句柄」的包装，位图释放后图标内容失效，托盘里表现为空白或干脆不显示——这正是「开机自启后找不到程序、也没托盘」的真实原因。正确写法是 `GetHicon()` → `Icon.FromHandle` → `Clone()` → `DestroyIcon(原始句柄)`。**改图标逻辑后必须实测托盘里能看到**（用 UI Automation 打开溢出区确认存在「DSH 中继」按钮），只看 `tray.Visible == true` 不算数，它只表示调用成功。
+- **托盘必须同时绑单击与双击**：只绑 `DoubleClick` 时，Win11 把新图标收进溢出区后单击那层行为不稳定，用户会「点了没反应」。`RestoreWindow()` 里也要**先把 `WindowState` 设回 `Normal` 再 `Show()`**，否则停在最小化的窗口显示出来仍是「没打开」。
+- **托盘不可用时不隐藏窗口**：`OnShown` 里若 `tray == null || !tray.Visible` 就直接返回、保持窗口可见。否则用户既没窗口也没托盘，只能去任务管理器结束进程。
+- Windows 11 会把新的托盘图标默认收进「^」溢出区（实测本次就是），托盘图标**存在但不在任务栏可见位置**。README/使用说明要写明这一点，引导用户展开溢出区或拖到任务栏固定。
 - **开机自启写当前用户的 Run 键**（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `DshRelay`）：不需要管理员权限，删掉即取消。刻意不用启动文件夹快捷方式（出错时用户看不到任何反馈）也不用计划任务（要提权，会被企业策略拦）。
 - **「开机自启」与「随 DSH 启动」共用一个进程**：后者由 `PanelHost.StartWatchdog()` 每 5 秒问一次 `DshLocator.IsRunning(dshPortHint)`，DSH 没了就 `StopServing()`、回来就 `StartServing()`。两个都勾时先开机待命、DSH 一出现才开始服务，**绝不另起第二个实例**——两个实例会抢 19390 端口。
 - **公网默认开启**：`RelaySettings.AutoTunnel` 缺省为 `true`，`StartServing()` 起中继后在后台线程拉 cloudflared（不能阻塞启动，局域网不该等它）。老存档没有这个键时也按开启处理，否则升级上来的用户会以为功能丢了。

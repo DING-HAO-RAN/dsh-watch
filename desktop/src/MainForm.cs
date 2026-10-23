@@ -106,7 +106,6 @@ namespace DshRelay
             tray = new NotifyIcon();
             tray.Text = "DSH 中继";
             tray.Icon = MakeTrayIcon();
-            tray.Visible = true;
 
             var menu = new ContextMenuStrip();
             menu.Items.Add("打开窗口", null, delegate { RestoreWindow(); });
@@ -117,53 +116,132 @@ namespace DshRelay
                 Close();
             });
             tray.ContextMenuStrip = menu;
+            // 单击与双击都恢复窗口：Win11 把新图标收进溢出区后，单击那一层的
+            // 行为并不稳定，只绑 DoubleClick 会让用户「点了没反应」。
+            tray.MouseClick += delegate (object sender, MouseEventArgs e)
+            {
+                if (e.Button == MouseButtons.Left) RestoreWindow();
+            };
             tray.DoubleClick += delegate { RestoreWindow(); };
+
+            // 先把图标与菜单都挂好，最后再置 Visible：
+            // 反过来做的话，NotifyIcon 会在图标还没设置好时就向系统注册，
+            // 注册出来的条目可能是个空图标，用户根本认不出、也点不到。
+            tray.Visible = true;
+            StartupLog.Write("托盘图标已创建（可见=" + tray.Visible + "）");
+
+            // 首次运行时提示图标被折叠进了溢出区是常见困惑：Windows 11 默认把
+            // 新图标放进「^」里。这里不做弹窗打扰，只在日志里留一条线索。
+            try
+            {
+                StartupLog.Write("若任务栏看不到图标，请点任务栏的「^」展开隐藏的图标区，"
+                    + "并把 DSH 中继拖到任务栏上固定。");
+            }
+            catch { }
         }
 
-        /// <summary>画一个简单的托盘图标，避免依赖外部 .ico 文件。</summary>
+        /// <summary>
+        /// 画一个简单的托盘图标，避免依赖外部 .ico 文件。
+        ///
+        /// 必须返回**拥有自己数据**的图标：`Icon.FromHandle(bitmap.GetHicon())`
+        /// 拿到的是「借用」句柄的包装，位图一释放图标内容就失效，托盘里会变成
+        /// 一片空白或干脆不显示——这正是「程序在跑但托盘里找不到」的原因。
+        /// 这里用 Clone 复制成独立图标，再释放原始句柄。
+        /// </summary>
         private static Icon MakeTrayIcon()
         {
             try
             {
                 using (var bitmap = new Bitmap(32, 32))
-                using (var g = Graphics.FromImage(bitmap))
                 {
-                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-                    g.Clear(Color.Transparent);
-                    using (var ring = new Pen(Color.FromArgb(240, 182, 75), 3.2f))
+                    using (var g = Graphics.FromImage(bitmap))
                     {
-                        g.DrawEllipse(ring, 4f, 4f, 24f, 24f);
-                    }
-                    using (var hand = new Pen(Color.FromArgb(240, 182, 75), 3.2f))
-                    {
-                        g.DrawLine(hand, 16f, 16f, 16f, 9f);
-                        g.DrawLine(hand, 16f, 16f, 21.5f, 19f);
+                        g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        g.Clear(Color.Transparent);
+                        using (var ring = new Pen(Color.FromArgb(240, 182, 75), 3.2f))
+                        {
+                            g.DrawEllipse(ring, 4f, 4f, 24f, 24f);
+                        }
+                        using (var hand = new Pen(Color.FromArgb(240, 182, 75), 3.2f))
+                        {
+                            g.DrawLine(hand, 16f, 16f, 16f, 9f);
+                            g.DrawLine(hand, 16f, 16f, 21.5f, 19f);
+                        }
                     }
                     IntPtr handle = bitmap.GetHicon();
-                    return Icon.FromHandle(handle);
+                    try
+                    {
+                        using (var borrowed = Icon.FromHandle(handle))
+                        {
+                            // Clone 之后 Icon 自带数据副本，不再依赖位图与原始句柄。
+                            return (Icon)borrowed.Clone();
+                        }
+                    }
+                    finally
+                    {
+                        DestroyIcon(handle);
+                    }
                 }
             }
-            catch
+            catch (Exception error)
             {
+                StartupLog.Write("生成托盘图标失败，退回系统图标：" + error.Message);
                 // 画不出来也不能让托盘缺位，退回系统默认图标。
-                return SystemIcons.Application;
+                return (Icon)SystemIcons.Application.Clone();
             }
         }
 
+        [System.Runtime.InteropServices.DllImport("user32.dll", SetLastError = true)]
+        private static extern bool DestroyIcon(IntPtr handle);
+
         private void RestoreWindow()
         {
-            Show();
-            WindowState = FormWindowState.Normal;
-            Activate();
+            try
+            {
+                // 顺序要紧：先把状态设回 Normal 再显示。窗口若停在 Minimized，
+                // 单靠 Show() 只能得到一个最小化窗口，用户看到的仍是「没打开」。
+                if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
+                Show();
+                WindowState = FormWindowState.Normal;
+                ShowInTaskbar = true;
+                Activate();
+                BringToFront();
+                Focus();
+                StartupLog.Write("用户从托盘打开了窗口");
+            }
+            catch (Exception error)
+            {
+                StartupLog.Write("从托盘恢复窗口失败：" + error.Message);
+            }
         }
 
         protected override void OnShown(EventArgs e)
         {
             base.OnShown(e);
             if (!startHidden) return;
+            // 托盘没建起来就绝不隐藏窗口——否则用户既看不到窗口、也没有托盘可点，
+            // 只能去任务管理器结束进程。这是「打开了却什么都没有」的兜底。
+            if (tray == null || !tray.Visible)
+            {
+                StartupLog.Write("托盘不可用，保持窗口可见（否则用户将无法操作）");
+                return;
+            }
             // 开机自启不该在登录后弹窗，这里隐藏到托盘。
             StartupLog.Write("以 --background 启动，窗口收进托盘");
             Hide();
+            // 开机自启时用户看不到任何窗口，给一次气泡提示说明「我在托盘里」，
+            // 否则会以为程序没启动。只提示一次，不反复打扰。
+            try
+            {
+                if (tray != null)
+                {
+                    tray.BalloonTipTitle = "DSH 中继已在后台运行";
+                    tray.BalloonTipText = "手表可以正常连接。单击托盘图标可打开窗口，右键可退出。";
+                    tray.BalloonTipIcon = ToolTipIcon.Info;
+                    tray.ShowBalloonTip(5000);
+                }
+            }
+            catch { }
         }
 
         protected override void OnResize(EventArgs e)
@@ -595,6 +673,9 @@ namespace DshRelay
 
                 listener.Start();
                 int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+                // 登记自己的控制台端口：DSH 探测必须跳过它，否则会把自家页面
+                // 当成 DSH API（本次故障就是这么来的）。
+                DshLocator.MarkOwnPort(port);
                 string url = "http://127.0.0.1:" + port.ToString(CultureInfo.InvariantCulture) + "/";
                 log("控制台：" + url);
                 RaiseReady(url);

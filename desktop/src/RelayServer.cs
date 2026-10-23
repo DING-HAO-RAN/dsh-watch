@@ -532,6 +532,14 @@ namespace DshRelay
 
         public void Start()
         {
+            // 先确认端口没被上一次的残留占用。
+            //
+            // 中继拉起的 cloudflared 会继承监听 socket 的句柄：中继被强杀后端口
+            // 仍显示 LISTENING，但那个 PID 已经不存在，而且不会随时间释放（实测 90 秒仍在）。
+            // 这时新实例只会拿到「每个套接字地址只允许使用一次」。这里先尝试清掉
+            // 指向该端口的 cloudflared，再绑定。
+            ReleaseOrphanedPort();
+
             listener = new TcpListener(IPAddress.Any, Port);
             listener.Start();
             Running = true;
@@ -751,6 +759,82 @@ namespace DshRelay
                 bool cached;
                 return runningCache.TryGetValue(sessionId, out cached) && cached;
             }
+        }
+
+        /// <summary>
+        /// 释放端口上的残留占用者。
+        ///
+        /// 情形：上一个中继实例被强杀，但它的 cloudflared 子进程继承了监听 socket
+        /// 句柄，端口因此一直 LISTENING 在一个已不存在的 PID 上。此时新实例绑不上。
+        /// 处理方式：找出命令行里带 "--url http://127.0.0.1:&lt;端口&gt;" 的 cloudflared
+        /// 并结束它（它本来就是上一个实例的遗留），句柄随之关闭。
+        ///
+        /// 只动和我们端口匹配的 cloudflared，绝不碰别人的进程。
+        /// </summary>
+        private void ReleaseOrphanedPort()
+        {
+            if (!IsPortBusy(Port)) return;
+            log("端口 " + Port + " 仍被占用，正在清理上一次遗留的公网中转进程…");
+            try
+            {
+                foreach (var process in System.Diagnostics.Process.GetProcessesByName("cloudflared"))
+                {
+                    try
+                    {
+                        string args = CommandLineOf(process.Id);
+                        if (args == null) continue;
+                        if (args.IndexOf("127.0.0.1:" + Port, StringComparison.Ordinal) < 0) continue;
+                        log("结束遗留的 cloudflared（PID " + process.Id + "）");
+                        process.Kill();
+                        process.WaitForExit(3000);
+                    }
+                    catch { }
+                    finally { try { process.Dispose(); } catch { } }
+                }
+            }
+            catch (Exception error)
+            {
+                log("清理遗留进程失败：" + error.Message);
+            }
+            // 给系统一点时间真正关闭句柄。
+            for (int i = 0; i < 20 && IsPortBusy(Port); i++)
+            {
+                System.Threading.Thread.Sleep(150);
+            }
+        }
+
+        private static bool IsPortBusy(int port)
+        {
+            try
+            {
+                var probe = new TcpListener(IPAddress.Any, port);
+                probe.Start();
+                probe.Stop();
+                return false;
+            }
+            catch
+            {
+                return true;
+            }
+        }
+
+        /// <summary>取某个进程的命令行（失败返回 null）。</summary>
+        private static string CommandLineOf(int processId)
+        {
+            try
+            {
+                using (var searcher = new System.Management.ManagementObjectSearcher(
+                    "SELECT CommandLine FROM Win32_Process WHERE ProcessId = " + processId))
+                {
+                    foreach (System.Management.ManagementObject item in searcher.Get())
+                    {
+                        object value = item["CommandLine"];
+                        if (value != null) return Convert.ToString(value);
+                    }
+                }
+            }
+            catch { }
+            return null;
         }
 
         private readonly object runningGate = new object();

@@ -296,6 +296,31 @@ namespace DshRelay
         public static string LastPortDiagnostic = "";
 
         /// <summary>
+        /// 本进程（中继自己）正在监听的端口。
+        ///
+        /// **必须排除**：中继的控制台也在 loopback 上提供 HTTP 页面，而那个页面的
+        /// 标题就写着「DSH 中继」——正文判据（含 dsh / deepseek）会把它当成 DSH API。
+        /// 实际踩到过：探测选中了自己的控制台端口，随后所有 RPC 都 404，
+        /// 界面上表现为「连不上 DSH」，而 DSH 明明开着。
+        /// </summary>
+        private static readonly List<int> OwnPorts = new List<int>();
+
+        /// <summary>登记一个属于本进程的端口，端口探测会跳过它。</summary>
+        public static void MarkOwnPort(int port)
+        {
+            if (port <= 0) return;
+            lock (OwnPorts)
+            {
+                if (!OwnPorts.Contains(port)) OwnPorts.Add(port);
+            }
+        }
+
+        private static bool IsOwnPort(int port)
+        {
+            lock (OwnPorts) { return OwnPorts.Contains(port); }
+        }
+
+        /// <summary>
         /// 从正在运行的 DSH 进程所监听的 TCP 端口里挑一个能当 HTTP 服务用的。
         ///
         /// 通过 IP Helper API 读系统连接表（无需管理员权限，比 netstat 解析可靠），
@@ -341,6 +366,7 @@ namespace DshRelay
                 var probeLog = new StringBuilder();
                 foreach (int port in candidates)
                 {
+                    if (IsOwnPort(port)) continue;
                     if (IsDshHttp(port, probeLog))
                     {
                         LastPortDiagnostic = "按进程定位：进程 " + processIds.Count + " 个，候选端口 "
@@ -420,6 +446,7 @@ namespace DshRelay
             var probeLog = new StringBuilder();
             foreach (int port in ports)
             {
+                if (IsOwnPort(port)) continue;
                 if (IsDshHttp(port, probeLog)) return port;
             }
             return 0;
@@ -496,9 +523,16 @@ namespace DshRelay
                     }
                     catch { }
 
-                    if (body.IndexOf("dsh", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-                    if (body.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0) return true;
-                    if (body.IndexOf("harness", StringComparison.OrdinalIgnoreCase) >= 0) return true;
+                    // 正面特征：DSH 的页面里带这些标识。
+                    bool looksDsh = body.IndexOf("dsh", StringComparison.OrdinalIgnoreCase) >= 0
+                        || body.IndexOf("deepseek", StringComparison.OrdinalIgnoreCase) >= 0
+                        || body.IndexOf("harness", StringComparison.OrdinalIgnoreCase) >= 0;
+                    // 反面特征：中继自己的控制台页面也含「DSH」，靠这两个标记排除。
+                    // 只靠正文判据会把自家控制台认成 DSH（实测踩过）。
+                    bool looksRelayPanel = body.IndexOf("dsh-relay", StringComparison.OrdinalIgnoreCase) >= 0
+                        || body.IndexOf("配对码", StringComparison.Ordinal) >= 0
+                        || body.IndexOf("control-panel", StringComparison.OrdinalIgnoreCase) >= 0;
+                    if (looksDsh && !looksRelayPanel) return true;
                     if (probeLog != null)
                     {
                         string head = body.Length > 40 ? body.Substring(0, 40).Replace("\n", " ") : body;

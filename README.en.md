@@ -127,7 +127,9 @@ Enabling both does not conflict: after login the app waits in the tray, and star
 
 **Public tunnel is on by default**: "Open the public tunnel on startup" is checked out of the box, so the app starts cloudflared and gets a public address immediately — pair once and the watch works from anywhere. Turn it off if you never need access from outside your network.
 
-**Closing the window is not quitting**: the close button only tucks the app into the tray and the relay keeps serving the watch. To really quit, use "Quit" in the tray icon's right-click menu.
+**Closing the window is not quitting**: the close button only tucks the app into the tray and the relay keeps serving the watch. To really quit, use "Quit" in the tray icon's right-click menu; a single click on the icon reopens the window.
+
+**Can't find the tray icon on Windows 11?** The system files new tray icons under the taskbar's "^" overflow area by default — the app is running. Click "^" to find "DSH 中继" and drag it onto the taskbar to pin it. When started automatically, the app shows one tray balloon so you know it is running in the background.
 
 ### 6. Reading files from a session
 

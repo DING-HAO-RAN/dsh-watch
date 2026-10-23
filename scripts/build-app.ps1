@@ -124,6 +124,8 @@ try {
     $lines.Add('/reference:"System.Drawing.dll"')
     $lines.Add('/reference:"System.Windows.Forms.dll"')
     $lines.Add('/reference:"System.Web.Extensions.dll"')
+    # 端口清理要用 WMI 读别人进程的命令行（判断哪个 cloudflared 属于本端口）。
+    $lines.Add('/reference:"System.Management.dll"')
     $lines.Add('/reference:"' + $coreDll + '"')
     $lines.Add('/reference:"' + $formsDll + '"')
     # DPI 感知：不嵌这张清单，进程在 125%/150% 缩放下会被系统按位图拉伸，
