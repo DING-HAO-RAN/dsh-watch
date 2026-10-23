@@ -146,5 +146,56 @@ await check('用量统计随会话变化', async () => {
   return `输出 token 稳定为 ${String(a.json.usage.outputTokens)}`
 })
 
+await check('子任务列表', async () => {
+  const list = await call('GET', '/api/sessions')
+  // 挑一个真的派生过子任务的父会话；没有就说明这台机器上还没用过子智能体，
+  // 那是样本问题而不是功能问题，用 skip 说明而不是判失败。
+  const parent = (list.json.sessions ?? []).find((item) => Number(item.subagentCount ?? 0) > 0)
+  if (parent === undefined) return '本机没有派生过子任务的会话，跳过'
+  expect(parent.subagent === false, '父会话不该被标成子代理')
+
+  const { json } = await call('GET', `/api/subagents?id=${encodeURIComponent(String(parent.id))}`)
+  expect(json.ok === true, '子任务列表失败')
+  expect(Array.isArray(json.subagents), 'subagents 不是数组')
+  expect(json.subagents.length > 0, '父会话标了子任务但列表为空')
+  for (const item of json.subagents) {
+    expect(typeof item.id === 'string' && item.id !== '', '子任务缺少 id')
+    expect(typeof item.label === 'string' && item.label !== '', '子任务缺少 label')
+    expect(['running', 'done', 'idle', 'failed'].includes(item.state), `未知状态：${String(item.state)}`)
+    expect(typeof item.settledMs === 'number', '缺少 settledMs')
+  }
+
+  // 子任务的对话必须能读出来：DSH 要求用「父地址 + 子地址」，用错地址会报
+  // subagent Sessions require their durable parent address。
+  const child = json.subagents[0]
+  const detail = await call('GET', `/api/session?id=${encodeURIComponent(String(child.id))}`)
+  expect(detail.json.ok === true, `子任务对话读取失败：${String(detail.json.error)}`)
+  expect(Array.isArray(detail.json.steps), '子任务对话缺少 steps')
+  const states = json.subagents.map((item) => item.state).join(',')
+  return `${String(json.subagents.length)} 个子任务（${states}），首个对话 ${String(detail.json.steps.length)} 步`
+})
+
+await check('计划与任务块', async () => {
+  expect(sessionId !== '', '缺少样本会话')
+  const { json } = await call('GET', `/api/session?id=${encodeURIComponent(sessionId)}`)
+  const plan = json.plan
+  expect(plan !== null && typeof plan === 'object', 'plan 块缺失')
+  expect(Array.isArray(plan.todos), 'plan.todos 不是数组')
+  expect(typeof plan.mode === 'object' && plan.mode !== null, 'plan.mode 缺失')
+  expect(typeof plan.mode.active === 'boolean', 'plan.mode.active 不是布尔')
+  expect(typeof plan.team === 'object' && plan.team !== null, 'plan.team 缺失')
+  expect(Array.isArray(plan.team.members), 'plan.team.members 不是数组')
+  expect(Array.isArray(plan.team.tasks), 'plan.team.tasks 不是数组')
+  for (const todo of plan.todos) {
+    expect(typeof todo.content === 'string' && todo.content !== '', '待办缺少 content')
+    expect(['pending', 'in_progress', 'completed'].includes(todo.status), `未知待办状态：${String(todo.status)}`)
+  }
+  for (const task of plan.team.tasks) {
+    expect(typeof task.subject === 'string' && task.subject !== '', '任务缺少 subject')
+    expect(['pending', 'in_progress', 'completed'].includes(task.status), `未知任务状态：${String(task.status)}`)
+  }
+  return `待办 ${String(plan.todos.length)} 条、成员 ${String(plan.team.members.length)} 个、任务 ${String(plan.team.tasks.length)} 条`
+})
+
 process.stdout.write(`\n结果：${String(passed)} 通过 / ${String(failed)} 失败\n`)
 setTimeout(() => { process.exit(failed === 0 ? 0 : 1) }, 150)

@@ -211,6 +211,13 @@ final class Api {
         String provider = "";
         String model = "";
         String effort = "";
+        /** 子代理的父会话 id；普通会话为空。 */
+        String parentId = "";
+        /** 子代理自己的名字（continuable 模式必有）。 */
+        String subagentLabel = "";
+        /** 这个会话派生出的子任务总数与其中正在跑的数量。 */
+        int subagentCount;
+        int subagentRunning;
 
         /** 列表页的副标题：状态 + 相对时间。 */
         String subtitle() {
@@ -221,6 +228,172 @@ final class Api {
             if (updatedAt > 0) builder.append(" · ").append(relativeTime(updatedAt));
             if (subagent) builder.append(" · 子任务");
             return builder.toString();
+        }
+
+        /** 子任务提示：有子任务时单独一行，正在跑的要显眼。 */
+        String subagentHint() {
+            if (subagentCount <= 0) return "";
+            if (subagentRunning > 0) return subagentRunning + " 个子任务在跑";
+            return subagentCount + " 个子任务";
+        }
+    }
+
+    /** 一个子智能体（父会话派生的子会话）。 */
+    static final class Subagent {
+        String id = "";
+        String label = "";
+        /** running / done / idle / failed。 */
+        String state = "done";
+        boolean running;
+        /** 已跑时长（毫秒）。 */
+        long settledMs;
+        long turns;
+        long steps;
+        long updatedAt;
+
+        /** 状态的中文名。 */
+        String stateText() {
+            if ("running".equals(state)) return "运行中";
+            if ("idle".equals(state)) return "空闲";
+            if ("failed".equals(state)) return "失败";
+            return "已完成";
+        }
+
+        /** 状态对应的颜色：运行中醒目、失败报警、其余淡化。 */
+        int stateColor() {
+            if ("running".equals(state)) return WatchUi.ACCENT;
+            if ("failed".equals(state)) return WatchUi.DANGER;
+            if ("idle".equals(state)) return WatchUi.MUTED;
+            return WatchUi.OK;
+        }
+
+        /** 副标题：状态 · 耗时 · 轮/步。 */
+        String subtitle() {
+            StringBuilder builder = new StringBuilder(stateText());
+            if (settledMs > 0) builder.append(" · ").append(duration(settledMs));
+            if (turns > 0) builder.append(" · ").append(turns).append(" 轮");
+            if (steps > 0) builder.append(" ").append(steps).append(" 步");
+            return builder.toString();
+        }
+    }
+
+    /** 毫秒压成「3.2 秒」「2 分 5 秒」；子任务耗时都走这里。 */
+    static String duration(long ms) {
+        if (ms <= 0) return "—";
+        if (ms < 1000) return ms + " 毫秒";
+        if (ms < 60_000) return String.format(java.util.Locale.US, "%.1f", ms / 1000.0) + " 秒";
+        long totalSeconds = Math.round(ms / 1000.0);
+        return (totalSeconds / 60) + " 分 " + (totalSeconds % 60) + " 秒";
+    }
+
+    /** 计划里的一个待办项。 */
+    static final class Todo {
+        String content = "";
+        /** pending / in_progress / completed。 */
+        String status = "pending";
+
+        String statusText() {
+            if ("completed".equals(status)) return "已完成";
+            if ("in_progress".equals(status)) return "进行中";
+            return "待办";
+        }
+
+        int statusColor() {
+            if ("completed".equals(status)) return WatchUi.OK;
+            if ("in_progress".equals(status)) return WatchUi.WARN;
+            return WatchUi.MUTED;
+        }
+    }
+
+    /** 团队成员。 */
+    static final class Member {
+        String name = "";
+        /** lead / teammate。 */
+        String role = "teammate";
+        /** provisioning / active / failed。 */
+        String phase = "active";
+        String error = "";
+
+        String phaseText() {
+            if ("provisioning".equals(phase)) return "启动中";
+            if ("failed".equals(phase)) return "失败";
+            return "在线";
+        }
+
+        int phaseColor() {
+            if ("failed".equals(phase)) return WatchUi.DANGER;
+            if ("provisioning".equals(phase)) return WatchUi.WARN;
+            return WatchUi.OK;
+        }
+    }
+
+    /** 团队任务板上的一条任务。 */
+    static final class TeamTask {
+        String id = "";
+        String subject = "";
+        /** pending / in_progress / completed。 */
+        String status = "pending";
+        String owner = "";
+        boolean ready;
+        int blockedBy;
+
+        String statusText() {
+            if ("completed".equals(status)) return "已完成";
+            if ("in_progress".equals(status)) return "进行中";
+            return "待办";
+        }
+
+        int statusColor() {
+            if ("completed".equals(status)) return WatchUi.OK;
+            if ("in_progress".equals(status)) return WatchUi.WARN;
+            return WatchUi.MUTED;
+        }
+    }
+
+    /** 长目标。 */
+    static final class Goal {
+        String objective = "";
+        /** active / paused / blocked / complete。 */
+        String phase = "active";
+        long rounds;
+        long maxRounds;
+        String blockedReason = "";
+
+        String phaseText() {
+            if ("paused".equals(phase)) return "已暂停";
+            if ("blocked".equals(phase)) return "受阻";
+            if ("complete".equals(phase)) return "已完成";
+            return "进行中";
+        }
+
+        int phaseColor() {
+            if ("blocked".equals(phase)) return WatchUi.DANGER;
+            if ("paused".equals(phase)) return WatchUi.WARN;
+            if ("complete".equals(phase)) return WatchUi.OK;
+            return WatchUi.ACCENT;
+        }
+
+        /** 轮次说明，没有上限时只显示已用轮数。 */
+        String roundsText() {
+            if (maxRounds <= 0) return rounds > 0 ? "已进行 " + rounds + " 轮" : "";
+            return "第 " + Math.min(rounds + 1, maxRounds) + " / " + maxRounds + " 轮";
+        }
+    }
+
+    /** 一个会话的「计划与任务」：待办、计划模式、团队、目标。 */
+    static final class Plan {
+        final List<Todo> todos = new ArrayList<>();
+        final List<Member> members = new ArrayList<>();
+        final List<TeamTask> tasks = new ArrayList<>();
+        Goal goal;
+        boolean planActive;
+        boolean planPending;
+        /** 这个会话自己就是子代理时的名字。 */
+        String subagentLabel = "";
+
+        /** 四块内容全空时界面显示空态。 */
+        boolean isEmpty() {
+            return todos.isEmpty() && members.isEmpty() && tasks.isEmpty() && goal == null && !planActive && !planPending;
         }
     }
 
@@ -405,6 +578,10 @@ final class Api {
             session.provider = text(item, "provider");
             session.model = text(item, "model");
             session.effort = text(item, "effort");
+            session.parentId = text(item, "parentId");
+            session.subagentLabel = text(item, "subagentLabel");
+            session.subagentCount = item.optInt("subagentCount", 0);
+            session.subagentRunning = item.optInt("subagentRunning", 0);
             if (!session.id.isEmpty()) sessions.add(session);
         }
         return sessions;
@@ -441,12 +618,118 @@ final class Api {
                     session.provider = text(raw, "provider");
                     session.model = text(raw, "model");
                     session.effort = text(raw, "effort");
+                    session.parentId = text(raw, "parentId");
+                    session.subagentLabel = text(raw, "subagentLabel");
+                    session.subagentCount = raw.optInt("subagentCount", 0);
+                    session.subagentRunning = raw.optInt("subagentRunning", 0);
                     if (!session.id.isEmpty()) project.sessions.add(session);
                 }
             }
             if (!project.project.isEmpty()) projects.add(project);
         }
         return projects;
+    }
+
+    /** 解析一个会话派生的子任务列表。 */
+    static List<Subagent> parseSubagents(JSONObject root) {
+        List<Subagent> subagents = new ArrayList<>();
+        JSONArray array = root == null ? null : root.optJSONArray("subagents");
+        if (array == null) return subagents;
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item == null) continue;
+            Subagent subagent = new Subagent();
+            subagent.id = text(item, "id");
+            subagent.label = text(item, "label");
+            subagent.state = text(item, "state");
+            if (subagent.state.isEmpty()) subagent.state = "done";
+            subagent.running = item.optBoolean("running", false);
+            subagent.settledMs = item.optLong("settledMs", 0L);
+            subagent.turns = item.optLong("turns", 0L);
+            subagent.steps = item.optLong("steps", 0L);
+            subagent.updatedAt = item.optLong("updatedAt", 0L);
+            if (subagent.label.isEmpty()) subagent.label = "子任务";
+            if (!subagent.id.isEmpty()) subagents.add(subagent);
+        }
+        return subagents;
+    }
+
+    /** 解析会话的「计划与任务」块；字段缺失时返回空计划，界面据此显示空态。 */
+    static Plan parsePlan(JSONObject root) {
+        Plan plan = new Plan();
+        JSONObject value = root == null ? null : root.optJSONObject("plan");
+        if (value == null) return plan;
+
+        JSONArray todos = value.optJSONArray("todos");
+        if (todos != null) {
+            for (int i = 0; i < todos.length(); i++) {
+                JSONObject item = todos.optJSONObject(i);
+                if (item == null) continue;
+                Todo todo = new Todo();
+                todo.content = text(item, "content");
+                todo.status = text(item, "status");
+                if (todo.status.isEmpty()) todo.status = "pending";
+                if (!todo.content.isEmpty()) plan.todos.add(todo);
+            }
+        }
+
+        JSONObject mode = value.optJSONObject("mode");
+        if (mode != null) {
+            plan.planActive = mode.optBoolean("active", false);
+            plan.planPending = mode.optBoolean("pending", false);
+        }
+
+        JSONObject team = value.optJSONObject("team");
+        if (team != null) {
+            JSONArray members = team.optJSONArray("members");
+            if (members != null) {
+                for (int i = 0; i < members.length(); i++) {
+                    JSONObject item = members.optJSONObject(i);
+                    if (item == null) continue;
+                    Member member = new Member();
+                    member.name = text(item, "name");
+                    member.role = text(item, "role");
+                    if (member.role.isEmpty()) member.role = "teammate";
+                    member.phase = text(item, "phase");
+                    if (member.phase.isEmpty()) member.phase = "active";
+                    member.error = text(item, "error");
+                    if (!member.name.isEmpty()) plan.members.add(member);
+                }
+            }
+            JSONArray tasks = team.optJSONArray("tasks");
+            if (tasks != null) {
+                for (int i = 0; i < tasks.length(); i++) {
+                    JSONObject item = tasks.optJSONObject(i);
+                    if (item == null) continue;
+                    TeamTask task = new TeamTask();
+                    task.id = text(item, "id");
+                    task.subject = text(item, "subject");
+                    task.status = text(item, "status");
+                    if (task.status.isEmpty()) task.status = "pending";
+                    task.owner = text(item, "owner");
+                    task.ready = item.optBoolean("ready", false);
+                    JSONArray blocked = item.optJSONArray("blockedBy");
+                    task.blockedBy = blocked == null ? 0 : blocked.length();
+                    if (!task.subject.isEmpty()) plan.tasks.add(task);
+                }
+            }
+        }
+
+        JSONObject goal = value.optJSONObject("goal");
+        if (goal != null) {
+            Goal parsed = new Goal();
+            parsed.objective = text(goal, "objective");
+            parsed.phase = text(goal, "phase");
+            if (parsed.phase.isEmpty()) parsed.phase = "active";
+            parsed.rounds = goal.optLong("rounds", 0L);
+            parsed.maxRounds = goal.optLong("maxRounds", 0L);
+            parsed.blockedReason = text(goal, "blockedReason");
+            if (!parsed.objective.isEmpty()) plan.goal = parsed;
+        }
+
+        JSONObject subagent = value.optJSONObject("subagent");
+        if (subagent != null) plan.subagentLabel = text(subagent, "label");
+        return plan;
     }
 
     /** 解析会话里的步骤序列（含工具调用与结果）。 */

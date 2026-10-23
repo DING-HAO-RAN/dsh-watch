@@ -95,6 +95,15 @@
 - DSH 在新客户端接入事件流时会重放所有待处理事件；中继据此在「有会话运行但看不到提问」时重连补齐。
 - 会话事件里混有大量系统注入的 `user/message`（时间上下文、记忆快照、指令），只保留 `source.kind` 为 `user` / `user-question-reply` 的才是真人消息。
 
+## 子智能体与计划任务
+
+- **子代理会话的历史必须用「父地址 + 子地址」读**：对 `origin == "subagent"` 的会话用普通 `{kind:'session'}` 地址调 `session/page` 会直接报错 `subagent Sessions require their durable parent address`。正确形状是 `{kind:'subagent', parentSessionId, childSessionId, mode}`（`mode` 取 `values.subagent.mode`，缺省 `continuable`）。`session/projections` 不受影响，仍只用 `sessionId`。这是「查看子智能体对话」唯一的坑，两端中继都在 `Session()` / `readSession()` 里按 `parentSessionId` 是否为空选地址。
+- **子代理与计划数据全在 `session/list` 的每个条目里**（`item.projections.values`），不需要额外 RPC：`subagent{mode,label}`、`subagentTiming{settledMs,active,lastTurnCompleted}`、`subagentCatalog[]`、`todos[{content,status}]`、`plan{active,pending}`、`agentTeam{members[{name,role,phase}],tasks[{subject,status,ownerName,ready,blockedBy}]}`、`goal{goal{objective,phase,maxGoalRounds},roundsStarted}`。**逐个会话拉投影来凑这些数据会慢到不可用**（实测 499 个子代理）。
+- **列表截断必须发生在过滤之后**。子代理动辄数百条且 `updatedAt` 很新，先 `slice(0, 60)` 再筛父会话，父会话会被子代理整体挤出列表。`normalizeSessionList` 因此把 `limit` 交给调用方（`0` = 不截断），`/api/sessions` 先全量再过滤再截断，`/api/subagents` 完全不截断。
+- 子代理状态四档按此顺序判定，不要重排：`running` → `running`；`lastTurnCompleted` → `done`；`agentAvailable` → `idle`；否则 `done`。
+- 子任务列表的入口只在**会话页**（父会话左滑菜单「子任务」），不在项目/会话列表平铺——498 个子会话会把手表首屏淹掉。会话列表里用 `subagentCount`/`subagentRunning` 在副标题上提示「N 个子任务在跑」即可。
+- 子任务对话**复用普通会话页**（子会话与普通会话同构），因此「返回」要按进入路径决定去向：`sessionReturnTo` 为 `subagents` 时回子任务列表，否则回项目列表。进过子任务对话后 `currentSessionId` 已指向子会话，回父会话时必须显式恢复 id，**且不要把子会话写进 `lastSession`**——否则下次启动会直接把用户丢进一个子代理的历史里。
+
 ## 构建
 
 - 环境变量用 `JAVA_HOME` / `ANDROID_HOME` / `WATCH_BUILD_ROOT` 指定，**不要把本机路径写进仓库**。
@@ -115,6 +124,8 @@
 - 标题必须单行（`WatchUi.headingView` 已设 `setSingleLine`）。圆屏可视高度只有三百多像素，标题一旦折成两三行，按钮和内容区就被挤出屏幕、整页也滚不动。截断用 `clipLine`（只加省略号），**不要用 `cut`**（它会插入换行，等于把标题变成两行）。
 - **绝不能让「渲染 → 发请求 → 回调再渲染」形成环**。列表页曾经如此：`showSessionList()` 里发请求，回调又调 `showSessionList()`，屏幕每轮都重建、持续上下抽动。现在的分工是：`showSessionList()` 只在进入页面时调用一次，回调一律走 `renderSessionListPage()`（只重绘、不发请求）。
 - 界面用「重建整屏」的方式刷新，因此**滚动位置由 `render()` 统一保留**，换页时才调 `resetScroll()` 回顶部。会话页（4 秒）与会话列表（10 秒）都会定时刷新，不做这件事用户就翻不动列表和长对话。
+- **进入任何新页面都必须先 `resetScroll()`**：`render()` 默认沿用上一页的滚动位置，从长对话点进子任务页或计划页时，新页面会停在中间、连标题都被带出屏幕（实测）。子任务页、计划页在 `show*()` 里都显式调了它；只有同页重绘（定时刷新）才不调。
+- **列表的定时刷新与响应回调一律用 `onListPage()` 判断，不要只判 `onSessionPage`**。文件页、子任务页、计划页都会把 `onSessionPage` 置 false，只判它的话列表刷新一到就会把这几页整屏覆盖掉——文件页长期存在这个问题，现在统一走 `onListPage()`（要求四个页面标记全为 false）。
 - 刷新前先比对**内容指纹**，没变化就直接返回。定时刷新还额外受两道闸约束：用户刚触摸过（2.5 秒静默期）、或正在编辑时跳过。
 - **需要用户停留的页面**（发消息、打字回答、选项答题）必须先置 `editing = true` 暂停自动刷新，否则刚打开的界面会被立刻换掉。
 - 服务端 JSON 的文案字段可能显式为 `null`；`org.json` 的 `optString(key, default)` 遇 null 会返回 null，必须经 `Api.text(...)` 兜底，否则界面会崩。

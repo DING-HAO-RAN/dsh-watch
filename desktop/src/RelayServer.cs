@@ -928,6 +928,7 @@ namespace DshRelay
             try
             {
                 if (path == "/api/sessions" && request.Method == "GET") return Sessions();
+                if (path == "/api/subagents" && request.Method == "GET") return Subagents(request);
                 if (path == "/api/session" && request.Method == "GET") return Session(request);
                 if (path == "/api/file" && request.Method == "GET") return FileView(request);
                 if (path == "/api/send" && request.Method == "POST") return Send(request);
@@ -1041,41 +1042,78 @@ namespace DshRelay
                 StartupLog.Write("session/list 返回的字段：" + string.Join(", ", new List<string>(value.Keys).ToArray()));
             }
 
-            var sessions = new List<object>();
-            var projects = new Dictionary<string, Dictionary<string, object>>();
             var items = ListField(value, "items");
 
+            // 先把**全部**条目（含子代理）归一化：子代理条目本身就带着父会话 id、
+            // 状态与耗时，统计与 /api/subagents 都从这份全量里取，不必再发 RPC。
+            var all = new List<object>();
             if (items != null)
             {
                 foreach (var raw in items)
                 {
                     var item = raw as Dictionary<string, object>;
                     if (item == null) continue;
-                    string origin = GetString(item, "origin");
-                    if (origin == "subagent") continue;
-
-                    var session = NormalizeSession(item);
-                    sessions.Add(session);
-                    if (sessions.Count >= MaxSessions) break;
-
-                    string project = Convert.ToString(session["project"]);
-                    if (!projects.ContainsKey(project))
-                    {
-                        var group = new Dictionary<string, object>();
-                        group["project"] = project;
-                        group["path"] = session["projectPath"];
-                        group["sessions"] = new List<object>();
-                        group["running"] = 0;
-                        group["waiting"] = 0;
-                        group["updatedAt"] = 0L;
-                        projects[project] = group;
-                    }
-                    ((List<object>)projects[project]["sessions"]).Add(session);
-                    if (Convert.ToBoolean(session["running"])) projects[project]["running"] = Convert.ToInt32(projects[project]["running"]) + 1;
-                    if (Convert.ToBoolean(session["waiting"])) projects[project]["waiting"] = Convert.ToInt32(projects[project]["waiting"]) + 1;
-                    long updated = Convert.ToInt64(session["updatedAt"]);
-                    if (updated > Convert.ToInt64(projects[project]["updatedAt"])) projects[project]["updatedAt"] = updated;
+                    all.Add(NormalizeSession(item));
                 }
+            }
+
+            // 统计每个会话派生了几个子代理：键是父会话 id，值固定为 [总数, 运行中数]。
+            var counts = new Dictionary<string, int[]>();
+            foreach (var raw in all)
+            {
+                var child = raw as Dictionary<string, object>;
+                if (child == null) continue;
+                if (!Convert.ToBoolean(child["subagent"])) continue;
+                string parentId = Convert.ToString(child["parentId"]);
+                if (parentId.Length == 0) continue;
+                int[] entry;
+                if (!counts.TryGetValue(parentId, out entry))
+                {
+                    entry = new int[2];
+                    counts[parentId] = entry;
+                }
+                entry[0] = entry[0] + 1;
+                if (Convert.ToBoolean(child["running"])) entry[1] = entry[1] + 1;
+            }
+
+            var sessions = new List<object>();
+            var projects = new Dictionary<string, Dictionary<string, object>>();
+
+            foreach (var raw in all)
+            {
+                var session = raw as Dictionary<string, object>;
+                if (session == null) continue;
+                // 子代理不进列表，只作为父会话的计数来源。
+                if (Convert.ToBoolean(session["subagent"])) continue;
+                if (sessions.Count >= MaxSessions) break;
+
+                string sessionId = Convert.ToString(session["id"]);
+                int[] entry;
+                if (sessionId.Length > 0 && counts.TryGetValue(sessionId, out entry))
+                {
+                    session["subagentCount"] = entry[0];
+                    session["subagentRunning"] = entry[1];
+                }
+
+                sessions.Add(session);
+
+                string project = Convert.ToString(session["project"]);
+                if (!projects.ContainsKey(project))
+                {
+                    var group = new Dictionary<string, object>();
+                    group["project"] = project;
+                    group["path"] = session["projectPath"];
+                    group["sessions"] = new List<object>();
+                    group["running"] = 0;
+                    group["waiting"] = 0;
+                    group["updatedAt"] = 0L;
+                    projects[project] = group;
+                }
+                ((List<object>)projects[project]["sessions"]).Add(session);
+                if (Convert.ToBoolean(session["running"])) projects[project]["running"] = Convert.ToInt32(projects[project]["running"]) + 1;
+                if (Convert.ToBoolean(session["waiting"])) projects[project]["waiting"] = Convert.ToInt32(projects[project]["waiting"]) + 1;
+                long updated = Convert.ToInt64(session["updatedAt"]);
+                if (updated > Convert.ToInt64(projects[project]["updatedAt"])) projects[project]["updatedAt"] = updated;
             }
 
             var projectList = new List<object>(projects.Values);
@@ -1093,6 +1131,86 @@ namespace DshRelay
             return Http.Json(200, top);
         }
 
+        /// <summary>
+        /// 列出某个会话派生的全部子代理。
+        ///
+        /// 数据全部来自一次 `session/list`（每个条目自带 projections.values），
+        /// 不逐个拉投影：子代理动辄数百条，逐个发 RPC 会慢到不可用。
+        /// </summary>
+        private Http.Response Subagents(Http.Request request)
+        {
+            string id = request.Query.ContainsKey("id") ? request.Query["id"] : "";
+            if (string.IsNullOrEmpty(id)) return Http.Json(400, Simple("缺少 id 参数"));
+
+            var args = new Dictionary<string, object>();
+            args["_request"] = new Dictionary<string, object>();
+            var value = dsh.Rpc("session/list", args) as Dictionary<string, object>;
+
+            var list = new List<object>();
+            var items = ListField(value, "items");
+            if (items != null)
+            {
+                foreach (var raw in items)
+                {
+                    var item = raw as Dictionary<string, object>;
+                    if (item == null) continue;
+                    if (GetString(item, "parentSessionId") != id) continue;
+
+                    var values = Dig(item, "projections", "values");
+                    var identity = Dig(values, "subagent");
+                    var timing = Dig(values, "subagentTiming");
+
+                    string title = GetString(values, "title");
+                    // 子代理不一定有 label（one-shot 模式），退回会话标题。
+                    string label = GetString(identity, "label");
+                    if (label.Length == 0) label = title;
+                    if (label.Length == 0) label = "子任务";
+
+                    bool running = GetBool(item, "running");
+                    bool completed = GetBool(timing, "lastTurnCompleted");
+                    bool agentAvailable = GetBool(item, "agentAvailable");
+
+                    // 顺序不能变：运行中优先，其次已结束，再看是否可继续对话。
+                    string state;
+                    if (running) state = "running";
+                    else if (completed) state = "done";
+                    else if (agentAvailable) state = "idle";
+                    else state = "done";
+
+                    var entry = new Dictionary<string, object>();
+                    entry["id"] = GetString(item, "sessionId");
+                    entry["label"] = label;
+                    entry["title"] = title;
+                    entry["mode"] = GetString(identity, "mode");
+                    entry["state"] = state;
+                    entry["running"] = running;
+                    entry["settledMs"] = GetLong(timing, "settledMs");
+                    entry["active"] = timing != null && timing.ContainsKey("active") && timing["active"] != null;
+                    entry["completed"] = completed;
+                    entry["updatedAt"] = GetLong(item, "updatedAt");
+                    entry["turns"] = GetLong(Dig(values, "sessionStats"), "turns");
+                    entry["steps"] = GetLong(Dig(values, "sessionStats"), "steps");
+                    list.Add(entry);
+                }
+            }
+
+            list.Sort(delegate (object a, object b)
+            {
+                var left = (Dictionary<string, object>)a;
+                var right = (Dictionary<string, object>)b;
+                bool leftRunning = Convert.ToBoolean(left["running"]);
+                bool rightRunning = Convert.ToBoolean(right["running"]);
+                if (leftRunning != rightRunning) return leftRunning ? -1 : 1;
+                return Convert.ToInt64(right["updatedAt"]).CompareTo(Convert.ToInt64(left["updatedAt"]));
+            });
+
+            var result = new Dictionary<string, object>();
+            result["ok"] = true;
+            result["parentId"] = id;
+            result["subagents"] = list;
+            return Http.Json(200, result);
+        }
+
         private Dictionary<string, object> NormalizeSession(Dictionary<string, object> item)
         {
             var values = Dig(item, "projections", "values");
@@ -1103,6 +1221,12 @@ namespace DshRelay
             var model = values != null && values.ContainsKey("modelSelection")
                 ? values["modelSelection"] as Dictionary<string, object> : null;
             var next = model != null && model.ContainsKey("next") ? model["next"] as Dictionary<string, object> : null;
+
+            string origin = GetString(item, "origin");
+            // subagent 与 subagentTiming 都是投影里的可选块：不存在时 Dig 返回 null，
+            // 下面的取值helper 会退化成空串/0，不会抛异常。
+            var identity = Dig(values, "subagent");
+            var timing = Dig(values, "subagentTiming");
 
             var session = new Dictionary<string, object>();
             session["id"] = GetString(item, "sessionId");
@@ -1115,7 +1239,22 @@ namespace DshRelay
             session["provider"] = GetString(next, "provider");
             session["model"] = GetString(next, "model");
             session["effort"] = GetString(next, "reasoningEffort");
-            session["subagent"] = false;
+            session["subagent"] = origin == "subagent";
+            // 子代理会话靠 parentSessionId 挂回父会话；普通会话为空串。
+            session["parentId"] = GetString(item, "parentSessionId");
+            session["subagentLabel"] = GetString(identity, "label");
+            session["subagentMode"] = GetString(identity, "mode");
+            session["agentAvailable"] = GetBool(item, "agentAvailable");
+            // settledMs 是已跑时长；active 存在（哪怕值为 false）就表示这一轮仍在跑。
+            session["settledMs"] = GetLong(timing, "settledMs");
+            session["active"] = timing != null && timing.ContainsKey("active") && timing["active"] != null;
+            session["completed"] = GetBool(timing, "lastTurnCompleted");
+            // 派生的子代理数量由 Sessions() 汇总后回填。
+            session["subagentCount"] = 0;
+            session["subagentRunning"] = 0;
+            // 子任务列表要显示工作量：轮次与步数来自会话统计投影。
+            session["turns"] = GetLong(Dig(values, "sessionStats"), "turns");
+            session["steps"] = GetLong(Dig(values, "sessionStats"), "steps");
             return session;
         }
 
@@ -1151,9 +1290,7 @@ namespace DshRelay
 
             var pageArgs = new Dictionary<string, object>();
             var pageRequest = new Dictionary<string, object>();
-            var address = new Dictionary<string, object>();
-            address["kind"] = "session";
-            address["sessionId"] = id;
+            var address = SessionAddress(id);
             pageRequest["address"] = address;
             pageRequest["throughSeq"] = through;
             pageRequest["maxMessages"] = MaxMessages;
@@ -1176,11 +1313,182 @@ namespace DshRelay
             result["messages"] = Steps.NormalizeMessages(records);
             result["steps"] = Steps.NormalizeSteps(records);
             result["usage"] = Usage.Normalize(values);
+            result["plan"] = NormalizePlan(values);
 
             var question = ActiveQuestion(values);
             if (question != null) result["question"] = question;
             result["files"] = StepFiles(records);
             return Http.Json(200, result);
+        }
+
+        /// <summary>
+        /// 拼出读历史用的会话地址。
+        ///
+        /// 子代理会话**必须**用「父地址 + 子地址」，否则 DSH 直接拒绝：
+        /// `session/page: subagent Sessions require their durable parent address`。
+        /// 父会话 id 与子代理模式只能从 `session/list` 里取（投影里没有父 id），
+        /// 因此这里多一次 list 调用；查不到该条目时按普通会话处理，不报错。
+        /// </summary>
+        private Dictionary<string, object> SessionAddress(string id)
+        {
+            var address = new Dictionary<string, object>();
+
+            string parentId = "";
+            string mode = "";
+            var args = new Dictionary<string, object>();
+            args["_request"] = new Dictionary<string, object>();
+            var listValue = dsh.RpcSafe("session/list", args) as Dictionary<string, object>;
+            var items = ListField(listValue, "items");
+            if (items != null)
+            {
+                foreach (var raw in items)
+                {
+                    var item = raw as Dictionary<string, object>;
+                    if (item == null) continue;
+                    if (GetString(item, "sessionId") != id) continue;
+                    parentId = GetString(item, "parentSessionId");
+                    mode = GetString(Dig(Dig(item, "projections", "values"), "subagent"), "mode");
+                    break;
+                }
+            }
+
+            if (parentId.Length > 0)
+            {
+                address["kind"] = "subagent";
+                address["parentSessionId"] = parentId;
+                address["childSessionId"] = id;
+                // one-shot 的子代理没有 subagent 块；continuable 是默认模式。
+                address["mode"] = mode.Length == 0 ? "continuable" : mode;
+            }
+            else
+            {
+                address["kind"] = "session";
+                address["sessionId"] = id;
+            }
+            return address;
+        }
+
+        /// <summary>
+        /// 把一个会话的「计划与任务」压成手表要的结构。
+        ///
+        /// 四块内容来源不同、含义也不同，不要混为一谈：
+        /// - todos：todo_write 产生的待办清单，是真正会逐项勾选的东西；
+        /// - plan：只是「计划模式」的开关状态（active/pending 两个布尔），没有正文；
+        /// - team：Agent Teams 的成员与任务板（谁负责、什么状态、被谁阻塞）；
+        /// - goal：长目标（objective + phase），只在有目标时存在。
+        /// </summary>
+        private static Dictionary<string, object> NormalizePlan(Dictionary<string, object> values)
+        {
+            var todos = new List<object>();
+            var rawTodos = ListField(values, "todos");
+            if (rawTodos != null)
+            {
+                foreach (var raw in rawTodos)
+                {
+                    var todo = raw as Dictionary<string, object>;
+                    if (todo == null) continue;
+                    string content = GetString(todo, "content");
+                    if (content.Length == 0) continue;
+                    var entry = new Dictionary<string, object>();
+                    entry["content"] = content;
+                    string status = GetString(todo, "status");
+                    entry["status"] = status.Length == 0 ? "pending" : status;
+                    todos.Add(entry);
+                }
+            }
+
+            var mode = new Dictionary<string, object>();
+            var planMode = Dig(values, "plan");
+            mode["active"] = GetBool(planMode, "active");
+            mode["pending"] = GetBool(planMode, "pending");
+
+            var team = Dig(values, "agentTeam");
+            var members = new List<object>();
+            var rawMembers = ListField(team, "members");
+            if (rawMembers != null)
+            {
+                foreach (var raw in rawMembers)
+                {
+                    var member = raw as Dictionary<string, object>;
+                    if (member == null) continue;
+                    string name = GetString(member, "name");
+                    if (name.Length == 0) continue;
+                    var entry = new Dictionary<string, object>();
+                    entry["name"] = name;
+                    string role = GetString(member, "role");
+                    entry["role"] = role.Length == 0 ? "teammate" : role;
+                    string phase = GetString(member, "phase");
+                    entry["phase"] = phase.Length == 0 ? "active" : phase;
+                    entry["error"] = GetString(member, "error");
+                    members.Add(entry);
+                }
+            }
+
+            var tasks = new List<object>();
+            var rawTasks = ListField(team, "tasks");
+            if (rawTasks != null)
+            {
+                foreach (var raw in rawTasks)
+                {
+                    var task = raw as Dictionary<string, object>;
+                    if (task == null) continue;
+                    string status = GetString(task, "status");
+                    if (status == "deleted") continue;
+                    string subject = GetString(task, "subject");
+                    if (subject.Length == 0) continue;
+
+                    var entry = new Dictionary<string, object>();
+                    entry["id"] = GetString(task, "id");
+                    entry["subject"] = subject;
+                    entry["status"] = status.Length == 0 ? "pending" : status;
+                    entry["owner"] = GetString(task, "ownerName");
+                    entry["ready"] = GetBool(task, "ready");
+                    // 被谁阻塞只给名字，手表上没有空间展开 id。
+                    var blockedBy = new List<object>();
+                    var rawBlocked = ListField(task, "blockedBy");
+                    if (rawBlocked != null)
+                    {
+                        foreach (var rawId in rawBlocked) blockedBy.Add(Convert.ToString(rawId));
+                    }
+                    entry["blockedBy"] = blockedBy;
+                    tasks.Add(entry);
+                }
+            }
+
+            var teamResult = new Dictionary<string, object>();
+            teamResult["members"] = members;
+            teamResult["tasks"] = tasks;
+
+            var result = new Dictionary<string, object>();
+            result["todos"] = todos;
+            result["mode"] = mode;
+            result["team"] = teamResult;
+
+            // goal 与 subagent 是「有才出现」的键：没有时整个键都不下发，
+            // 手表据此区分「没有目标」和「目标字段为空」。
+            var goalOuter = Dig(values, "goal");
+            if (goalOuter != null && goalOuter.ContainsKey("goal") && goalOuter["goal"] != null)
+            {
+                var goal = goalOuter["goal"] as Dictionary<string, object>;
+                var entry = new Dictionary<string, object>();
+                entry["objective"] = GetString(goal, "objective");
+                string phase = GetString(goal, "phase");
+                entry["phase"] = phase.Length == 0 ? "active" : phase;
+                entry["rounds"] = GetLong(goalOuter, "roundsStarted");
+                entry["maxRounds"] = GetLong(goal, "maxGoalRounds");
+                entry["blockedReason"] = GetString(goal, "blockedReason");
+                result["goal"] = entry;
+            }
+
+            if (values != null && values.ContainsKey("subagent") && values["subagent"] != null)
+            {
+                var identity = values["subagent"] as Dictionary<string, object>;
+                var entry = new Dictionary<string, object>();
+                entry["label"] = GetString(identity, "label");
+                entry["mode"] = GetString(identity, "mode");
+                result["subagent"] = entry;
+            }
+            return result;
         }
 
         /// <summary>

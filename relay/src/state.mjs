@@ -18,7 +18,7 @@ const MAX_TEXT_CHARS = 4_000
 /** 每个会话缓存的消息条数上限。 */
 export const MAX_MESSAGES = 40
 /** 会话列表返回的条目上限（DSH 实测可返回数百条）。 */
-const MAX_SESSIONS = 60
+export const MAX_SESSIONS = 60
 /** 子代理会话在列表里标记出来，默认不进入手表的会话列表。 */
 const SUBAGENT_ORIGIN = 'subagent'
 
@@ -179,10 +179,14 @@ export function questionOfSession(item) {
 
 /**
  * 把 `session/list` 的返回压成手表用的会话列表。
+ *
+ * 截断由调用方决定（`limit`）：子代理动辄数百条且更新时间很新，若在这里先截断
+ * 再过滤，父会话会被子代理挤出列表。传 0 表示不截断。
  * @param {unknown} value `session/list` 的 value
  * @param {boolean} includeSubagents 是否包含子代理会话
+ * @param {number} [limit] 返回条数上限，0 表示不截断
  */
-export function normalizeSessionList(value, includeSubagents = false) {
+export function normalizeSessionList(value, includeSubagents = false, limit = MAX_SESSIONS) {
   const items = Array.isArray(value?.items) ? value.items : []
   const sessions = []
   for (const item of items) {
@@ -193,6 +197,8 @@ export function normalizeSessionList(value, includeSubagents = false) {
     const title = values.title
     const cwd = typeof item?.cwd === 'string' ? item.cwd : ''
     const model = values.modelSelection?.next ?? values.modelSelection?.lastUsed
+    const identity = values.subagent
+    const timing = values.subagentTiming ?? {}
     sessions.push({
       id: String(item?.sessionId ?? ''),
       // 空标题的会话用工作目录名兜底，手表上至少能区分。
@@ -203,6 +209,19 @@ export function normalizeSessionList(value, includeSubagents = false) {
       updatedAt: Number(item?.updatedAt ?? 0),
       seq: Number(item?.projections?.asOfSeq ?? 0),
       subagent: isSubagent,
+      // 子代理会话靠 parentSessionId 挂回父会话；普通会话为空串。
+      parentId: typeof item?.parentSessionId === 'string' ? item.parentSessionId : '',
+      // 子代理的显示名来自它自己的 subagent.label（continuable 模式必有）。
+      subagentLabel: typeof identity?.label === 'string' ? identity.label : '',
+      subagentMode: typeof identity?.mode === 'string' ? identity.mode : '',
+      agentAvailable: item?.agentAvailable === true,
+      // 子代理耗时与活跃标记：settledMs 是已跑时长，active 存在表示当前仍在跑。
+      settledMs: numberOr(timing.settledMs),
+      active: timing.active !== undefined && timing.active !== null,
+      completed: timing.lastTurnCompleted === true,
+      // 轮数与步数：子任务列表里用来显示「干了多少活」。
+      turns: numberOr(values?.sessionStats?.turns),
+      steps: numberOr(values?.sessionStats?.steps),
       cwd,
       // 项目分组用：取工作目录的最后一段作为组名，根目录会话归到「未分组」。
       project: projectNameOf(cwd),
@@ -213,7 +232,121 @@ export function normalizeSessionList(value, includeSubagents = false) {
     })
   }
   sessions.sort((a, b) => b.updatedAt - a.updatedAt)
-  return sessions.slice(0, MAX_SESSIONS)
+  return limit > 0 ? sessions.slice(0, limit) : sessions
+}
+
+/** 数字兜底：非有限数一律按 0 处理，避免手表端拿到 null 崩掉。 */
+function numberOr(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0
+}
+
+/**
+ * 挑出某个会话派生的子代理，压成手表列表要的结构。
+ *
+ * 数据全部来自一次 `session/list`（每个条目自带 projections.values），因此这里
+ * 不额外发起任何 RPC——498 个子代理逐个拉投影会慢到不可用。
+ *
+ * @param {Array<object>} sessions `normalizeSessionList(value, true)` 的结果
+ * @param {string} parentId 父会话 id
+ * @returns {Array<object>} 按「运行中优先、再按创建时间倒序」排好的子代理
+ */
+export function subagentsOf(sessions, parentId) {
+  const list = []
+  for (const session of Array.isArray(sessions) ? sessions : []) {
+    if (session.parentId !== parentId) continue
+    const name = session.subagentLabel !== '' ? session.subagentLabel : session.title
+    list.push({
+      id: session.id,
+      // 子代理不一定有 label（one-shot 模式），退回会话标题。
+      label: name === '' ? '子任务' : name,
+      title: session.title,
+      mode: session.subagentMode,
+      state: stateOf(session),
+      running: session.running,
+      settledMs: session.settledMs,
+      active: session.active,
+      completed: session.completed,
+      updatedAt: session.updatedAt,
+      turns: session.turns,
+      steps: session.steps,
+    })
+  }
+  list.sort((a, b) => {
+    if (a.running !== b.running) return a.running ? -1 : 1
+    return b.updatedAt - a.updatedAt
+  })
+  return list
+}
+
+/** 子代理状态：运行中 / 失败 / 已完成 / 空闲。 */
+function stateOf(session) {
+  if (session.running) return 'running'
+  if (session.completed) return 'done'
+  if (session.agentAvailable) return 'idle'
+  return 'done'
+}
+
+/**
+ * 把一个会话的「计划与任务」压成手表要的结构。
+ *
+ * 四块内容来源不同、含义也不同，不要混为一谈：
+ * - todos：todo_write 产生的待办清单，是真正会逐项勾选的东西；
+ * - plan：只是「计划模式」的开关状态（active/pending 两个布尔），没有正文；
+ * - team：Agent Teams 的成员与任务板（谁负责、什么状态、被谁阻塞）；
+ * - goal：长目标（objective + phase），只在有目标时存在。
+ * @param {object} values `session/projections` 的 values
+ */
+export function normalizePlan(values) {
+  const todos = (Array.isArray(values?.todos) ? values.todos : [])
+    .map((item) => ({
+      content: typeof item?.content === 'string' ? item.content : '',
+      status: typeof item?.status === 'string' ? item.status : 'pending',
+    }))
+    .filter((item) => item.content !== '')
+
+  const members = (Array.isArray(values?.agentTeam?.members) ? values.agentTeam.members : [])
+    .map((member) => ({
+      name: typeof member?.name === 'string' ? member.name : '',
+      role: typeof member?.role === 'string' ? member.role : 'teammate',
+      phase: typeof member?.phase === 'string' ? member.phase : 'active',
+      error: typeof member?.error === 'string' ? member.error : '',
+    }))
+    .filter((member) => member.name !== '')
+
+  const tasks = (Array.isArray(values?.agentTeam?.tasks) ? values.agentTeam.tasks : [])
+    .filter((task) => String(task?.status ?? '') !== 'deleted')
+    .map((task) => ({
+      id: String(task?.id ?? ''),
+      subject: typeof task?.subject === 'string' ? task.subject : '',
+      status: typeof task?.status === 'string' ? task.status : 'pending',
+      owner: typeof task?.ownerName === 'string' ? task.ownerName : '',
+      ready: task?.ready === true,
+      // 被谁阻塞只给名字，手表上没有空间展开 id。
+      blockedBy: (Array.isArray(task?.blockedBy) ? task.blockedBy : []).map((value) => String(value)),
+    }))
+    .filter((task) => task.subject !== '')
+
+  const goal = values?.goal?.goal
+  const identity = values?.subagent
+  return {
+    todos,
+    mode: {
+      active: values?.plan?.active === true,
+      pending: values?.plan?.pending === true,
+    },
+    team: { members, tasks },
+    goal: goal === undefined || goal === null ? undefined : {
+      objective: typeof goal.objective === 'string' ? goal.objective : '',
+      phase: typeof goal.phase === 'string' ? goal.phase : 'active',
+      rounds: numberOr(values?.goal?.roundsStarted),
+      maxRounds: numberOr(goal.maxGoalRounds),
+      blockedReason: typeof goal.blockedReason === 'string' ? goal.blockedReason : '',
+    },
+    subagent: identity === null || identity === undefined ? undefined : {
+      label: typeof identity.label === 'string' ? identity.label : '',
+      mode: typeof identity.mode === 'string' ? identity.mode : '',
+    },
+  }
 }
 
 /**

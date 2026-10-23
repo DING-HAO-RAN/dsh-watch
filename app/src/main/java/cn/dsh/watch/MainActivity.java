@@ -3,6 +3,9 @@ package cn.dsh.watch;
 import android.app.Activity;
 import android.content.Intent;
 import android.os.Bundle;
+import android.text.SpannableStringBuilder;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
 import android.view.Gravity;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -33,6 +36,8 @@ public class MainActivity extends Activity {
     private static final long SESSION_REFRESH_MS = 4_000L;
     /** 会话列表的自动刷新间隔。 */
     private static final long LIST_REFRESH_MS = 10_000L;
+    /** 计划与任务页的自动刷新间隔。 */
+    private static final long PLAN_REFRESH_MS = 5_000L;
 
     private WatchUi ui;
     private Store store;
@@ -98,9 +103,27 @@ public class MainActivity extends Activity {
     private final Runnable listTicker = new Runnable() {
         @Override
         public void run() {
-            if (destroyed || onSessionPage) return;
+            if (destroyed || !onListPage()) return;
             if (!recentlyTouched()) loadSessions(true, false);
             refresh.postDelayed(this, LIST_REFRESH_MS);
+        }
+    };
+    /** 子任务页的自动刷新：子智能体的状态变化很快，用会话页同样的节奏。 */
+    private final Runnable subagentTicker = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed || !onSubagentPage) return;
+            if (!recentlyTouched()) loadSubagents(true);
+            refresh.postDelayed(this, SESSION_REFRESH_MS);
+        }
+    };
+    /** 计划页的自动刷新：任务状态变化没那么频繁，稍慢一点省电。 */
+    private final Runnable planTicker = new Runnable() {
+        @Override
+        public void run() {
+            if (destroyed || !onPlanPage) return;
+            if (!recentlyTouched()) loadPlan(true);
+            refresh.postDelayed(this, PLAN_REFRESH_MS);
         }
     };
 
@@ -863,6 +886,12 @@ public class MainActivity extends Activity {
         for (Api.Session session : visible) {
             String info = session.subtitle();
             if (!session.model.isEmpty()) info = info + " · " + shortModel(session.model);
+            // 有子任务时把数量接在后面：不点进去也能看出哪个会话在后台干活。
+            // 有子任务时省掉模型名，否则副标题折成三行、列表变得又高又难扫。
+            String hint = session.subagentHint();
+            if (!hint.isEmpty()) {
+                info = session.subtitle() + " · " + hint;
+            }
             View row = ui.row(session.title, info, () -> showSession(session.id));
             if (session.waiting) {
                 // 待回答的会话加一个颜色块，扫一眼就能定位。
@@ -915,7 +944,9 @@ public class MainActivity extends Activity {
         if (!silent) loadingSession = true;
         api.get(baseUrl(), "/api/sessions", store.token(), result -> {
             loadingSession = false;
-            if (destroyed || onSessionPage) return;
+            // 必须判断「是否还在列表页」而不是「是否在会话页」：文件页、子任务页、
+            // 计划页都会把 onSessionPage 置 false，只看它的话列表刷新会把这几页覆盖掉。
+            if (destroyed || !onListPage()) return;
             if (!result.ok) {
                 // 静默刷新失败时保持现有画面：把错误页反复重绘同样会闪。
                 if (silent) return;
@@ -1019,6 +1050,8 @@ public class MainActivity extends Activity {
         store.setLastSession(sessionId, currentSessionTitle);
         onSessionPage = true;
         editing = false;
+        // 从项目列表正常进入时，返回目标是列表；子任务入口会在本方法返回后覆盖它。
+        sessionReturnTo = "";
         messages.clear();
         steps.clear();
         currentAsk = null;
@@ -1259,6 +1292,10 @@ public class MainActivity extends Activity {
         }));
         items.add(new MenuItem("用量", "Token 与耗时", this::showUsage));
         items.add(new MenuItem("模型", "切换模型与推理强度", this::showModelPicker));
+        // 子任务与计划的入口**始终显示**：数据要等会话响应回来才有，按有无决定是否
+        // 显示会让入口在数据到达前消失；点进去空列表也给了明确说明。
+        items.add(new MenuItem("子任务", "这个会话派生的子智能体", this::openSubagentPage));
+        items.add(new MenuItem("计划与任务", "待办、团队任务与目标", this::showPlan));
         // 文件列表要等会话数据回来才有，所以入口**始终显示**：点进去再按需拉取。
         // 之前按 sessionFiles 是否为空来决定显示，而菜单在会话数据回来之前就建好了，
         // 结果入口根本不出现（点了也永远看不到文件）。
@@ -1271,7 +1308,8 @@ public class MainActivity extends Activity {
             renderSession("");
         }));
         items.add(new MenuItem("设置", "连接地址与配对", this::showConnect));
-        items.add(new MenuItem("返回项目", "回到会话列表", this::backToList));
+        items.add(new MenuItem("subagents".equals(sessionReturnTo) ? "返回子任务" : "返回项目",
+                "回到上一级列表", this::backToList));
         return items;
     }
 
@@ -1790,6 +1828,331 @@ public class MainActivity extends Activity {
         ui.addTo(container, view, top, bottom);
     }
 
+    // ------------------------------------------------------------ 子任务与计划
+
+    /** 当前父会话派生的子任务。 */
+    private final List<Api.Subagent> subagents = new ArrayList<>();
+    /** 当前会话的计划与任务。 */
+    private Api.Plan plan;
+    private boolean onSubagentPage;
+    private boolean onPlanPage;
+    /** 子任务页对应的父会话（从子任务点进对话后，返回要回到这里）。 */
+    private String subagentParentId = "";
+    private String subagentParentTitle = "";
+    /** 两个新页面的内容指纹，避免定时刷新时无变化也重建整屏。 */
+    private int lastSubagentSignature;
+    private int lastPlanSignature;
+    /**
+     * 会话页的返回目标：`subagents` 表示回子任务列表，空串表示回项目列表。
+     *
+     * 子任务对话复用的是普通会话页（子会话与普通会话同构），所以「返回」要按
+     * 进入路径决定去哪，不能一律回项目列表。
+     */
+    private String sessionReturnTo = "";
+
+    /**
+     * 当前是否停在会话列表页。
+     *
+     * 列表的定时刷新与它的响应回调都以这个为准：此前只判断 `onSessionPage`，
+     * 于是停在文件页（它会把 onSessionPage 置 false）时，列表刷新一到就会把
+     * 文件页整屏覆盖掉。子任务页与计划页同样不能被覆盖，因此统一走这里。
+     */
+    private boolean onListPage() {
+        return !onSessionPage && !onFilePage && !onSubagentPage && !onPlanPage;
+    }
+
+    /** 菜单入口：用当前会话作父会话，进入子任务列表。 */
+    private void openSubagentPage() {
+        if (currentSessionId.isEmpty()) {
+            showToast("还没有打开会话");
+            return;
+        }
+        showSubagentList(currentSessionId, currentSessionTitle);
+    }
+
+    /** 进入子任务列表页。 */
+    private void showSubagentList(String parentId, String parentTitle) {
+        subagentParentId = parentId;
+        subagentParentTitle = parentTitle;
+        onSubagentPage = true;
+        onSessionPage = false;
+        onFilePage = false;
+        onPlanPage = false;
+        editing = true;
+        subagents.clear();
+        // 换页面要回顶部：render() 默认保留上一页的滚动位置，否则新页面会停在
+        // 中间、连标题都看不见（实测从长对话点进子任务页就是这样）。
+        resetScroll();
+        refreshSubagentPage("正在读取子任务…");
+        loadSubagents(false);
+        refresh.removeCallbacks(subagentTicker);
+        refresh.postDelayed(subagentTicker, SESSION_REFRESH_MS);
+    }
+
+    /** 拉取子任务列表；silent 为真时只在内容变化后重绘。 */
+    private void loadSubagents(final boolean silent) {
+        if (!store.paired() || subagentParentId.isEmpty()) return;
+        api.get(baseUrl(), "/api/subagents?id=" + Api.urlEncode(subagentParentId), store.token(), result -> {
+            if (destroyed || !onSubagentPage) return;
+            if (!result.ok) {
+                // 静默刷新失败时保持现有画面，避免错误页反复重绘。
+                if (!silent) refreshSubagentPage(result.error);
+                return;
+            }
+            List<Api.Subagent> loaded = Api.parseSubagents(result.value);
+            int signature = subagentSignature(loaded);
+            if (silent && signature == lastSubagentSignature) return;
+            lastSubagentSignature = signature;
+            subagents.clear();
+            subagents.addAll(loaded);
+            refreshSubagentPage("");
+        });
+    }
+
+    /** 子任务列表的内容指纹。 */
+    private int subagentSignature(List<Api.Subagent> list) {
+        int signature = list.size() * 31;
+        for (Api.Subagent subagent : list) {
+            signature = signature * 31 + subagent.id.hashCode() + subagent.state.hashCode()
+                    + (int) (subagent.settledMs % 1000) + (int) subagent.steps;
+        }
+        return signature;
+    }
+
+    /** 画子任务列表页（只渲染，不发请求）。 */
+    private void refreshSubagentPage(String hint) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "子任务", subagentParentTitle.isEmpty() ? "" : clipLine(subagentParentTitle, 12));
+        if (!hint.isEmpty()) ui.add(page, ui.text(hint, 11, WatchUi.MUTED), 0, 8);
+
+        if (subagents.isEmpty()) {
+            ui.add(page, ui.text("这个会话还没有派生过子任务。", 11, WatchUi.MUTED), 0, 10);
+        } else {
+            int running = 0;
+            for (Api.Subagent subagent : subagents) if (subagent.running) running += 1;
+            ui.add(page, ui.text("共 " + subagents.size() + " 个" + (running > 0 ? "，其中 " + running + " 个在跑" : ""),
+                    10, WatchUi.MUTED), 0, 8);
+            for (final Api.Subagent subagent : subagents) {
+                LinearLayout card = ui.card();
+                card.addView(ui.text(clipLine(subagent.label, 24), 12, WatchUi.FG));
+                TextView state = ui.text(subagent.subtitle(), 10, subagent.stateColor());
+                card.addView(state);
+                card.setOnClickListener(v -> openSubagent(subagent));
+                card.setFocusable(true);
+                card.setClickable(true);
+                ui.add(page, card, 0, 6);
+            }
+        }
+        ui.add(page, ui.button("返回会话", false, this::backToSessionFromSubagents), 6, 0);
+        page.setOnSwipeRight(this::backToSessionFromSubagents);
+        page.setOnSwipeLeft(() -> showActionMenu(menuForSubagents()));
+        render(page);
+    }
+
+    /** 从子任务页回到它所属的父会话。 */
+    private void backToSessionFromSubagents() {
+        onSubagentPage = false;
+        editing = false;
+        onSessionPage = true;
+        sessionReturnTo = "";
+        // 进过子任务对话后 currentSessionId 已经指向子会话，这里必须显式回到父会话，
+        // 否则「返回会话」会把用户送回刚才那个子任务。
+        if (!subagentParentId.isEmpty()) {
+            currentSessionId = subagentParentId;
+            currentSessionTitle = subagentParentTitle;
+            store.setLastSession(currentSessionId, currentSessionTitle);
+            lastContentSignature = 0;
+        }
+        resetScroll();
+        renderSession("");
+        loadSession(currentSessionId, false);
+    }
+
+    /** 打开某个子任务自己的对话：复用普通会话页。 */
+    private void openSubagent(Api.Subagent subagent) {
+        onSubagentPage = false;
+        editing = false;
+        // showSession 会把返回目标重置成「项目列表」，因此子任务标记要在它之后设。
+        showSession(subagent.id);
+        sessionReturnTo = "subagents";
+        // showSession 的标题取自会话列表，子任务不在那个列表里，这里补上。
+        currentSessionTitle = subagent.label;
+        // 子任务的对话只是「进去看一眼」，不该成为下次启动恢复的会话：
+        // 那会把用户直接丢进一个子代理的历史里，连它属于谁都看不出来。
+        store.setLastSession(subagentParentId, subagentParentTitle);
+        renderSession("");
+    }
+
+    /** 子任务页的操作菜单。 */
+    private List<MenuItem> menuForSubagents() {
+        List<MenuItem> items = new ArrayList<>();
+        items.add(new MenuItem("刷新", "重新拉取子任务", () -> {
+            refreshSubagentPage("正在刷新…");
+            loadSubagents(false);
+        }));
+        items.add(new MenuItem("设置", "连接地址与配对", this::showConnect));
+        items.add(new MenuItem("返回会话", "回到这个会话", this::backToSessionFromSubagents));
+        return items;
+    }
+
+    /** 进入计划与任务页。 */
+    private void showPlan() {
+        onPlanPage = true;
+        onSessionPage = false;
+        onFilePage = false;
+        onSubagentPage = false;
+        editing = true;
+        plan = null;
+        // 同子任务页：换页面必须回到顶部，否则标题被上一页的滚动位置带出屏幕。
+        resetScroll();
+        refreshPlanPage("正在读取计划…");
+        loadPlan(false);
+        refresh.removeCallbacks(planTicker);
+        refresh.postDelayed(planTicker, PLAN_REFRESH_MS);
+    }
+
+    /** 拉取计划与任务；数据来自会话响应里的 plan 块。 */
+    private void loadPlan(final boolean silent) {
+        if (!store.paired() || currentSessionId.isEmpty()) return;
+        api.get(baseUrl(), "/api/session?id=" + Api.urlEncode(currentSessionId), store.token(), result -> {
+            if (destroyed || !onPlanPage) return;
+            if (!result.ok) {
+                if (!silent) refreshPlanPage(result.error);
+                return;
+            }
+            Api.Plan loaded = Api.parsePlan(result.value);
+            int signature = planSignature(loaded);
+            if (silent && signature == lastPlanSignature) return;
+            lastPlanSignature = signature;
+            plan = loaded;
+            refreshPlanPage("");
+        });
+    }
+
+    /** 计划页的内容指纹。 */
+    private int planSignature(Api.Plan value) {
+        int signature = 17;
+        if (value == null) return signature;
+        for (Api.Todo todo : value.todos) signature = signature * 31 + todo.content.hashCode() + todo.status.hashCode();
+        for (Api.Member member : value.members) signature = signature * 31 + member.name.hashCode() + member.phase.hashCode();
+        for (Api.TeamTask task : value.tasks) signature = signature * 31 + task.subject.hashCode() + task.status.hashCode();
+        if (value.goal != null) signature = signature * 31 + value.goal.phase.hashCode() + (int) value.goal.rounds;
+        return signature * 31 + (value.planActive ? 1 : 0) + (value.planPending ? 2 : 0);
+    }
+
+    /** 画计划与任务页（只渲染，不发请求）。 */
+    private void refreshPlanPage(String hint) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "计划与任务", currentSessionTitle.isEmpty() ? "" : clipLine(currentSessionTitle, 12));
+        if (!hint.isEmpty()) ui.add(page, ui.text(hint, 11, WatchUi.MUTED), 0, 8);
+
+        if (plan == null || plan.isEmpty()) {
+            ui.add(page, ui.text("这个会话没有待办、任务或目标。", 11, WatchUi.MUTED), 0, 10);
+        } else {
+            if (plan.planActive || plan.planPending) {
+                LinearLayout mode = ui.card();
+                mode.addView(ui.text("计划模式", 11, WatchUi.ACCENT));
+                mode.addView(ui.text(plan.planActive ? "正在计划模式：先出方案，不动手"
+                        : "计划待确认", 10, WatchUi.MUTED));
+                ui.add(page, mode, 0, 8);
+            }
+
+            if (plan.goal != null) {
+                LinearLayout goal = ui.card();
+                goal.addView(ui.text("目标", 11, WatchUi.ACCENT));
+                goal.addView(ui.text(plan.goal.objective, 11, WatchUi.FG));
+                StringBuilder meta = new StringBuilder(plan.goal.phaseText());
+                String rounds = plan.goal.roundsText();
+                if (!rounds.isEmpty()) meta.append(" · ").append(rounds);
+                goal.addView(ui.text(meta.toString(), 10, plan.goal.phaseColor()));
+                if (!plan.goal.blockedReason.isEmpty()) {
+                    goal.addView(ui.text("受阻：" + plan.goal.blockedReason, 10, WatchUi.DANGER));
+                }
+                ui.add(page, goal, 0, 8);
+            }
+
+            if (!plan.todos.isEmpty()) {
+                int done = 0;
+                for (Api.Todo todo : plan.todos) if ("completed".equals(todo.status)) done += 1;
+                LinearLayout todos = ui.card();
+                todos.addView(ui.text("待办 " + done + "/" + plan.todos.size(), 11, WatchUi.ACCENT));
+                for (Api.Todo todo : plan.todos) {
+                    // 状态与正文必须同一行、且状态单独上色：分成两行时八条待办会糊成
+                    // 一片，分不清哪一行状态属于哪一条。
+                    SpannableStringBuilder line = new SpannableStringBuilder();
+                    line.append(todo.statusText()).append("  ");
+                    line.setSpan(new ForegroundColorSpan(todo.statusColor()), 0, line.length(),
+                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    line.append(todo.content);
+                    TextView row = ui.text(line, 11, "completed".equals(todo.status) ? WatchUi.MUTED : WatchUi.FG);
+                    row.setPadding(0, ui.dp(4), 0, 0);
+                    todos.addView(row);
+                }
+                ui.add(page, todos, 0, 8);
+            }
+
+            if (!plan.members.isEmpty() || !plan.tasks.isEmpty()) {
+                LinearLayout team = ui.card();
+                team.addView(ui.text("团队", 11, WatchUi.ACCENT));
+                for (Api.Member member : plan.members) {
+                    SpannableStringBuilder line = new SpannableStringBuilder();
+                    line.append(member.name).append(" · ");
+                    line.append("lead".equals(member.role) ? "主持" : "成员").append(" · ");
+                    int phaseStart = line.length();
+                    line.append(member.phaseText());
+                    line.setSpan(new ForegroundColorSpan(member.phaseColor()), phaseStart, line.length(),
+                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    if (!member.error.isEmpty()) line.append("：").append(member.error);
+                    TextView row = ui.text(line, 10, WatchUi.FG);
+                    row.setPadding(0, ui.dp(4), 0, 0);
+                    team.addView(row);
+                }
+                for (Api.TeamTask task : plan.tasks) {
+                    SpannableStringBuilder line = new SpannableStringBuilder();
+                    line.append(task.statusText()).append("  ");
+                    line.setSpan(new ForegroundColorSpan(task.statusColor()), 0, line.length(),
+                            Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    line.append(clipLine(task.subject, 20));
+                    if (!task.owner.isEmpty()) line.append(" · ").append(task.owner);
+                    TextView row = ui.text(line, 10, WatchUi.FG);
+                    row.setPadding(0, ui.dp(4), 0, 0);
+                    team.addView(row);
+                }
+                ui.add(page, team, 0, 8);
+            }
+
+            if (!plan.subagentLabel.isEmpty()) {
+                ui.add(page, ui.text("这个会话本身是子任务：" + clipLine(plan.subagentLabel, 20), 10, WatchUi.MUTED), 0, 8);
+            }
+        }
+        ui.add(page, ui.button("返回会话", false, this::backToSessionFromPlan), 6, 0);
+        page.setOnSwipeRight(this::backToSessionFromPlan);
+        page.setOnSwipeLeft(() -> showActionMenu(menuForPlan()));
+        render(page);
+    }
+
+    /** 从计划页回到会话页。 */
+    private void backToSessionFromPlan() {
+        onPlanPage = false;
+        editing = false;
+        onSessionPage = true;
+        resetScroll();
+        renderSession("");
+        loadSession(currentSessionId, false);
+    }
+
+    /** 计划页的操作菜单。 */
+    private List<MenuItem> menuForPlan() {
+        List<MenuItem> items = new ArrayList<>();
+        items.add(new MenuItem("刷新", "重新拉取计划", () -> {
+            refreshPlanPage("正在刷新…");
+            loadPlan(false);
+        }));
+        items.add(new MenuItem("设置", "连接地址与配对", this::showConnect));
+        items.add(new MenuItem("返回会话", "回到这个会话", this::backToSessionFromPlan));
+        return items;
+    }
+
     // ------------------------------------------------------------ 文件查看
 
     /** 会话里出现过的文件（由中继在 session 响应里给出）。 */
@@ -2002,6 +2365,16 @@ public class MainActivity extends Activity {
 
     /** 返回时把内容指纹清掉，强制下次进入重新渲染。 */
     private void backToList() {
+        // 从子任务对话返回时回到子任务列表，而不是项目列表——否则用户点进一个
+        // 子任务看两眼，就被扔回了项目首屏，还得重新找回来。
+        if ("subagents".equals(sessionReturnTo)) {
+            sessionReturnTo = "";
+            onSessionPage = false;
+            editing = false;
+            refresh.removeCallbacks(sessionTicker);
+            showSubagentList(subagentParentId, subagentParentTitle);
+            return;
+        }
         onSessionPage = false;
         editing = false;
         returningFromSession = true;

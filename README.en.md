@@ -11,6 +11,8 @@ With DSH running on your PC and the watch connected to it, you can glance at you
 - **Send messages**, stop generation, scroll back through history
 - Answer the AI's questions (single choice, multiple choice, or typed)
 - Switch **model** and reasoning effort, check **token** usage and context occupancy
+- Watch **subagents**: who was sent out to work, whether they are still running or done, how long they took — and tap through to read their full conversation
+- Watch the **plan and tasks**: how far the todo list has got, who owns what on the team board, and how the current goal is progressing
 
 No server on the internet to set up, no changes to any DSH configuration, no DSH plugins.
 
@@ -150,6 +152,8 @@ The watch can only open **files that actually appeared in that session** — the
 | Answer a question | While a question is pending, "AI is waiting for your answer" appears; tap it and pick an option |
 | Change model | Swipe left → "Model": the current model shows first, then pick provider → model → reasoning effort |
 | Check usage | Swipe left → "Usage": token spend, context occupancy, timing |
+| Watch subagents | Swipe left → "Subagents": each subagent's name, state (running / done / failed), duration and turn count; tap one to read its full conversation |
+| Watch the plan and tasks | Swipe left → "Plan and tasks": the todo list with statuses, team members and the task board, and the current goal |
 | Scroll back | Swipe left → "Load older content" |
 | Change theme / round-screen fit | Swipe left → "Settings" → "Appearance": dark or light, and round-screen optimisation can be turned off |
 | Switch computer / device | Swipe left → "Settings": tap a saved device to switch |

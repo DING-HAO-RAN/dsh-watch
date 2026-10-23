@@ -17,7 +17,7 @@ import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { moduleDirectory } from './paths.mjs'
-import { MAX_MESSAGES, groupByProject, normalizeMessages, normalizeModelCatalog, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession } from './state.mjs'
+import { MAX_MESSAGES, MAX_SESSIONS, groupByProject, normalizeMessages, normalizeModelCatalog, normalizePlan, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession, subagentsOf } from './state.mjs'
 
 /**
  * 控制面板静态文件所在目录。
@@ -94,6 +94,29 @@ function earliestSeqOf(records) {
     if (seq > 0 && (earliest === 0 || seq < earliest)) earliest = seq
   }
   return earliest
+}
+
+/**
+ * 给每个会话标上「派生了几个子任务、其中几个正在跑」。
+ *
+ * 手表列表页靠它一眼看出哪个会话在后台干活，不必点进去。
+ * @param {Array<object>} all 含子代理的全量列表
+ * @param {Array<object>} sessions 即将返回给手表的会话（与 all 共享对象引用）
+ */
+function attachSubagentCounts(all, sessions) {
+  const counts = new Map()
+  for (const item of all) {
+    if (item.subagent !== true || item.parentId === '') continue
+    const entry = counts.get(item.parentId) ?? { total: 0, running: 0 }
+    entry.total += 1
+    if (item.running) entry.running += 1
+    counts.set(item.parentId, entry)
+  }
+  for (const session of sessions) {
+    const entry = counts.get(session.id) ?? { total: 0, running: 0 }
+    session.subagentCount = entry.total
+    session.subagentRunning = entry.running
+  }
 }
 
 /** 把提问投影压成手表要的结构（与 state.js 的 questions 形状保持一致）。 */
@@ -340,15 +363,22 @@ export class RelayServer {
    * @param {string} sessionId 会话 id
    * @param {boolean} running 是否正在运行（来自会话列表，投影里没有这个字段）
    * @param {number} [throughSeq] 从哪个 seq 往前读；省略则读最新
+   * @param {string} [parentId] 子代理的父会话 id；普通会话传空串
+   * @param {string} [mode] 子代理模式（one-shot / continuable / unknown）
    */
-  async readSession(sessionId, running, throughSeq) {
+  async readSession(sessionId, running, throughSeq, parentId, mode) {
     const projection = await this.link.rpc('session/projections', { request: { sessionId } })
     const latest = Number(projection?.asOfSeq ?? 0)
     const from = typeof throughSeq === 'number' && Number.isSafeInteger(throughSeq) && throughSeq > 0
       ? Math.min(throughSeq, latest)
       : latest
+    // 子代理的历史必须用「父地址 + 子地址」读：DSH 对 origin=subagent 的会话
+    // 直接给普通 session 地址会拒绝（subagent Sessions require their durable parent address）。
+    const address = parentId === undefined || parentId === ''
+      ? { kind: 'session', sessionId }
+      : { kind: 'subagent', parentSessionId: parentId, childSessionId: sessionId, mode: mode === '' || mode === undefined ? 'continuable' : mode }
     const page = await this.link.rpc('session/page', {
-      request: { address: { kind: 'session', sessionId }, throughSeq: from, maxMessages: MAX_MESSAGES },
+      request: { address, throughSeq: from, maxMessages: MAX_MESSAGES },
     })
     const active = projection?.values?.userQuestions?.active
     const first = Array.isArray(active) && active.length > 0 ? active[0] : undefined
@@ -386,6 +416,8 @@ export class RelayServer {
       messages: normalizeMessages(page?.records),
       steps: normalizeSteps(page?.records),
       usage: normalizeUsage(projection?.values),
+      // 计划与任务：待办清单、计划模式开关、团队任务板、长目标。
+      plan: normalizePlan(projection?.values),
       ...(question === undefined ? {} : { question }),
     }
   }
@@ -455,7 +487,12 @@ export class RelayServer {
     if (path === '/api/sessions' && req.method === 'GET') {
       const includeSubagents = url.searchParams.get('subagents') === '1'
       const value = await this.link.rpc('session/list', { _request: {} })
-      const sessions = normalizeSessionList(value, includeSubagents)
+      // 一次拉全量（含子代理、不截断）再按需要过滤：截断必须发生在过滤之后，
+      // 否则更新时间很新的几百条子代理会把父会话挤出列表。
+      const all = normalizeSessionList(value, true, 0)
+      const visible = includeSubagents ? all : all.filter((item) => item.subagent !== true)
+      const sessions = visible.slice(0, MAX_SESSIONS)
+      attachSubagentCounts(all, sessions)
       json(res, 200, {
         ok: true,
         sessions,
@@ -463,6 +500,18 @@ export class RelayServer {
         projects: groupByProject(sessions),
         pending: await this.pendingQuestions(sessions),
       })
+      return
+    }
+
+    if (path === '/api/subagents' && req.method === 'GET') {
+      const parentId = url.searchParams.get('id') ?? ''
+      if (parentId === '') {
+        json(res, 400, { ok: false, error: '缺少 id 参数' })
+        return
+      }
+      // 子代理的信息全在 session/list 里，不必为每个子代理再拉一次投影。
+      const all = normalizeSessionList(await this.link.rpc('session/list', { _request: {} }), true, 0)
+      json(res, 200, { ok: true, parentId, subagents: subagentsOf(all, parentId) })
       return
     }
 
@@ -475,10 +524,17 @@ export class RelayServer {
       // through 用于往前翻历史；省略即读最新一批。
       const throughRaw = url.searchParams.get('through') ?? ''
       const through = throughRaw === '' ? undefined : Number(throughRaw)
-      // running 从列表摘要读：projections 里没有这个字段。
-      const listed = normalizeSessionList(await this.link.rpcSafe('session/list', { _request: {} }), true)
+      // running 与父地址都从列表摘要读：projections 里没有 running，子代理的历史
+      // 又必须靠父地址才能读到，因此这里必须查全量列表（不截断）。
+      const listed = normalizeSessionList(await this.link.rpcSafe('session/list', { _request: {} }), true, 0)
       const summary = listed.find((item) => item.id === sessionId)
-      json(res, 200, await this.readSession(sessionId, summary?.running === true, through))
+      json(res, 200, await this.readSession(
+        sessionId,
+        summary?.running === true,
+        through,
+        summary?.parentId ?? '',
+        summary?.subagentMode ?? '',
+      ))
       return
     }
 
