@@ -42,6 +42,7 @@
 - **「开机自启」与「随 DSH 启动」共用一个进程**：后者由 `PanelHost.StartWatchdog()` 每 5 秒问一次 `DshLocator.IsRunning(dshPortHint)`，DSH 没了就 `StopServing()`、回来就 `StartServing()`。两个都勾时先开机待命、DSH 一出现才开始服务，**绝不另起第二个实例**——两个实例会抢 19390 端口。
 - **公网默认开启**：`RelaySettings.AutoTunnel` 缺省为 `true`，`StartServing()` 起中继后在后台线程拉 cloudflared（不能阻塞启动，局域网不该等它）。老存档没有这个键时也按开启处理，否则升级上来的用户会以为功能丢了。
 - **调试第二份实例不要打断正在运行的那份**：`RelaySettings.PathFor` 认 `DSH_RELAY_STATE_DIR` 覆盖状态目录，`PanelHost.Run` 认 `DSH_RELAY_PORT` 覆盖监听端口，`build-app.ps1` 有 `-OutputDir` / `-StateDir`。三者配合就能在原版仍占着 19390 的情况下跑新版验证。
+- **更新程序时不要 `Stop-Process -Force` 强杀中继**：它拉起的 `cloudflared.exe` 子进程**继承了监听 socket 的句柄**，中继进程消失后端口仍显示 `LISTENING <已死PID>`，新实例绑不上、日志报「每个套接字地址只允许使用一次」，而且这种 orphaned socket 不会随时间释放（实测等了 90 秒仍在）。正确做法是**先杀该实例的 cloudflared、再杀中继**（或走托盘「退出」），端口立刻释放。排查手法：`netstat -ano | findstr :19390` 拿到的 PID 若已不存在，就去看 `cloudflared.exe` 的 `--url` 是否指向这个端口。
 - **依赖全部嵌进 exe**，分发只有一个文件。挂载方式（[Bootstrap.cs](<desktop/src/Bootstrap.cs>)）分两条路，两者都必须保留：
   - 托管程序集用 `Assembly.Load(byte[])` **从内存装入**（在 `AssemblyResolve` 里实现）；
   - 原生加载器 `WebView2Loader.dll` **必须落盘**（Win32 的 `LoadLibrary` 只接受路径），优先写程序自身目录，失败再退到临时目录。
