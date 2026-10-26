@@ -44,6 +44,9 @@
 - Windows 11 会把新的托盘图标默认收进「^」溢出区（实测本次就是），托盘图标**存在但不在任务栏可见位置**。README/使用说明要写明这一点，引导用户展开溢出区或拖到任务栏固定。
 - **开机自启写当前用户的 Run 键**（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`，值名 `DshRelay`）：不需要管理员权限，删掉即取消。刻意不用启动文件夹快捷方式（出错时用户看不到任何反馈）也不用计划任务（要提权，会被企业策略拦）。
 - **「开机自启」与「随 DSH 启动」共用一个进程**：后者由 `PanelHost.StartWatchdog()` 每 5 秒问一次 `DshLocator.IsRunning(dshPortHint)`，DSH 没了就 `StopServing()`、回来就 `StartServing()`。两个都勾时先开机待命、DSH 一出现才开始服务，**绝不另起第二个实例**——两个实例会抢 19390 端口。
+- **DSH 端口会变，恢复服务时必须重新定位**：`StartServing()` 里调用 `RelocateDsh()` 重新 `Locate`、重建 `DshClient` 并 `RelayServer.RebindDsh()`。**绝不能复用暂停前的客户端**——DSH 重启换了随机端口，旧客户端会一直打老端口，手表侧全部显示「无法连接到远程服务器」（实测日志里那串 `127.0.0.1:53540 积极拒绝` 就是这么来的）。因此 `RelayServer.dsh` **不是 readonly**。
+- **`DshLocator.IsRunning` 不能只看端口**：旧端口不通**不代表 DSH 退出**（它每次启动都换端口）。正确顺序是「已知端口通 → true；否则看进程还在不在 → 在就重新定位、定位不到也**当作仍在运行**」。只按端口判断会让跟随模式反复误停服务。
+- **DSH 请求失败要自动重连一次**：`RelayServer.Route` 捕获 `DshException` 后调 `TryRelocate()` 并用 `Route(request, true)` 重试。用 `Interlocked` 互斥，避免一次断线的多个并发请求各自定位、互相覆盖客户端。把错误直接抛给手表只会显示「无法连接到远程服务器」，用户无从处理。
 - **公网默认开启**：`RelaySettings.AutoTunnel` 缺省为 `true`，`StartServing()` 起中继后在后台线程拉 cloudflared（不能阻塞启动，局域网不该等它）。老存档没有这个键时也按开启处理，否则升级上来的用户会以为功能丢了。
 - **调试第二份实例不要打断正在运行的那份**：`RelaySettings.PathFor` 认 `DSH_RELAY_STATE_DIR` 覆盖状态目录，`PanelHost.Run` 认 `DSH_RELAY_PORT` 覆盖监听端口，`build-app.ps1` 有 `-OutputDir` / `-StateDir`。三者配合就能在原版仍占着 19390 的情况下跑新版验证。
 - **更新程序时不要 `Stop-Process -Force` 强杀中继**：它拉起的 `cloudflared.exe` 子进程**继承了监听 socket 的句柄**，中继进程消失后端口仍显示 `LISTENING <已死PID>`，新实例绑不上、日志报「每个套接字地址只允许使用一次」，而且这种 orphaned socket 不会随时间释放（实测等了 90 秒仍在）。正确做法是**先杀该实例的 cloudflared、再杀中继**（或走托盘「退出」），端口立刻释放。排查手法：`netstat -ano | findstr :19390` 拿到的 PID 若已不存在，就去看 `cloudflared.exe` 的 `--url` 是否指向这个端口。

@@ -216,6 +216,38 @@ final class Store {
         saveDevices(list);
     }
 
+    /**
+     * 把「当前地址」从 from 换成 to（两者是同一台设备的两个入口）。
+     *
+     * 令牌与设备记录都保留，只改当前指针：切换必须是可逆的、无损的，
+     * 不能因为换了个网络就把配对信息弄丢。
+     */
+    void switchBase(String to, String from) {
+        if (to == null || to.trim().isEmpty()) return;
+        String target = to.trim();
+        List<Device> list = devices();
+        Device device = null;
+        for (Device item : list) {
+            if (item.base.equals(target) || item.alternateBase.equals(target)) {
+                device = item;
+                break;
+            }
+        }
+        if (device == null) return;
+
+        // 把换下来的那条记成备用，两条随时可以再换回来。
+        if (from != null && !from.trim().isEmpty() && !from.trim().equals(target)) {
+            device.alternateBase = from.trim();
+        }
+        device.base = target;
+        device.lastUsed = System.currentTimeMillis();
+        saveDevices(list);
+        prefs.edit()
+                .putString(KEY_BASE, target)
+                .putString(KEY_TOKEN, device.token)
+                .apply();
+    }
+
     /** 某台设备上的另一个可用地址（没有则返回空串）。 */
     String alternateFor(String base) {
         if (base == null) return "";

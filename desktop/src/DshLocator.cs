@@ -609,8 +609,21 @@ namespace DshRelay
             try
             {
                 if (knownPort > 0 && IsListening(knownPort)) return true;
+
+                // 旧端口不通**不代表 DSH 退出了**：DSH 桌面版每次启动都会换随机端口。
+                // 必须先看进程还在不在，在的话再重新定位一次拿到新端口；
+                // 只按端口判断会让「跟随 DSH」模式误判成「DSH 已退出」，
+                // 反复启停服务，手表侧表现为连不上。
+                if (!DshProcessAlive()) return false;
+
                 DshInstance instance = Locate(null, delegate { });
-                return instance != null && instance.Port > 0;
+                if (instance != null && instance.Port > 0)
+                {
+                    LastPortDiagnostic = "重新定位到 " + instance.Port;
+                    return true;
+                }
+                // 进程活着、只是这一轮没探到端口：当作仍在运行，避免误停服务。
+                return true;
             }
             catch
             {
@@ -618,6 +631,29 @@ namespace DshRelay
             }
         }
 
+        /// <summary>本机是否有 DSH 进程在跑（不看端口）。</summary>
+        private static bool DshProcessAlive()
+        {
+            try
+            {
+                foreach (var process in System.Diagnostics.Process.GetProcesses())
+                {
+                    try
+                    {
+                        string name = process.ProcessName ?? "";
+                        if (name.IndexOf("DeepSeek Harness", StringComparison.OrdinalIgnoreCase) >= 0
+                            || name.IndexOf("DeepSeekHarness", StringComparison.OrdinalIgnoreCase) >= 0)
+                        {
+                            return true;
+                        }
+                    }
+                    catch { }
+                    finally { try { process.Dispose(); } catch { } }
+                }
+            }
+            catch { }
+            return false;
+        }
         /// <summary>端口是否在本机监听。</summary>
         public static bool IsListening(int port)
         {

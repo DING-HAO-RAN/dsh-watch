@@ -802,6 +802,34 @@ public class MainActivity extends Activity {
         });
     }
 
+    /**
+     * 当前地址连不上时，自动试这台设备的另一个入口。
+     *
+     * 同一台电脑的局域网与公网地址共用一个令牌：在家、在外应该都能连上。
+     * 以前只认「当前那一条」，一旦换了网络（IP 变了、公网域名换了）就只剩
+     * 「连不上电脑」——用户只能手动改地址。这里自动在两条之间切换，
+     * 切成功后把这条提升为当前地址，后续请求就走它。
+     *
+     * @param onDone 切成功后回调（通常用于重试原请求）；失败不回调。
+     */
+    private void tryAlternateEndpoint(final Runnable onDone) {
+        if (!store.paired()) return;
+        final String current = store.base();
+        String alternate = store.alternateFor(current);
+        if (alternate.isEmpty() || alternate.equals(current)) return;
+
+        api.get(alternate, "/api/identity", store.token(), result -> {
+            if (destroyed || !result.ok || result.value == null) return;
+            // 确认这个入口连的是同一台中继（服务标识一致）才切，避免连到别处。
+            String service = Api.text(result.value, "service");
+            if (!service.startsWith("dsh-watch-relay")) return;
+
+            store.switchBase(alternate, current);
+            showToast("已切换到另一个地址：" + alternate);
+            if (onDone != null) onDone.run();
+        });
+    }
+
     /** 只渲染当前列表页，不发请求、不安排定时器。 */
     private void renderSessionListPage() {
         WatchUi.Page page = ui.page();
@@ -948,6 +976,17 @@ public class MainActivity extends Activity {
             // 计划页都会把 onSessionPage 置 false，只看它的话列表刷新会把这几页覆盖掉。
             if (destroyed || !onListPage()) return;
             if (!result.ok) {
+                // 连不上时先自动试这台设备的另一个入口（局域网↔公网）。
+                // 成功切换后会重新拉一次，用户不必自己去改地址。
+                if (!alternateTried) {
+                    alternateTried = true;
+                    tryAlternateEndpoint(() -> {
+                        alternateTried = false;
+                        loadSessions(silent, force);
+                    });
+                    return;
+                }
+                alternateTried = false;
                 // 静默刷新失败时保持现有画面：把错误页反复重绘同样会闪。
                 if (silent) return;
                 sessions.clear();
@@ -956,6 +995,7 @@ public class MainActivity extends Activity {
                 showListError(result.error);
                 return;
             }
+            alternateTried = false;
             List<Api.Session> loadedSessions = Api.parseSessions(result.value);
             List<Api.Project> loadedProjects = Api.parseProjects(result.value);
             List<Api.Ask> loadedPending = Api.parsePending(result.value);
@@ -998,7 +1038,23 @@ public class MainActivity extends Activity {
         ui.heading(page, "连不上电脑", "");
         ui.add(page, ui.text(error, 13, WatchUi.DANGER), 0, 12);
         ui.add(page, ui.text("地址：" + store.base(), 11, WatchUi.MUTED), 0, 12);
-        ui.add(page, ui.button("重试", true, this::showSessionList), 0, 8);
+        ui.add(page, ui.button("重试", true, () -> {
+            // 重试前顺手同步一次公网地址：中继重启后公网域名会变，
+            // 而错误页是唯一能停留的地方，不在这里同步就永远拿不到新域名。
+            syncPublicAddress();
+            showSessionList();
+        }), 0, 8);
+
+        // 同一台电脑有局域网与公网两个入口，换网络后当前那条可能不通。
+        // 给一个显式切换入口，不必重新配对（配对信息是好的，只是路换了）。
+        String alternate = store.alternateFor(store.base());
+        if (!alternate.isEmpty()) {
+            ui.add(page, ui.button("换一个地址", false, () -> {
+                tryAlternateEndpoint(this::showSessionList);
+            }), 0, 6);
+            ui.add(page, ui.text("这台电脑的另一个入口：" + alternate, 10, WatchUi.MUTED), 0, 8);
+        }
+
         ui.add(page, ui.button("重新配对", false, () -> {
             store.clearToken();
             showConnect();
@@ -2159,6 +2215,8 @@ public class MainActivity extends Activity {
     private final List<Api.FileEntry> sessionFiles = new ArrayList<>();
     /** 当前是否停留在文件页（决定定时刷新要不要跳过）。 */
     private boolean onFilePage;
+    /** 本次失败是否已经尝试过切换备用地址（避免无限循环）。 */
+    private boolean alternateTried;
 
     /**
      * 文件列表页：列出这次会话里碰到的 md / txt / 代码文件。

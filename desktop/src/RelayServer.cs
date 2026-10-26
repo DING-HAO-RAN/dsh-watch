@@ -38,7 +38,11 @@ namespace DshRelay
         private const int MaxSessions = 60;
         private const int MaxMessages = 40;
 
-        private readonly DshClient dsh;
+        /// <summary>
+        /// DSH 客户端。**不能是 readonly**：DSH 重启会换随机端口，
+        /// 跟随模式恢复时要换成新客户端（见 RebindDsh），否则请求会打到旧端口。
+        /// </summary>
+        private DshClient dsh;
         private readonly JavaScriptSerializer json;
         private readonly object gate = new object();
         private readonly Dictionary<string, long> tokens = new Dictionary<string, long>();
@@ -837,6 +841,60 @@ namespace DshRelay
             return null;
         }
 
+        /// <summary>
+        /// 换用一个新的 DSH 客户端（DSH 重启、端口变化后调用）。
+        ///
+        /// 只换引用、不动配对码与令牌：手表那边完全无感，重连即刻可用。
+        /// </summary>
+        public void RebindDsh(DshClient fresh)
+        {
+            if (fresh == null) return;
+            dsh = fresh;
+            // 运行状态缓存是按旧端口算的，必须清掉。
+            lock (runningGate)
+            {
+                runningCache = new Dictionary<string, bool>();
+                runningCheckedAt = 0;
+            }
+            log("中继已切换到新的 DSH 连接（端口 " + fresh.Port + "）");
+        }
+        /// <summary>正在重新定位 DSH（防止并发请求同时重连）。</summary>
+        private int relocating;
+
+        /// <summary>
+        /// DSH 连不上时重新定位一次并换客户端。
+        ///
+        /// 用 Interlocked 做互斥：一次断线会有多个手表请求同时失败，
+        /// 不能让它们各自定位一遍、互相把客户端改来改去。
+        /// </summary>
+        private bool TryRelocate()
+        {
+            if (System.Threading.Interlocked.CompareExchange(ref relocating, 1, 0) != 0) return false;
+            try
+            {
+                DshInstance instance = DshLocator.Locate(null, log);
+                if (instance == null || instance.Port <= 0) return false;
+                if (dsh != null && instance.Port == dsh.Port && instance.Home == dsh.Home) return false;
+
+                var fresh = new DshClient(instance.Home, instance.Port, instance.Secret, instance.SecretRaw);
+                var probe = new Dictionary<string, object>();
+                probe["_request"] = new Dictionary<string, object>();
+                fresh.Rpc("session/list", probe);
+
+                log("DSH 端口变化，已自动重连：" + instance.Port);
+                RebindDsh(fresh);
+                return true;
+            }
+            catch (Exception error)
+            {
+                log("自动重连 DSH 失败：" + error.Message);
+                return false;
+            }
+            finally
+            {
+                System.Threading.Interlocked.Exchange(ref relocating, 0);
+            }
+        }
         private readonly object runningGate = new object();
         private Dictionary<string, bool> runningCache = new Dictionary<string, bool>();
         private long runningCheckedAt;
@@ -948,6 +1006,12 @@ namespace DshRelay
 
         private Http.Response Route(Http.Request request)
         {
+            return Route(request, false);
+        }
+
+        /// <summary>@param retried 已经重连重试过一次，避免无限递归。</summary>
+        private Http.Response Route(Http.Request request, bool retried)
+        {
             string path = request.Path;
 
             // 控制面板由界面层提供；这里只暴露中继接口。
@@ -1024,6 +1088,14 @@ namespace DshRelay
             }
             catch (DshException error)
             {
+                // DSH 可能刚重启、端口变了。这里立刻重新定位并重试一次，
+                // 而不是把错误抛给手表——手表只会显示「无法连接到远程服务器」，
+                // 用户完全不知道该怎么办。重试成功后这次请求就是正常的。
+                if (TryRelocate() && retried == false)
+                {
+                    retried = true;
+                    return Route(request);
+                }
                 return Http.Json(502, Simple(error.Message));
             }
             catch (Exception error)

@@ -700,11 +700,60 @@ namespace DshRelay
                 log("跟随 DSH 模式：DSH 未运行，暂不对外服务");
                 return;
             }
+
+            // 恢复服务前必须重新定位 DSH。
+            //
+            // DSH 桌面版的端口是每次启动随机分配的。旧实现只在最初定位一次，
+            // 暂停后直接复用那个 DshClient——DSH 重启换了端口，客户端仍然对着老端口发请求，
+            // 于是手表端全部返回「无法连接到远程服务器」。实测日志里那串
+            // 「127.0.0.1:53540 积极拒绝」就是这么来的。
+            if (!RelocateDsh())
+            {
+                log("跟随 DSH 模式：暂时找不到 DSH，保持待命");
+                followingPaused = true;
+                return;
+            }
+
             relay.Start();
             log("中继已启动，局域网端口：" + relay.Port);
             if (relay.AutoTunnel)
             {
                 StartTunnelInBackground();
+            }
+        }
+
+        /// <summary>
+        /// 重新定位 DSH 并把中继切到新的客户端上。
+        ///
+        /// @returns 是否成功找到一个可用的 DSH。
+        /// </summary>
+        private bool RelocateDsh()
+        {
+            try
+            {
+                DshInstance instance = DshLocator.Locate(null, log);
+                if (instance == null || instance.Port <= 0) return false;
+                if (dsh != null && instance.Port == dsh.Port && instance.Home == dsh.Home)
+                {
+                    // 端口没变，沿用现有客户端即可。
+                    return true;
+                }
+
+                var fresh = new DshClient(instance.Home, instance.Port, instance.Secret, instance.SecretRaw);
+                var probe = new Dictionary<string, object>();
+                probe["_request"] = new Dictionary<string, object>();
+                fresh.Rpc("session/list", probe);
+
+                log("DSH 端口已更新：" + instance.Port);
+                dsh = fresh;
+                dshPortHint = instance.Port;
+                if (relay != null) relay.RebindDsh(fresh);
+                return true;
+            }
+            catch (Exception error)
+            {
+                log("重新定位 DSH 失败：" + error.Message);
+                return false;
             }
         }
 
