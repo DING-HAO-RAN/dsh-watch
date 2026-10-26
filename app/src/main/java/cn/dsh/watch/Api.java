@@ -401,6 +401,10 @@ final class Api {
     static final class Message {
         String role = "assistant";
         String text = "";
+        /** 事件序号：思考卡片用它做展开状态的稳定键。 */
+        long seq;
+        /** 这条消息的思考内容；为空表示没有。 */
+        String thinking = "";
         final List<String> tools = new ArrayList<>();
     }
 
@@ -903,6 +907,8 @@ final class Api {
             Message message = new Message();
             message.role = text(item, "role"); if (message.role.isEmpty()) message.role = "assistant";
             message.text = text(item, "text");
+            message.seq = item.optLong("seq", 0L);
+            message.thinking = text(item, "thinking");
             JSONArray tools = item.optJSONArray("tools");
             if (tools != null) {
                 for (int j = 0; j < tools.length(); j++) {

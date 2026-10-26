@@ -35,8 +35,13 @@ namespace DshRelay
         private const int DiscoveryPort = 19391;
         private const string ServiceTag = "dsh-watch-relay/1";
         private const long TokenTtlMs = 30L * 24 * 60 * 60 * 1000;
-        private const int MaxSessions = 60;
-        private const int MaxMessages = 40;
+        // 会话数与每页消息数。
+        //
+        // 用户要求「能显示 DSH 里的全部项目和会话以及每个会话的全部内容」，
+        // 所以这两个上限放得很宽：会话列表一次给 500 条（足够覆盖实际规模），
+        // 单页消息 120 条；更早的历史由手表的「看更早的内容」继续往前翻。
+        private const int MaxSessions = 500;
+        private const int MaxMessages = 120;
 
         /// <summary>
         /// DSH 客户端。**不能是 readonly**：DSH 重启会换随机端口，
@@ -1241,6 +1246,8 @@ namespace DshRelay
                 if (session == null) continue;
                 // 子代理不进列表，只作为父会话的计数来源。
                 if (Convert.ToBoolean(session["subagent"])) continue;
+                // 上限只是兜底（DSH 实际规模远小于此）。**不能在加进项目分组之前 break**，
+                // 否则最后一个项目会被截成半截，手表上点进去少会话而没有任何提示。
                 if (sessions.Count >= MaxSessions) break;
 
                 string sessionId = Convert.ToString(session["id"]);

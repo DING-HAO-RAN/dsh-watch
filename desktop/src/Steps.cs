@@ -16,10 +16,14 @@ namespace DshRelay
     public static class Steps
     {
         private const int MaxTextChars = 4000;
-        private const int StepTextChars = 1500;
-        private const int StepResultChars = 2000;
+        // 正文与工具结果给足空间：手表端是按需展开的，传少了就永远看不到全文。
+        // 以前 1500/2000 会把正常长度的回复直接截断，表现为「对话内容显示不全」。
+        private const int StepTextChars = 12000;
+        private const int StepResultChars = 8000;
         /// <summary>思考内容的截断上限。用户要求能看到思考，但手表屏幕小，留一段足够判断思路。</summary>
-        private const int StepThinkingChars = 1200;
+        // 思考往往比正文还长（实测最长单条 11326 字）。以前截到 1200，
+        // 用户看到的就是「思考只有几百字」。这里放宽到 12000，并压缩空白。
+        private const int StepThinkingChars = 12000;
 
         /// <summary>工具名到显示标签的映射（手表上是短标签，不需要原始英文名）。</summary>
         private static readonly Dictionary<string, string> ToolLabels = new Dictionary<string, string>(StringComparer.Ordinal)
@@ -84,44 +88,25 @@ namespace DshRelay
                     var content = ContentOf(data);
                     string text = TextOfContent(content);
                     string thinking = ThinkingOfContent(content);
-                    var last = messages.Count > 0 ? messages[messages.Count - 1] as Dictionary<string, object> : null;
-                    bool canAppend = last != null && Convert.ToString(last["role"]) == "assistant";
-                    if (!canAppend)
-                    {
-                        last = new Dictionary<string, object>();
-                        last["seq"] = RelayServer.GetLong(evt, "seq");
-                        last["role"] = "assistant";
-                        last["text"] = "";
-                        last["thinking"] = "";
-                        last["tools"] = new List<object>();
-                        last["time"] = RelayServer.GetLong(evt, "time");
-                        messages.Add(last);
-                    }
-                    if (text.Trim().Length > 0)
-                    {
-                        string existing = Convert.ToString(last["text"]);
-                        last["text"] = existing.Length == 0 ? text : existing + "\n\n" + text;
-                    }
-                    if (thinking.Length > 0)
-                    {
-                        string existingThought = Convert.ToString(last["thinking"]);
-                        last["thinking"] = existingThought.Length == 0
-                            ? thinking
-                            : existingThought + "\n\n" + thinking;
-                    }
-                    var calls = ToolsOfContent(content);
-                    // tools 是本方法自己创建的 List<object>，不是 JSON 反序列化的结果；
-                    // 但 canAppend 时上一条可能来自别处，取不到就补一个，避免空引用。
-                    var list = last["tools"] as List<object>;
-                    if (list == null)
-                    {
-                        list = new List<object>();
-                        last["tools"] = list;
-                    }
-                    foreach (string tool in calls)
+                    // 每条 assistant/message 独立成条。
+                    //
+                    // 以前是「上一条是助手就往后追加」，几十条回复会被拼成一条超长文本：
+                    // 「只看对话」模式下整段挤在一起，思考也混在中间，
+                    // 用户看到的就是「对话内容显示不全」。
+                    var entry = new Dictionary<string, object>();
+                    entry["seq"] = RelayServer.GetLong(evt, "seq");
+                    entry["role"] = "assistant";
+                    entry["text"] = text;
+                    entry["thinking"] = thinking;
+                    entry["time"] = RelayServer.GetLong(evt, "time");
+
+                    var list = new List<object>();
+                    foreach (string tool in ToolsOfContent(content))
                     {
                         if (!list.Contains(tool)) list.Add(tool);
                     }
+                    entry["tools"] = list;
+                    messages.Add(entry);
                 }
             }
 
@@ -130,6 +115,11 @@ namespace DshRelay
                 var message = raw as Dictionary<string, object>;
                 if (message == null) continue;
                 message["text"] = Clip(Convert.ToString(message["text"]), MaxTextChars);
+                if (message.ContainsKey("thinking"))
+                {
+                    message["thinking"] = Clip(Convert.ToString(message["thinking"]), StepThinkingChars);
+                }
+
             }
             return messages;
         }
@@ -144,7 +134,6 @@ namespace DshRelay
         {
             var steps = new List<object>();
             var pendingTools = new Dictionary<string, Dictionary<string, object>>();
-            Dictionary<string, object> pendingAssistant = null;
 
             foreach (var raw in records ?? new List<object>())
             {
@@ -159,7 +148,6 @@ namespace DshRelay
                     if (!IsHumanMessage(data)) continue;
                     string text = TextOfContent(ContentOf(data));
                     if (text.Trim().Length == 0) continue;
-                    pendingAssistant = null;
                     steps.Add(MessageStep(evt, "user", text));
                     continue;
                 }
@@ -169,44 +157,41 @@ namespace DshRelay
                     var content = ContentOf(data);
                     string text = TextOfContent(content);
                     string thinking = ThinkingOfContent(content);
-                    if (pendingAssistant == null) pendingAssistant = MessageStep(evt, "assistant", "");
-                    if (text.Trim().Length > 0)
-                    {
-                        string existing = Convert.ToString(pendingAssistant["text"]);
-                        pendingAssistant["text"] = existing.Length == 0 ? text : existing + "\n\n" + text;
-                    }
+
+                    // 每一条 assistant/message 各自成步。
+                    //
+                    // 早先的实现靠 pendingAssistant 累积「这一轮」的正文，但它只在
+                    // 有工具调用时才被收走置空——纯文本回复会一直往后合并，
+                    // 于是几十条回复挤成几步，每条回复的思考也被拼成一整段并被截断，
+                    // 用户看到的就是「思考不显示」「对话只有几段」。这里改成逐条落步。
                     if (thinking.Length > 0)
                     {
-                        string existingThought = Convert.ToString(pendingAssistant["thinking"]);
-                        pendingAssistant["thinking"] = existingThought.Length == 0
-                            ? thinking
-                            : existingThought + "\n\n" + thinking;
+                        // 思考单独成步（kind=thinking），手表端据此做成可展开的独立块，
+                        // 与工具调用同样的折叠交互。
+                        var thought = new Dictionary<string, object>();
+                        thought["kind"] = "thinking";
+                        thought["seq"] = RelayServer.GetLong(evt, "seq");
+                        thought["time"] = RelayServer.GetLong(evt, "time");
+                        thought["role"] = "assistant";
+                        thought["text"] = "";
+                        thought["thinking"] = thinking;
+                        thought["tools"] = new List<object>();
+                        steps.Add(thought);
                     }
-                    pendingAssistant["seq"] = RelayServer.GetLong(evt, "seq");
-                    pendingAssistant["time"] = RelayServer.GetLong(evt, "time");
+
+                    if (text.Trim().Length > 0)
+                    {
+                        var reply = MessageStep(evt, "assistant", text);
+                        reply["seq"] = RelayServer.GetLong(evt, "seq");
+                        reply["time"] = RelayServer.GetLong(evt, "time");
+                        steps.Add(reply);
+                    }
 
                     var calls = CallBlocks(content);
                     if (calls.Count == 0) continue;
 
-                    // 先把助手正文收成一条，再把这次的所有工具调用各排一条。
-                    //
-                    // 早先的写法是在工具循环里取一次 pendingAssistant 就置空，循环到第二个
-                    // 工具时拿到的已是 null，随即 NullReferenceException —— 于是「一条助手
-                    // 消息里调了多个工具」的会话全都读不出来。这里改成循环外取一次。
-                    var assistant = pendingAssistant;
-                    pendingAssistant = null;
-                    var labels = assistant["tools"] as List<object>;
-                    if (labels == null)
-                    {
-                        labels = new List<object>();
-                        assistant["tools"] = labels;
-                    }
-                    foreach (var call in calls)
-                    {
-                        string label = ToolLabel(Convert.ToString(call["name"]));
-                        if (!labels.Contains(label)) labels.Add(label);
-                    }
-                    steps.Add(assistant);
+                    // 正文已经单独落步；这里只为每条工具调用各排一条步骤。
+                    // 工具名标签挂在工具步骤自己身上，手表端按正文分界分组时会用到。
 
                     foreach (var call in calls)
                     {
@@ -233,7 +218,6 @@ namespace DshRelay
 
                 if (type == "tool/result")
                 {
-                    pendingAssistant = null;
                     var message = data != null && data.ContainsKey("message") ? data["message"] as Dictionary<string, object> : null;
                     string callId = RelayServer.GetString(message, "toolCallId");
                     string text = TextOfContent(ContentOf(message));
@@ -574,3 +558,4 @@ namespace DshRelay
         }
     }
 }
+

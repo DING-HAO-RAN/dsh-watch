@@ -1546,27 +1546,150 @@ public class MainActivity extends Activity {
             return;
         }
         List<Api.Step> group = new ArrayList<>();
+        List<Api.Step> thoughts = new ArrayList<>();
         for (int i = 0; i < steps.size(); i++) {
             Api.Step step = steps.get(i);
+
+            // 「思考」是独立的一步（中继把它从正文里拆出来了）。
+            // 与工具调用用同一套交互：平时收成一行「思考 N 条」，点开列出清单，
+            // 再点某一条才看全文。这样长会话里不会被大段推理淹掉，
+            // 也不会像以前那样因为塞进正文而被截断。
+            if ("thinking".equals(step.kind)) {
+                thoughts.add(step);
+                continue;
+            }
+
             if ("tool".equals(step.kind)) {
                 group.add(step);
                 continue;
             }
             if (step.text.trim().isEmpty()) continue;
-            // 正文本身是一道分隔：先把上一段的工具调用收成一组。
+
+            // 正文本身是一道分隔：先把上一段的思考与工具调用各自收成一坨。
+            if (!thoughts.isEmpty()) {
+                addTo(container, thinkingGroup(thoughts), 0, 6);
+                thoughts = new ArrayList<>();
+            }
             if (!group.isEmpty()) {
                 addTo(container, toolGroup(group), 0, 6);
                 group = new ArrayList<>();
             }
             addTo(container, stepLabel(step, i + 1), 0, 3);
-            // 思考内容排在正文之前：它是得出这句话之前的推理，顺序与电脑上一致。
-            // 默认折叠成一行，点开才看详细。
-            if (step.thinking != null && !step.thinking.trim().isEmpty()) {
-                addTo(container, thinkingBlock(step), 0, 5);
-            }
             addTo(container, messageBubble(step), 0, 6);
         }
+        if (!thoughts.isEmpty()) addTo(container, thinkingGroup(thoughts), 0, 6);
         if (!group.isEmpty()) addTo(container, toolGroup(group), 0, 6);
+    }
+
+    /**
+     * 思考分组卡片：与工具调用完全一致的交互。
+     *
+     * 收起时是一行「思考 N 条」加一段摘要；点开列出这一段推理的清单，
+     * 再点某一条才看全文。早先把思考塞进正文步骤里、只留 1200 字，
+     * 结果既看不到完整推理，长会话里还会把正文挤下去。
+     */
+    private View thinkingGroup(final List<Api.Step> group) {
+        LinearLayout card = ui.card();
+        final String key = "thinkgroup:" + (group.get(0).seq);
+
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.addView(ui.chip("思考", WatchUi.ACCENT));
+        header.addView(ui.text(" " + group.size() + " 条", 12, WatchUi.FG));
+        card.addView(header);
+
+        // 收起时的摘要：第一条思考的开头。
+        String preview = group.get(0).thinking == null ? "" : group.get(0).thinking.trim();
+        TextView summaryView = ui.text(cut(firstLine(preview), 80), 11, WatchUi.MUTED);
+        summaryView.setPadding(0, ui.dp(6), 0, 0);
+        summaryView.setMaxLines(2);
+        summaryView.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        card.addView(summaryView);
+
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        list.setVisibility(View.GONE);
+
+        final List<View> details = new ArrayList<>();
+        final List<View> lines = new ArrayList<>();
+        for (int i = 0; i < group.size(); i++) {
+            final Api.Step step = group.get(i);
+            final String rowKey = key + "#" + i;
+
+            LinearLayout rowBox = new LinearLayout(this);
+            rowBox.setOrientation(LinearLayout.VERTICAL);
+            rowBox.setMinimumHeight(ui.dp(48));
+
+            String body = step.thinking == null ? "" : step.thinking.trim();
+            TextView line = ui.text(cut(firstLine(body), 90), 10, WatchUi.MUTED);
+            line.setPadding(ui.dp(2), ui.dp(5), 0, 0);
+            line.setMaxLines(2);
+            line.setEllipsize(android.text.TextUtils.TruncateAt.END);
+            rowBox.addView(line);
+
+            // 全文用 Markdown 渲染：思考里常带列表、代码片段，等宽显示更好读。
+            TextView full = new TextView(this);
+            full.setTextSize(10);
+            full.setTextColor(WatchUi.MUTED);
+            full.setLineSpacing(ui.dp(1), 1f);
+            full.setText(Markdown.render(body, WatchUi.MUTED, WatchUi.ACCENT,
+                    WatchUi.MUTED, WatchUi.SURFACE_HI));
+            full.setPadding(ui.dp(2), ui.dp(4), 0, ui.dp(4));
+            full.setVisibility(View.GONE);
+            rowBox.addView(full);
+
+            rowBox.setFocusable(true);
+            rowBox.setClickable(true);
+            rowBox.setOnClickListener(v -> {
+                boolean open = full.getVisibility() != View.VISIBLE;
+                full.setVisibility(open ? View.VISIBLE : View.GONE);
+                line.setVisibility(open ? View.GONE : View.VISIBLE);
+                if (open) openRows.add(rowKey);
+                else openRows.remove(rowKey);
+            });
+            details.add(full);
+            lines.add(line);
+            list.addView(rowBox);
+        }
+        card.addView(list);
+
+        TextView toggle = ui.text("展开", 10, WatchUi.ACCENT);
+        toggle.setPadding(0, ui.dp(6), 0, 0);
+        card.addView(toggle);
+
+        final TextView summary = summaryView;
+        final TextView toggleView = toggle;
+        toggle.setOnClickListener(v -> toggleThinking(key, list, summary, toggleView));
+        // 标题与摘要也能开合，整块卡片区域都可用，不必精确点「展开」两个字。
+        header.setOnClickListener(v -> toggleThinking(key, list, summary, toggleView));
+        summary.setOnClickListener(v -> toggleThinking(key, list, summary, toggleView));
+
+        restoreThinking(key, list, summary, toggle, details, lines);
+        return card;
+    }
+
+    /** 开合一个思考分组，并记住状态。 */
+    private void toggleThinking(String key, View list, TextView summary, TextView toggle) {
+        boolean open = list.getVisibility() != View.VISIBLE;
+        list.setVisibility(open ? View.VISIBLE : View.GONE);
+        summary.setVisibility(open ? View.GONE : View.VISIBLE);
+        toggle.setText(open ? "收起" : "展开");
+        if (open) openGroups.add(key);
+        else openGroups.remove(key);
+    }
+
+    /** 整屏重建后恢复思考分组的展开状态（直接设可见性，不走动画）。 */
+    private void restoreThinking(String key, View list, TextView summary, TextView toggle,
+                                 List<View> details, List<View> lines) {
+        boolean expanded = openGroups.contains(key);
+        list.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        summary.setVisibility(expanded ? View.GONE : View.VISIBLE);
+        toggle.setText(expanded ? "收起" : "展开");
+        for (int i = 0; i < details.size(); i++) {
+            boolean open = openRows.contains(key + "#" + i);
+            details.get(i).setVisibility(open ? View.VISIBLE : View.GONE);
+            if (i < lines.size()) lines.get(i).setVisibility(open ? View.GONE : View.VISIBLE);
+        }
     }
 
     /**
