@@ -13,10 +13,11 @@ import { createServer } from 'node:http'
 import { createSocket } from 'node:dgram'
 import { networkInterfaces } from 'node:os'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { readFile } from 'node:fs/promises'
-import { join } from 'node:path'
+import { readFile, readdir, stat } from 'node:fs/promises'
+import { basename, extname, join, resolve, sep } from 'node:path'
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { moduleDirectory } from './paths.mjs'
+import { TerminalHub } from './terminals.mjs'
 import { MAX_MESSAGES, MAX_SESSIONS, groupByProject, normalizeMessages, normalizeModelCatalog, normalizePlan, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession, subagentsOf } from './state.mjs'
 
 /**
@@ -44,6 +45,24 @@ const MAX_BODY_BYTES = 256 * 1024
 const TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000
 /** 一个 waterfall 事件的有效期：超过后只能走 RPC 补答。 */
 const EVENT_WINDOW_MS = 10 * 60 * 1000
+/**
+ * 会话索引的新鲜期。
+ *
+ * DSH 的 session/list 要 2~5 秒、返回约 1MB，绝不能每次请求都穿透。
+ * 取 6 秒：比手机列表页的 10 秒轮询短，比会话页的 4 秒刷新长——
+ * 既能保证用户改完会话名几秒内可见，又不会让 4 秒一次的会话刷新反复触发重拉。
+ */
+const FRESH_MS = 6_000
+/** 内容缓存最多保留几个会话（每个约 100KB）。 */
+const MAX_SESSION_PAGES = 12
+/**
+ * 发出消息后的「乐观运行」窗口。
+ *
+ * 会话列表有 6 秒缓存，刚发完消息时 running 还是 false，界面会显示「空闲」，
+ * 用户以为没发出去。这里在发送后的一小段时间内直接把该会话当运行中，
+ * 等真实数据接管（6 秒足够列表缓存刷新）。
+ */
+const OPTIMISTIC_RUNNING_MS = 8_000
 
 function json(res, status, payload) {
   const body = JSON.stringify(payload)
@@ -134,6 +153,104 @@ function compactQuestions(questions) {  return (Array.isArray(questions) ? quest
   }))
 }
 
+/**
+ * 有并发上限的 map。
+ *
+ * 用于把「对每个会话各发一次 RPC」这类串行循环改成并行：串行时每次往返都要
+ * 几十毫秒到几秒，会话一多就把一个接口拖成十几秒。上限存在的意义是不把
+ * DSH 一次性打爆（它自己也是单进程）。
+ */
+async function mapLimit(items, limit, worker) {
+  const results = new Array(items.length)
+  let cursor = 0
+  const runners = new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+    while (true) {
+      const index = cursor
+      cursor += 1
+      if (index >= items.length) return
+      results[index] = await worker(items[index], index)
+    }
+  })
+  await Promise.all(runners)
+  return results
+}
+
+
+const MAX_FILE_BYTES = 512 * 1024
+/** 一个目录最多返回的条目数。 */
+const MAX_DIR_ENTRIES = 600
+
+/**
+ * 目标路径必须落在工作区根目录内。
+ *
+ * 手机端的「查看文件」是浏览会话的工作目录，不是浏览整台电脑：没有这道检查，
+ * 任何拿到配对令牌的设备都能用 `../../` 读到密钥文件。中继在本机有完整读权限，
+ * 因此这里必须自己把关（DSH 的白名单机制在手机端用不上）。
+ */
+function withinRoot(root, target) {
+  const base = resolve(root)
+  const full = resolve(base, target)
+  return full === base || full.startsWith(base + sep)
+}
+
+/** 扩展名 → 语言标识。手机端据此选高亮规则，未命中按纯文本显示。 */
+function languageOf(name) {
+  const ext = extname(name).toLowerCase()
+  const table = {
+    '.java': 'java', '.js': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript',
+    '.ts': 'typescript', '.tsx': 'typescript', '.jsx': 'javascript', '.json': 'json',
+    '.py': 'python', '.md': 'markdown', '.css': 'css', '.html': 'html', '.htm': 'html',
+    '.xml': 'xml', '.yml': 'yaml', '.yaml': 'yaml', '.sh': 'shell', '.ps1': 'powershell',
+    '.bat': 'batch', '.cmd': 'batch', '.sql': 'sql', '.c': 'c', '.h': 'c', '.cpp': 'cpp',
+    '.cs': 'csharp', '.go': 'go', '.rs': 'rust', '.kt': 'kotlin', '.gradle': 'groovy',
+    '.toml': 'toml', '.ini': 'ini', '.txt': 'text', '.log': 'text', '.gitignore': 'text',
+  }
+  return table[ext] ?? 'text'
+}
+
+/** 图片不按文本读，直接给 base64，手机端用 BitmapFactory 解码。 */
+function isImageName(name) {
+  return ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp'].includes(extname(name).toLowerCase())
+}
+
+/**
+ * 每个网段的定向广播地址（例如 192.168.1.255）。
+ *
+ * 只发 255.255.255.255 时由系统挑网卡，装了 VPN 的机器会把包送到虚拟网卡，
+ * 手机所在局域网一个包都收不到。逐网段发才能保证对端一定收到。
+ */
+function directedBroadcasts() {
+  const targets = []
+  for (const entries of Object.values(networkInterfaces())) {
+    for (const entry of entries ?? []) {
+      if (entry.family !== 'IPv4' || entry.internal === true) continue
+      const address = ipv4ToInt(entry.address)
+      const mask = ipv4ToInt(entry.netmask)
+      if (address === undefined || mask === undefined) continue
+      const broadcast = (address & mask) | (~mask >>> 0)
+      targets.push(intToIpv4(broadcast))
+    }
+  }
+  return targets
+}
+
+function ipv4ToInt(value) {
+  const parts = String(value).split('.')
+  if (parts.length !== 4) return undefined
+  let result = 0
+  for (const part of parts) {
+    const octet = Number(part)
+    if (!Number.isInteger(octet) || octet < 0 || octet > 255) return undefined
+    result = (result << 8) | octet
+  }
+  return result >>> 0
+}
+
+function intToIpv4(value) {
+  const number = value >>> 0
+  return [(number >>> 24) & 255, (number >>> 16) & 255, (number >>> 8) & 255, number & 255].join('.')
+}
+
 export class RelayServer {
   /**
    * @param {object} options
@@ -151,6 +268,19 @@ export class RelayServer {
     this.tokens = new Map()
     /** callId → {eventId, at}：用于优先走 waterfall 前台应答通道。 */
     this.pendingEvents = new Map()
+    /** eventId → 待审批请求。approval/request 也是 waterfall，回填必须带 eventId。 */
+    this.pendingApprovals = new Map()
+    /** 终端中心：把 attach 流桥接成手机可轮询的增量缓冲。 */
+    this.terminals = new TerminalHub({ link: this.link, log: this.log })
+    /** 会话索引短缓存，见 sessionIndex()。 */
+    this.sessionCache = undefined
+    this.sessionCacheAt = 0
+    this.sessionPending = undefined
+    this.sessionRefreshing = false
+    /** 会话内容缓存：key 见 readSession，值是裁剪后的完整响应。 */
+    this.sessionPages = new Map()
+    /** sessionId → 到期时间：发出消息后的一小段时间内当作运行中，见 OPTIMISTIC_RUNNING_MS。 */
+    this.optimisticRunning = new Map()
     this.lastReconcileAt = 0
     /** 公网地址（由入口在隧道就绪后注入），用于状态接口与打印。 */
     this.publicBaseUrl = undefined
@@ -252,6 +382,82 @@ export class RelayServer {
   }
 
   /**
+   * 会话索引（stale-while-revalidate）。
+   *
+   * 为什么必须这样：DSH 的 `session/list` 一次返回约 1MB（748 个会话里 534 个是
+   * 子代理），实测单次 2.4~4.8 秒，且参数（limit / includeSubagents）几乎压不下来——
+   * 开销在 DSH 侧，不在返回体。中继有五个接口要用这份数据（会话列表、会话详情、
+   * 文件页、终端页、工作区），若每次请求都穿透到 DSH，手表的 4 秒/10 秒轮询根本
+   * 跑不动，表现就是「加载很久然后超时」。
+   *
+   * 因此：**手上有旧数据就立刻返回旧数据**，同时后台刷新；只有完全没数据时才等待。
+   * 代价是新建的会话最多晚一个刷新周期（FRESH_MS）出现在列表里，换来的是任何一次
+   * 请求都不再被 2~5 秒的列表拉取卡住。
+   */
+  async sessionIndex() {
+    const now = Date.now()
+    if (this.sessionCache !== undefined) {
+      if (now - this.sessionCacheAt >= FRESH_MS) this.refreshSessionIndex()
+      return this.sessionCache
+    }
+    // 冷启动：必须等一次。并发请求共用同一个 promise，避免同时打多份 1MB 的列表。
+    if (this.sessionPending === undefined) {
+      this.sessionPending = this.link.rpc('session/list', { _request: {} })
+        .then((value) => {
+          this.sessionCache = normalizeSessionList(value, true, 0)
+          this.sessionCacheAt = Date.now()
+          return this.sessionCache
+        })
+        .finally(() => { this.sessionPending = undefined })
+    }
+    return this.sessionPending
+  }
+
+  /**
+   * 后台刷新会话索引，不阻塞调用方。
+   *
+   * 失败时保留旧数据并推迟下一次重试：DSH 重启的瞬间列表会报错，
+   * 此时把手上的旧数据继续发出去，比让手表看到一片空白好得多。
+   */
+  refreshSessionIndex() {
+    if (this.sessionRefreshing) return
+    this.sessionRefreshing = true
+    this.link.rpc('session/list', { _request: {} })
+      .then((value) => {
+        this.sessionCache = normalizeSessionList(value, true, 0)
+        this.sessionCacheAt = Date.now()
+      })
+      .catch((error) => {
+        this.log(`后台刷新会话列表失败（继续用旧数据）：${String(error.message)}`)
+        // 有旧数据就标记为新鲜，避免 DSH 抖动时反复重试；
+        // 一条数据都没有时保持「已过期」，让下一次请求立刻再试。
+        if (this.sessionCache !== undefined) this.sessionCacheAt = Date.now()
+      })
+      .finally(() => { this.sessionRefreshing = false })
+  }
+
+  /** 会话数据变了（发送、重命名等）时让缓存立刻过期，下一次读取会重新拉。 */
+  invalidateSessionIndex() {
+    this.sessionCacheAt = 0
+  }
+
+  /**
+   * 预热会话索引。
+   *
+   * DSH 的 session/list 一次 2~5 秒（返回约 1MB）。中继启动时先拉一次，
+   * 等设备连上来时缓存已经就绪，第一次打开列表就是毫秒级——否则用户会看到
+   * 一个 3 秒以上的白屏，网络差时还会撞上超时。
+   */
+  async warmup() {
+    try {
+      await this.sessionIndex()
+      this.log(`会话索引已预热（${String(this.sessionCache?.length ?? 0)} 条）`)
+    } catch (error) {
+      this.log(`预热会话索引失败（首次请求会重试）：${String(error.message)}`)
+    }
+  }
+
+  /**
    * 记录 waterfall 帧：既保存 eventId 用于走前台应答通道，也保存问题内容，
    * 这样即使投影还没登记（前台 open 状态），手表也能看到并回答。
    *
@@ -274,7 +480,26 @@ export class RelayServer {
         this.pendingEvents = new Map(fresh.slice(-20))
       }
     }
+    if (frame.type === 'waterfall' && frame.event === 'approval/request') {
+      // 审批与提问同构：都是一次性 waterfall，回填时 DSH 只认 clientId+eventId。
+      const request = frame.request ?? {}
+      const eventId = String(frame.eventId ?? '')
+      if (eventId !== '') {
+        this.pendingApprovals.set(eventId, {
+          eventId,
+          sessionId: String(frame.agentId ?? ''),
+          toolName: String(request.toolName ?? ''),
+          callId: String(request.callId ?? ''),
+          reason: String(request.reason ?? ''),
+          displayReason: typeof request.displayReason === 'string' ? request.displayReason : '',
+          at: Date.now(),
+        })
+        const fresh = [...this.pendingApprovals.entries()].filter(([, record]) => Date.now() - record.at < EVENT_WINDOW_MS)
+        this.pendingApprovals = new Map(fresh.slice(-20))
+      }
+    }
     if (frame.type === 'cancel' && typeof frame.eventId === 'string') {
+      this.pendingApprovals.delete(frame.eventId)
       for (const [key, record] of this.pendingEvents) {
         if (record.eventId === frame.eventId) this.pendingEvents.delete(key)
       }
@@ -283,11 +508,16 @@ export class RelayServer {
 
   /** 汇总当前所有待答问题（跨会话），供手表列表页提示。 */
   async collectPending(sessions) {
+    // 只查标了 waiting 的会话；并发拉取（上限 4）而不是逐个 await——
+    // 串行时每个会话一次往返，等待中的会话一多，列表接口就会被拖到几秒。
+    const waiting = sessions.filter((session) => session.waiting)
+    if (waiting.length === 0) return []
+    const results = await mapLimit(waiting, 4, (session) =>
+      this.link.rpcSafe('session/projections', { request: { sessionId: session.id } }))
     const pending = []
-    for (const session of sessions) {
-      if (!session.waiting) continue
-      const projection = await this.link.rpcSafe('session/projections', { request: { sessionId: session.id } })
-      const active = projection?.values?.userQuestions?.active
+    for (let index = 0; index < waiting.length; index += 1) {
+      const session = waiting[index]
+      const active = results[index]?.values?.userQuestions?.active
       if (!Array.isArray(active)) continue
       for (const item of active) {
         const callId = String(item?.callId ?? '')
@@ -367,8 +597,19 @@ export class RelayServer {
    * @param {string} [mode] 子代理模式（one-shot / continuable / unknown）
    */
   async readSession(sessionId, running, throughSeq, parentId, mode) {
+    // 内容缓存的正确做法：**先用便宜的 projections 拿 asOfSeq，再拿它当缓存键**。
+    //
+    // 为什么不能按「running 与否」猜 TTL：会话刚发完消息、DSH 还没把 running 翻过来时，
+    // 会命中「空闲」的长缓存，用户就看不到自己刚发的那句话（实测踩过）。
+    // projections 只要 5ms 且永远反映最新状态；真正昂贵的是 session/page
+    // （一次拉回 300KB~1.5MB 原始事件，实测最重 1.5MB / 148ms）。
+    // 所以：便宜的每次都问，昂贵的按 asOfSeq 命中。
     const projection = await this.link.rpc('session/projections', { request: { sessionId } })
     const latest = Number(projection?.asOfSeq ?? 0)
+    const cacheKey = `${sessionId}|${throughSeq ?? 0}|${parentId ?? ''}|${mode ?? ''}|${latest}`
+    const cached = this.sessionPages.get(cacheKey)
+    if (cached !== undefined) return cached.value
+
     const from = typeof throughSeq === 'number' && Number.isSafeInteger(throughSeq) && throughSeq > 0
       ? Math.min(throughSeq, latest)
       : latest
@@ -403,11 +644,16 @@ export class RelayServer {
         }
       }
     }
-    return {
+    // 乐观运行：发出消息后的窗口内直接当作运行中，避免界面显示「空闲」让人以为没发出去。
+    const optimisticUntil = this.optimisticRunning.get(sessionId) ?? 0
+    if (optimisticUntil !== 0 && Date.now() > optimisticUntil) this.optimisticRunning.delete(sessionId)
+    const effectiveRunning = running || Date.now() < optimisticUntil
+
+    const result = {
       ok: true,
       sessionId,
       title: typeof projection?.values?.title === 'string' ? projection.values.title : '',
-      running,
+      running: effectiveRunning,
       hasMore: page?.hasMore === true,
       asOfSeq: latest,
       fromSeq: from,
@@ -419,6 +665,31 @@ export class RelayServer {
       // 计划与任务：待办清单、计划模式开关、团队任务板、长目标。
       plan: normalizePlan(projection?.values),
       ...(question === undefined ? {} : { question }),
+    }
+    this.rememberSessionPage(cacheKey, result)
+    return result
+  }
+
+  /**
+   * 写入会话内容缓存，并按总量淘汰。
+   *
+   * 单个会话裁剪后约 100KB，缓存太多会把中继的内存吃满（跑几天、看几十个会话
+   * 是常态），因此保留最近 12 个会话的结果，超出的按时间淘汰最旧的。
+   */
+  rememberSessionPage(key, value) {
+    const now = Date.now()
+    this.sessionPages.set(key, { at: now, value })
+    if (this.sessionPages.size <= MAX_SESSION_PAGES) return
+    const entries = [...this.sessionPages.entries()].sort((a, b) => a[1].at - b[1].at)
+    for (let index = 0; index < entries.length - MAX_SESSION_PAGES; index += 1) {
+      this.sessionPages.delete(entries[index][0])
+    }
+  }
+
+  /** 丢掉某个会话的所有缓存分页（内容已变时调用）。 */
+  forgetSessionPage(sessionId) {
+    for (const key of [...this.sessionPages.keys()]) {
+      if (key.startsWith(`${sessionId}|`)) this.sessionPages.delete(key)
     }
   }
 
@@ -486,10 +757,9 @@ export class RelayServer {
 
     if (path === '/api/sessions' && req.method === 'GET') {
       const includeSubagents = url.searchParams.get('subagents') === '1'
-      const value = await this.link.rpc('session/list', { _request: {} })
       // 一次拉全量（含子代理、不截断）再按需要过滤：截断必须发生在过滤之后，
       // 否则更新时间很新的几百条子代理会把父会话挤出列表。
-      const all = normalizeSessionList(value, true, 0)
+      const all = await this.sessionIndex()
       const visible = includeSubagents ? all : all.filter((item) => item.subagent !== true)
       const sessions = visible.slice(0, MAX_SESSIONS)
       attachSubagentCounts(all, sessions)
@@ -510,7 +780,7 @@ export class RelayServer {
         return
       }
       // 子代理的信息全在 session/list 里，不必为每个子代理再拉一次投影。
-      const all = normalizeSessionList(await this.link.rpc('session/list', { _request: {} }), true, 0)
+      const all = await this.sessionIndex()
       json(res, 200, { ok: true, parentId, subagents: subagentsOf(all, parentId) })
       return
     }
@@ -525,8 +795,9 @@ export class RelayServer {
       const throughRaw = url.searchParams.get('through') ?? ''
       const through = throughRaw === '' ? undefined : Number(throughRaw)
       // running 与父地址都从列表摘要读：projections 里没有 running，子代理的历史
-      // 又必须靠父地址才能读到，因此这里必须查全量列表（不截断）。
-      const listed = normalizeSessionList(await this.link.rpcSafe('session/list', { _request: {} }), true, 0)
+      // 又必须靠父地址才能读到。走 sessionIndex 的短缓存——几百个会话时
+      // 每次都拉全量列表会让打开会话明显卡住（实测 700+ 会话要十几秒）。
+      const listed = await this.sessionIndex()
       const summary = listed.find((item) => item.id === sessionId)
       json(res, 200, await this.readSession(
         sessionId,
@@ -584,6 +855,12 @@ export class RelayServer {
           clientTimeZone: 'Asia/Shanghai',
         },
       })
+      // 刚发出的消息会改变 running 与 updatedAt，让列表下一次读取重新拉。
+      this.invalidateSessionIndex()
+      // 内容缓存也要清：否则用户发完消息，4 秒刷新拿到的还是旧内容（看不到自己那句话）。
+      this.forgetSessionPage(sessionId)
+      // 列表缓存要 6 秒才反映 running，这段时间内先按运行中处理。
+      this.optimisticRunning.set(sessionId, Date.now() + OPTIMISTIC_RUNNING_MS)
       json(res, 200, { ok: true })
       return
     }
@@ -591,7 +868,10 @@ export class RelayServer {
     if (path === '/api/cancel' && req.method === 'POST') {
       const body = await readJsonBody(req)
       // session/cancel 同样以 request 为参数名。
-      await this.link.rpc('session/cancel', { request: { sessionId: String(body.sessionId ?? '') } })
+      const cancelId = String(body.sessionId ?? '')
+      await this.link.rpc('session/cancel', { request: { sessionId: cancelId } })
+      this.invalidateSessionIndex()
+      this.forgetSessionPage(cancelId)
       json(res, 200, { ok: true })
       return
     }
@@ -603,6 +883,7 @@ export class RelayServer {
       if (typeof body.cwd === 'string' && body.cwd !== '') args.request.cwd = body.cwd
       if (typeof body.workspaceId === 'string' && body.workspaceId !== '') args.request.workspaceId = body.workspaceId
       const value = await this.link.rpc('session/create', args)
+      this.invalidateSessionIndex()
       json(res, 200, { ok: true, sessionId: String(value?.sessionId ?? '') })
       return
     }
@@ -630,6 +911,8 @@ export class RelayServer {
         try {
           await this.link.resolveEvent(eventId, { answers: normalized })
           this.pendingEvents.delete(callId)
+          // 答完之后 question 字段要从会话内容里消失，缓存必须失效。
+          this.forgetSessionPage(sessionId)
           json(res, 200, { ok: true, via: 'events' })
           return
         } catch (error) {
@@ -643,7 +926,309 @@ export class RelayServer {
         return
       }
       const accepted = await this.link.rpc('userQuestions/answer', { agentId: sessionId, callId, answer: { answers: normalized } })
+      this.forgetSessionPage(sessionId)
       json(res, 200, { ok: true, via: 'rpc', accepted: accepted === true })
+      return
+    }
+
+    // ===== 以下是手机端用的接口 =====
+
+    if (path === '/api/approvals' && req.method === 'GET') {
+      // 审批是一次性 waterfall：DSH 只认 clientId+eventId，因此必须原样带出 eventId。
+      const now = Date.now()
+      const items = [...this.pendingApprovals.values()]
+        .filter((record) => now - record.at < EVENT_WINDOW_MS)
+        .map((record) => ({
+          eventId: record.eventId,
+          sessionId: record.sessionId,
+          toolName: record.toolName,
+          callId: record.callId,
+          reason: record.reason,
+          displayReason: record.displayReason,
+          ageMs: now - record.at,
+        }))
+      json(res, 200, { ok: true, approvals: items })
+      return
+    }
+
+    if (path === '/api/approval' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const eventId = String(body.eventId ?? '')
+      // DSH 的审批结果只有两个取值：allowed-once（允许这一次）与 rejected（拒绝）。
+      const decision = body.decision === 'allowed-once' ? 'allowed-once' : 'rejected'
+      const record = this.pendingApprovals.get(eventId)
+      if (eventId === '' || record === undefined) {
+        json(res, 409, { ok: false, error: '这个审批已失效，请在电脑端处理' })
+        return
+      }
+      try {
+        await this.link.resolveEvent(eventId, decision)
+        this.pendingApprovals.delete(eventId)
+        json(res, 200, { ok: true, decision })
+      } catch (error) {
+        // 回填失败通常是事件流断开重连换了 clientId：把记录清掉，避免手机端反复点一个死请求。
+        this.pendingApprovals.delete(eventId)
+        json(res, 409, { ok: false, error: `审批未能送达 DSH：${String(error.message)}` })
+      }
+      return
+    }
+
+    if (path === '/api/workspaces' && req.method === 'GET') {
+      const listed = await this.sessionIndex()
+      const sessions = listed.filter((item) => item.subagent !== true)
+      const groups = new Map()
+      for (const session of sessions) {
+        const key = session.projectPath === '' ? '' : session.projectPath
+        let group = groups.get(key)
+        if (group === undefined) {
+          group = {
+            path: key,
+            name: session.project === '' ? '未分组' : session.project,
+            sessions: 0,
+            running: 0,
+            waiting: 0,
+            updatedAt: 0,
+          }
+          groups.set(key, group)
+        }
+        group.sessions += 1
+        if (session.running) group.running += 1
+        if (session.waiting) group.waiting += 1
+        if (session.updatedAt > group.updatedAt) group.updatedAt = session.updatedAt
+      }
+      const workspaces = [...groups.values()].sort((a, b) => b.updatedAt - a.updatedAt)
+      json(res, 200, { ok: true, workspaces })
+      return
+    }
+
+    if (path === '/api/files' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('id') ?? ''
+      const relative = url.searchParams.get('path') ?? ''
+      if (sessionId === '') {
+        json(res, 400, { ok: false, error: '缺少 id 参数' })
+        return
+      }
+      const listed = await this.sessionIndex()
+      const session = listed.find((item) => item.id === sessionId)
+      const root = session?.projectPath ?? ''
+      if (root === '') {
+        json(res, 409, { ok: false, error: '这个会话没有工作目录，无法浏览文件' })
+        return
+      }
+      if (!withinRoot(root, relative)) {
+        json(res, 403, { ok: false, error: '只能浏览当前会话的工作目录' })
+        return
+      }
+      const target = resolve(root, relative)
+      let entries
+      try {
+        entries = await readdir(target, { withFileTypes: true })
+      } catch (error) {
+        json(res, 404, { ok: false, error: `目录不可读：${String(error.message)}` })
+        return
+      }
+      const rows = []
+      for (const entry of entries) {
+        if (rows.length >= MAX_DIR_ENTRIES) break
+        // .git 内部结构对手机没有意义，且条目极多。
+        if (entry.name === '.git') continue
+        let size = 0
+        let mtime = 0
+        try {
+          const info = await stat(join(target, entry.name))
+          size = info.size
+          mtime = info.mtimeMs
+        } catch { /* 符号链接或权限问题：保留条目，只是没有大小 */ }
+        rows.push({
+          name: entry.name,
+          type: entry.isDirectory() ? 'directory' : (entry.isFile() ? 'file' : 'other'),
+          size,
+          mtime,
+          language: entry.isFile() ? languageOf(entry.name) : '',
+        })
+      }
+      // 目录在前、同类按名字排，和电脑上的文件管理器一致。
+      rows.sort((a, b) => {
+        if (a.type !== b.type) return a.type === 'directory' ? -1 : 1
+        return a.name.localeCompare(b.name, 'zh-Hans-CN')
+      })
+      json(res, 200, {
+        ok: true,
+        root,
+        path: relative,
+        parent: relative === '' ? '' : (relative.includes('/') ? relative.slice(0, relative.lastIndexOf('/')) : ''),
+        entries: rows,
+        truncated: entries.length > rows.length,
+      })
+      return
+    }
+
+    if (path === '/api/file' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('id') ?? ''
+      const relative = url.searchParams.get('path') ?? ''
+      if (sessionId === '' || relative === '') {
+        json(res, 400, { ok: false, error: '缺少 id 或 path 参数' })
+        return
+      }
+      const listed = await this.sessionIndex()
+      const session = listed.find((item) => item.id === sessionId)
+      const root = session?.projectPath ?? ''
+      if (root === '' || !withinRoot(root, relative)) {
+        json(res, 403, { ok: false, error: '只能读取当前会话工作目录里的文件' })
+        return
+      }
+      const target = resolve(root, relative)
+      let info
+      try {
+        info = await stat(target)
+      } catch (error) {
+        json(res, 404, { ok: false, error: `文件不存在：${String(error.message)}` })
+        return
+      }
+      if (!info.isFile()) {
+        json(res, 400, { ok: false, error: '这不是文件' })
+        return
+      }
+      if (isImageName(relative)) {
+        if (info.size > 4 * 1024 * 1024) {
+          json(res, 413, { ok: false, error: '图片超过 4MB，手机端不加载' })
+          return
+        }
+        const bytes = await readFile(target)
+        json(res, 200, {
+          ok: true,
+          name: basename(relative),
+          path: relative,
+          kind: 'image',
+          size: info.size,
+          mtime: info.mtimeMs,
+          base64: bytes.toString('base64'),
+        })
+        return
+      }
+      const bytes = await readFile(target)
+      const slice = bytes.subarray(0, MAX_FILE_BYTES)
+      // 含 NUL 字节的按二进制处理，避免把 exe 当文本塞给手机端。
+      const binary = slice.includes(0)
+      json(res, 200, {
+        ok: true,
+        name: basename(relative),
+        path: relative,
+        kind: binary ? 'binary' : 'text',
+        language: languageOf(relative),
+        size: info.size,
+        mtime: info.mtimeMs,
+        truncated: bytes.byteLength > MAX_FILE_BYTES,
+        text: binary ? '' : slice.toString('utf8'),
+      })
+      return
+    }
+
+    if (path === '/api/terminals' && req.method === 'GET') {
+      const sessionId = url.searchParams.get('id') ?? ''
+      if (sessionId === '') {
+        json(res, 400, { ok: false, error: '缺少 id 参数' })
+        return
+      }
+      const items = await this.terminals.list(sessionId)
+      json(res, 200, { ok: true, terminals: items })
+      return
+    }
+
+    if (path === '/api/terminal' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const action = String(body.action ?? '')
+      if (action === 'create') {
+        const sessionId = String(body.id ?? '')
+        if (sessionId === '') {
+          json(res, 400, { ok: false, error: '缺少 id（会话）参数' })
+          return
+        }
+        try {
+          const terminal = await this.terminals.create({
+            sessionId,
+            cols: body.cols,
+            rows: body.rows,
+            shellPath: body.shellPath,
+          })
+          json(res, 200, { ok: true, terminal })
+        } catch (error) {
+          json(res, 409, { ok: false, error: `创建终端失败：${String(error.message)}` })
+        }
+        return
+      }
+      if (action === 'attach') {
+        const sessionId = String(body.id ?? '')
+        const terminalId = String(body.terminalId ?? '')
+        if (sessionId === '' || terminalId === '') {
+          json(res, 400, { ok: false, error: '缺少 id 或 terminalId' })
+          return
+        }
+        json(res, 200, await this.terminals.attachExisting(sessionId, terminalId))
+        return
+      }
+      if (action === 'input') {
+        json(res, 200, this.terminals.input(String(body.terminalId ?? ''), body.data ?? ''))
+        return
+      }
+      if (action === 'resize') {
+        json(res, 200, this.terminals.resize(String(body.terminalId ?? ''), body.cols, body.rows))
+        return
+      }
+      if (action === 'close') {
+        json(res, 200, await this.terminals.close(String(body.terminalId ?? '')))
+        return
+      }
+      json(res, 400, { ok: false, error: '未知的 action' })
+      return
+    }
+
+    if (path === '/api/terminal/output' && req.method === 'GET') {
+      const terminalId = url.searchParams.get('id') ?? ''
+      const since = Number(url.searchParams.get('since') ?? '0')
+      if (terminalId === '') {
+        json(res, 400, { ok: false, error: '缺少 id 参数' })
+        return
+      }
+      const result = this.terminals.output(terminalId, Number.isFinite(since) ? since : 0)
+      json(res, result.ok === false ? 404 : 200, result)
+      return
+    }
+
+    if (path === '/api/session/rename' && req.method === 'POST') {
+      const body = await readJsonBody(req)
+      const sessionId = String(body.id ?? '')
+      const title = String(body.title ?? '').trim()
+      if (sessionId === '' || title === '') {
+        json(res, 400, { ok: false, error: '缺少 id 或 title' })
+        return
+      }
+      try {
+        const value = await this.link.rpc('session/rename', { request: { sessionId, title } })
+        this.invalidateSessionIndex()
+        json(res, 200, { ok: true, title: String(value?.title ?? title) })
+      } catch (error) {
+        json(res, 409, { ok: false, error: `重命名失败：${String(error.message)}` })
+      }
+      return
+    }
+
+    if (path === '/api/session/queue' && req.method === 'POST') {
+      // 运行中会话的排队消息：手机端在「正在回答时又发一条」时用它查看队列。
+      const body = await readJsonBody(req)
+      const sessionId = String(body.id ?? '')
+      if (sessionId === '') {
+        json(res, 400, { ok: false, error: '缺少 id' })
+        return
+      }
+      try {
+        const value = await this.link.rpc('session/updateQueue', {
+          request: { sessionId, entries: Array.isArray(body.entries) ? body.entries : [] },
+        })
+        json(res, 200, { ok: true, value })
+      } catch (error) {
+        json(res, 409, { ok: false, error: `更新队列失败：${String(error.message)}` })
+      }
       return
     }
 
@@ -668,20 +1253,27 @@ export class RelayServer {
   }
 
   /**
-   * 周期性 UDP 广播，让手表无需手输 IP 即可发现中继。
-   * 报文是单行 JSON，手表只按 `service` 字段识别。
+   * 周期性 UDP 广播，让手机/手表无需手输 IP 即可发现中继。
+   * 报文是单行 JSON，设备只按 `service` 字段识别。
+   *
+   * **必须按每个网段发定向广播**，不能只发 255.255.255.255：
+   * 只发全局广播时由系统选路由，装了 VPN 或虚拟网卡的机器会把包从那张网卡送出去，
+   * 手机所在的局域网一个包都收不到（实测这台机器上默认走了 198.18.0.1 的虚拟网卡）。
+   * 因此这里对每个非回环 IPv4 网卡各算一次定向广播地址。
    */
   startBeacon() {
     const socket = createSocket({ type: 'udp4', reuseAddr: true })
     socket.on('error', (error) => { this.log(`广播失败：${String(error.message)}`) })
     socket.bind(() => {
       socket.setBroadcast(true)
+      const payload = Buffer.from(JSON.stringify({ service: SERVICE_TAG, port: this.port, name: 'DSH 中继' }))
       const send = () => {
-        const payload = Buffer.from(JSON.stringify({ service: SERVICE_TAG, port: this.port, name: 'DSH 中继' }))
-        try {
-          socket.send(payload, DISCOVERY_PORT, '255.255.255.255')
-        } catch (error) {
-          this.log(`广播发送失败：${String(error.message)}`)
+        const targets = new Set(['255.255.255.255'])
+        for (const target of directedBroadcasts()) targets.add(target)
+        for (const target of targets) {
+          try {
+            socket.send(payload, DISCOVERY_PORT, target)
+          } catch { /* 单个网卡发不出去不影响其它网卡 */ }
         }
       }
       send()

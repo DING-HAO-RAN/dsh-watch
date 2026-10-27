@@ -120,6 +120,9 @@ link.openEvents({
 })
 
 const addresses = await relay.start()
+// 启动即在后台预热会话索引：DSH 的 session/list 要 2~5 秒（返回约 1MB），
+// 等设备连上来才拉的话，第一次打开列表就是一个长长的白屏。
+void relay.warmup()
 log('中继已启动')
 log(`  监听：0.0.0.0:${String(port)}`)
 for (const address of addresses) log(`  局域网地址：http://${address}:${String(port)}`)

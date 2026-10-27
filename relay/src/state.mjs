@@ -79,6 +79,25 @@ function toolsOfContent(content) {
 }
 
 /**
+ * 从消息 content 数组里抽取思考内容（reasoning 块）。
+ *
+ * 为什么单独抽：实测一条会话里 reasoning 块占 35 个、tool-call 59 个、text 仅 5 个，
+ * 思考才是占比最高的一类内容。手机端把它做成默认折叠的「思考」块，
+ * 否则用户看到的回复会显得毫无推理过程。
+ */
+function thinkingOfContent(content) {
+  if (!Array.isArray(content)) return ''
+  const parts = []
+  for (const block of content) {
+    if (block === null || typeof block !== 'object') continue
+    if (block.type === 'reasoning' && typeof block.text === 'string' && block.text.trim() !== '') {
+      parts.push(block.text.trim())
+    }
+  }
+  return parts.join('\n\n')
+}
+
+/**
  * 判断一条 user/message 是否来自真人输入。
  *
  * DSH 会用 user/message 承载多种系统注入（time-context 快照、mnemon 记忆、全局指令等）。
@@ -128,10 +147,14 @@ export function normalizeMessages(records) {
     if (event.type === 'assistant/message') {
       const message = data.message ?? {}
       const text = textOfContent(message?.content)
+      const thinking = thinkingOfContent(message?.content)
       const tools = toolsOfContent(message?.content)
-      if (pendingAssistant === undefined) pendingAssistant = { seq, role: 'assistant', text: '', tools: [], time }
+      if (pendingAssistant === undefined) pendingAssistant = { seq, role: 'assistant', text: '', thinking: '', tools: [], time }
       if (text !== '') {
         pendingAssistant.text = pendingAssistant.text === '' ? text : `${pendingAssistant.text}\n\n${text}`
+      }
+      if (thinking !== '') {
+        pendingAssistant.thinking = pendingAssistant.thinking === '' ? thinking : `${pendingAssistant.thinking}\n\n${thinking}`
       }
       for (const tool of tools) {
         if (!pendingAssistant.tools.includes(tool)) pendingAssistant.tools.push(tool)
@@ -410,12 +433,16 @@ export function normalizeSteps(records, maxText = 1_200) {
     if (event.type === 'assistant/message') {
       const message = data.message ?? {}
       const text = textOfContent(message?.content)
+      const thinking = thinkingOfContent(message?.content)
       const calls = Array.isArray(message?.content) ? message.content.filter((b) => b?.type === 'tool-call') : []
       if (pendingAssistant === undefined) {
-        pendingAssistant = { kind: STEP_KINDS.message, seq, time, role: 'assistant', text: '', tools: [] }
+        pendingAssistant = { kind: STEP_KINDS.message, seq, time, role: 'assistant', text: '', thinking: '', tools: [] }
       }
       if (text !== '') {
         pendingAssistant.text = pendingAssistant.text === '' ? text : `${pendingAssistant.text}\n\n${text}`
+      }
+      if (thinking !== '') {
+        pendingAssistant.thinking = pendingAssistant.thinking === '' ? thinking : `${pendingAssistant.thinking}\n\n${thinking}`
       }
       pendingAssistant.seq = seq
       pendingAssistant.time = time
@@ -425,7 +452,7 @@ export function normalizeSteps(records, maxText = 1_200) {
         const name = typeof call.name === 'string' ? call.name : '工具'
         const label = TOOL_LABELS[name] ?? name
         if (pendingAssistant === undefined) {
-          pendingAssistant = { kind: STEP_KINDS.message, seq, time, role: 'assistant', text: '', tools: [] }
+          pendingAssistant = { kind: STEP_KINDS.message, seq, time, role: 'assistant', text: '', thinking: '', tools: [] }
         }
         pendingAssistant.tools.push(label)
         const tool = {

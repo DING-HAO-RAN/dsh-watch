@@ -715,6 +715,9 @@ namespace DshRelay
             }
 
             relay.Start();
+            // 启动即在后台预热会话索引：DSH 的 session/list 要 2~5 秒（约 1MB），
+            // 等手表连上来才拉的话，第一次打开列表就是一个长长的白屏。
+            relay.Warmup();
             log("中继已启动，局域网端口：" + relay.Port);
             if (relay.AutoTunnel)
             {

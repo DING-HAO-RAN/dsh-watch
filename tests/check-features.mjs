@@ -61,7 +61,13 @@ await check('会话列表带项目分组', async () => {
   }
   const names = json.projects.map((p) => p.project).slice(0, 5).join('、')
   const biggest = json.projects.reduce((a, b) => (b.sessions.length > a.sessions.length ? b : a))
-  sessionId = String(biggest.sessions[0]?.id ?? '')
+  // 挑「确实有内容」的样本：项目里第一个会话常常是刚建的空会话（turns/steps 都是 0），
+  // 拿它去验步骤必然失败，而这不是功能问题。优先挑 steps 最大的那条。
+  let sample = biggest.sessions[0]
+  for (const session of biggest.sessions) {
+    if ((session.steps ?? 0) > (sample?.steps ?? 0)) sample = session
+  }
+  sessionId = String(sample?.id ?? '')
   return `${String(json.projects.length)} 个项目（${names}…），最大＝${biggest.project}(${String(biggest.sessions.length)})`
 })
 

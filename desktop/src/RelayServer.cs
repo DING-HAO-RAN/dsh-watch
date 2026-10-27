@@ -727,47 +727,31 @@ namespace DshRelay
         /// <summary>
         /// 某个会话当前是否在生成回复。
         ///
-        /// 用 session/list 里的 running 字段判断：这是 DSH 自己维护的权威状态。
-        /// 查列表比查单个会话便宜（一次调用覆盖所有会话），因此还顺带缓存 2 秒，
-        /// 避免手表 4 秒一次的刷新把 DSH 打爆。
+        /// 从共享的 session/list 缓存里查，不再单独发 RPC：以前这里为了拿 running
+        /// 又拉一次 1MB 的列表（2 秒缓存），与 Sessions() 各拉一次，一次页面刷新
+        /// 就是两趟大往返。现在两者共用同一份数据。
         /// </summary>
         private bool IsRunning(string sessionId)
         {
-            lock (runningGate)
+            // 刚发过消息的窗口内直接按运行中处理：列表缓存最长 6 秒才更新，
+            // 这段时间界面显示「空闲」会让人以为消息没发出去。
+            lock (optimisticGate)
             {
-                if (NowMs() - runningCheckedAt < 2000)
-                {
-                    bool cached;
-                    if (runningCache.TryGetValue(sessionId, out cached)) return cached;
-                    return false;
-                }
+                long until;
+                if (optimisticRunning.TryGetValue(sessionId, out until) && NowMs() < until) return true;
             }
-
-            var args = new Dictionary<string, object>();
-            args["_request"] = new Dictionary<string, object>();
-            var value = dsh.RpcSafe("session/list", args) as Dictionary<string, object>;
-            var items = ListField(value, "items");
-
-            var fresh = new Dictionary<string, bool>();
+            List<object> items = SharedItems();
             if (items != null)
             {
                 foreach (var raw in items)
                 {
                     var item = raw as Dictionary<string, object>;
                     if (item == null) continue;
-                    string id = GetString(item, "sessionId");
-                    if (id.Length == 0) continue;
-                    fresh[id] = GetBool(item, "running");
+                    if (GetString(item, "sessionId") != sessionId) continue;
+                    return GetBool(item, "running");
                 }
             }
-
-            lock (runningGate)
-            {
-                runningCache = fresh;
-                runningCheckedAt = NowMs();
-                bool cached;
-                return runningCache.TryGetValue(sessionId, out cached) && cached;
-            }
+            return false;
         }
 
         /// <summary>
@@ -915,6 +899,10 @@ namespace DshRelay
         /// <summary>共享列表的新鲜期：比手表列表页的 10 秒轮询短，比会话页的 4 秒刷新长。</summary>
         private const long SharedFreshMs = 6000;
 
+        // 刚发过消息的会话在一小段时间内直接按「运行中」处理，见 IsRunning。
+        private readonly object optimisticGate = new object();
+        private readonly Dictionary<string, long> optimisticRunning = new Dictionary<string, long>();
+
         /// <summary>
         /// 取 session/list 的 items（含子代理）。
         ///
@@ -946,15 +934,19 @@ namespace DshRelay
             }
             if (needWait)
             {
-                for (int i = 0; i < 100; i += 1)
+                // 冷启动撞上正在进行的刷新：等到它结束再取，而不是扔一个空列表出去。
+                // 等待上限与 DSH 的请求超时一致（30 秒）——超时就说明 DSH 本身有问题，
+                // 再等也没有意义。
+                for (int i = 0; i < 600; i += 1)
                 {
                     System.Threading.Thread.Sleep(50);
                     lock (sharedGate)
                     {
                         if (sharedItems != null) return sharedItems;
+                        if (!sharedRefreshing) break;
                     }
                 }
-                return new List<object>();
+                lock (sharedGate) return sharedItems ?? new List<object>();
             }
             if (snapshot != null) return snapshot;
             // 冷启动同步拉一次。
@@ -981,9 +973,18 @@ namespace DshRelay
                     StartupLog.Write("session/list 返回的字段：" + string.Join(", ", new List<string>(value.Keys).ToArray()));
                 }
                 List<object> items = ListField(value, "items");
+                if (items == null)
+                {
+                    // 拿不到 items 说明这次响应不可用（鉴权、协议或 DSH 自身出错）。
+                    // **绝不能把它当成「空列表」写进缓存**：那样之后所有请求都会看到
+                    // 0 个会话，且不会再重试，表现为「中继起来了但一个会话都没有」。
+                    StartupLog.Write("session/list 没有 items，本次刷新作废");
+                    lock (sharedGate) { sharedRefreshing = false; }
+                    return;
+                }
                 lock (sharedGate)
                 {
-                    sharedItems = items ?? new List<object>();
+                    sharedItems = items;
                     sharedAt = NowMs();
                     sharedRefreshing = false;
                 }
@@ -1000,8 +1001,10 @@ namespace DshRelay
                 lock (sharedGate)
                 {
                     sharedRefreshing = false;
-                    // 退避：5 秒内不再重试，避免 DSH 重启期间疯狂重试。
-                    sharedAt = NowMs() - SharedFreshMs + 5000;
+                    // 有旧数据就标记为新鲜，避免 DSH 抖动时反复重试（用户至少还能看到旧列表）；
+                    // 一条数据都没有时保持「已过期」，让下一次请求立刻再试——
+                    // 此时退避只会让用户多等几秒才看到空列表。
+                    if (sharedItems != null) sharedAt = NowMs();
                 }
             }
         }
@@ -1306,23 +1309,9 @@ namespace DshRelay
 
         private Http.Response Sessions()
         {
-            var args = new Dictionary<string, object>();
-            args["_request"] = new Dictionary<string, object>();
-            object rawValue = dsh.Rpc("session/list", args);
-            var value = rawValue as Dictionary<string, object>;
-
-            // 取不到会话时把实际拿到的形状记下来：DSH 正常应返回 items 数组，
-            // 返回空或类型不对说明参数/鉴权有问题，只看最终的空列表是查不出来的。
-            if (value == null)
-            {
-                StartupLog.Write("session/list 返回了非对象：" + (rawValue == null ? "null" : rawValue.GetType().Name));
-            }
-            else if (!value.ContainsKey("items"))
-            {
-                StartupLog.Write("session/list 返回的字段：" + string.Join(", ", new List<string>(value.Keys).ToArray()));
-            }
-
-            var items = ListField(value, "items");
+            // 走共享缓存：以前这里每次都同步拉一次 1MB 的 session/list（2~5 秒），
+            // 手表 10 秒轮询一次就是 10 秒里有 3 秒在等，体感就是一直转圈。
+            List<object> items = SharedItems();
 
             // 先把**全部**条目（含子代理）归一化：子代理条目本身就带着父会话 id、
             // 状态与耗时，统计与 /api/subagents 都从这份全量里取，不必再发 RPC。
@@ -1424,12 +1413,8 @@ namespace DshRelay
             string id = request.Query.ContainsKey("id") ? request.Query["id"] : "";
             if (string.IsNullOrEmpty(id)) return Http.Json(400, Simple("缺少 id 参数"));
 
-            var args = new Dictionary<string, object>();
-            args["_request"] = new Dictionary<string, object>();
-            var value = dsh.Rpc("session/list", args) as Dictionary<string, object>;
-
             var list = new List<object>();
-            var items = ListField(value, "items");
+            var items = SharedItems();
             if (items != null)
             {
                 foreach (var raw in items)
@@ -1680,10 +1665,7 @@ namespace DshRelay
 
             string parentId = "";
             string mode = "";
-            var args = new Dictionary<string, object>();
-            args["_request"] = new Dictionary<string, object>();
-            var listValue = dsh.RpcSafe("session/list", args) as Dictionary<string, object>;
-            var items = ListField(listValue, "items");
+            var items = SharedItems();
             if (items != null)
             {
                 foreach (var raw in items)
@@ -2056,6 +2038,13 @@ namespace DshRelay
             }
             // 马上要让手表看到这条消息，缓存必须立刻失效。
             InvalidateSession(sessionId);
+            // 列表缓存最长 6 秒才更新 running，这段时间内先按运行中处理，
+            // 否则手表的会话页会显示「空闲」，用户以为消息没发出去。
+            lock (optimisticGate)
+            {
+                optimisticRunning[sessionId] = NowMs() + 8000;
+                if (optimisticRunning.Count > 64) optimisticRunning.Clear();
+            }
 
             var content = new Dictionary<string, object>();
             content["type"] = "text";

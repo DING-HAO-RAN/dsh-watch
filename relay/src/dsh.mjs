@@ -58,8 +58,65 @@ export class DshLink {
     this.clientId = undefined
     this.streamId = 'ev'
     this.handlers = {}
+    /** streamId → {onItem, onEnd}：同一条 WebSocket 上并存的逻辑流。 */
+    this.streams = new Map()
+    /** streamId → {endpoint, args}：连接就绪后要补发的 open 帧。 */
+    this.opens = new Map()
     this.reconnectDelayMs = 1_000
     this.closed = false
+  }
+
+  /**
+   * 打开一条逻辑流。一条 remote.mux 连接可以并存多条流：$events 用 'ev'，
+   * 每个终端各自一条。连接还没就绪时先登记，连上后由 replayOpens 统一补发。
+   *
+   * @param {string} streamId 流标识，同一连接内唯一
+   * @param {string} endpoint Typert 端点名，如 `terminal/attach`
+   * @param {object} args 该端点的 args
+   * @param {{onItem?: (value: unknown) => void, onEnd?: (frame: object) => void}} [handlers]
+   */
+  openStream(streamId, endpoint, args, handlers = {}) {
+    this.streams.set(streamId, handlers)
+    this.opens.set(streamId, { endpoint, args })
+    if (this.socket !== undefined && this.socket.readyState === 1) {
+      this.sendFrame({ type: 'open', streamId, endpoint, payload: { args } })
+    }
+  }
+
+  /** 关闭一条逻辑流并通知 DSH；$events 由 openEvents 的返回值管理，不走这里。 */
+  closeStream(streamId) {
+    if (streamId === this.streamId) return
+    this.opens.delete(streamId)
+    this.streams.delete(streamId)
+    if (this.socket !== undefined && this.socket.readyState === 1) {
+      this.sendFrame({ type: 'end', streamId })
+    }
+  }
+
+  /**
+   * 向某条逻辑流发一帧上行数据。
+   * @returns {boolean} 连接未就绪或发送失败时为 false
+   */
+  sendStream(streamId, value) {
+    if (this.socket === undefined || this.socket.readyState !== 1) return false
+    return this.sendFrame({ type: 'item', streamId, value })
+  }
+
+  sendFrame(frame) {
+    try {
+      this.socket.send(JSON.stringify(frame))
+      return true
+    } catch (error) {
+      this.log(`流帧发送失败：${String(error.message)}`)
+      return false
+    }
+  }
+
+  /** 连接（或重连）就绪后，把所有已登记的流重新 open 一遍。 */
+  replayOpens() {
+    for (const [streamId, entry] of this.opens) {
+      this.sendFrame({ type: 'open', streamId, endpoint: entry.endpoint, payload: { args: entry.args } })
+    }
   }
 
   /** 读取并缓存 DSH 的 cookie 签名密钥；文件被替换时会重新读取。 */
@@ -174,6 +231,9 @@ export class DshLink {
   openEvents(handlers = {}) {
     this.handlers = handlers
     this.closed = false
+    // 登记成一条普通逻辑流，这样它与终端流共用同一套 open/重放逻辑。
+    this.streams.set(this.streamId, { onItem: (value) => { this.onEventStreamItem(value) } })
+    this.opens.set(this.streamId, { endpoint: '$events', args: {} })
     this.connectEvents()
     return () => {
       this.closed = true
@@ -212,7 +272,8 @@ export class DshLink {
     socket.addEventListener('open', () => {
       this.reconnectDelayMs = 1_000
       this.handlers.link?.(true)
-      socket.send(JSON.stringify({ type: 'open', streamId: this.streamId, endpoint: '$events', payload: { args: {} } }))
+      // 一次补发所有已登记的流：$events 与正在被手机查看的终端。
+      this.replayOpens()
     })
     socket.addEventListener('message', (event) => { this.onEventsFrame(String(event.data)) })
     socket.addEventListener('error', () => { /* close 事件会跟随，这里不重复处理 */ })
@@ -230,6 +291,12 @@ export class DshLink {
     setTimeout(() => { this.connectEvents() }, delay)
   }
 
+  /**
+   * 按 streamId 把 mux 帧分发给对应的逻辑流。
+   *
+   * 一条 remote.mux 连接上并存多条流（$events + 每个终端一条），因此不能像早期那样
+   * 把所有 item 都当成事件流：终端的输出帧若被喂给事件处理器，提问状态会被污染。
+   */
   onEventsFrame(text) {
     let frame
     try {
@@ -237,8 +304,24 @@ export class DshLink {
     } catch {
       return
     }
-    if (frame?.type !== 'item') return
-    const value = frame.value
+    if (frame === null || typeof frame !== 'object') return
+    const streamId = String(frame.streamId ?? '')
+    if (frame.type === 'item') {
+      const handler = this.streams.get(streamId)
+      if (handler !== undefined) {
+        handler.onItem?.(frame.value)
+        return
+      }
+      if (streamId === this.streamId) this.onEventStreamItem(frame.value)
+      return
+    }
+    if (frame.type === 'end' || frame.type === 'error') {
+      this.streams.get(streamId)?.onEnd?.(frame)
+    }
+  }
+
+  /** $events 流的业务帧：ready 单独处理，其余交给上层。 */
+  onEventStreamItem(value) {
     if (value === undefined || value === null) return
     if (value.type === 'ready') {
       this.clientId = String(value.clientId ?? '')
