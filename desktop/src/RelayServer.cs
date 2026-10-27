@@ -904,6 +904,125 @@ namespace DshRelay
         private Dictionary<string, bool> runningCache = new Dictionary<string, bool>();
         private long runningCheckedAt;
 
+        // session/list 的共享缓存。DSH 一次返回约 1MB、耗时 2~5 秒（实测 748 个会话里
+        // 534 个是子代理），而会话列表、子任务、running 判断都要用它。以前每个接口各拉
+        // 一次，手表一刷新就是好几次 1MB 往返，表现就是「转圈很久然后超时」。
+        // 现在统一走 SharedItems：有旧数据立刻返回、后台刷新，只有完全没有时才等。
+        private readonly object sharedGate = new object();
+        private List<object> sharedItems;
+        private long sharedAt;
+        private bool sharedRefreshing;
+        /// <summary>共享列表的新鲜期：比手表列表页的 10 秒轮询短，比会话页的 4 秒刷新长。</summary>
+        private const long SharedFreshMs = 6000;
+
+        /// <summary>
+        /// 取 session/list 的 items（含子代理）。
+        ///
+        /// 有缓存就立刻返回，过期时触发一次后台刷新；完全没有缓存时才同步等待。
+        /// 并发刷新由 sharedRefreshing 挡住，避免多个请求同时拉几份 1MB。
+        /// </summary>
+        private List<object> SharedItems()
+        {
+            List<object> snapshot;
+            bool needWait = false;
+            lock (sharedGate)
+            {
+                snapshot = sharedItems;
+                if (snapshot == null)
+                {
+                    // 冷启动：必须等一次。期间其它请求也走这里，用 Refreshing 合并。
+                    if (!sharedRefreshing) sharedRefreshing = true;
+                    else
+                    {
+                        // 别人正在拉，短暂让出后重试，避免重复拉取。
+                        needWait = true;
+                    }
+                }
+                else if (NowMs() - sharedAt >= SharedFreshMs && !sharedRefreshing)
+                {
+                    sharedRefreshing = true;
+                    System.Threading.ThreadPool.QueueUserWorkItem(delegate { RefreshSharedItems(); });
+                }
+            }
+            if (needWait)
+            {
+                for (int i = 0; i < 100; i += 1)
+                {
+                    System.Threading.Thread.Sleep(50);
+                    lock (sharedGate)
+                    {
+                        if (sharedItems != null) return sharedItems;
+                    }
+                }
+                return new List<object>();
+            }
+            if (snapshot != null) return snapshot;
+            // 冷启动同步拉一次。
+            RefreshSharedItems();
+            lock (sharedGate) return sharedItems ?? new List<object>();
+        }
+
+        private void RefreshSharedItems()
+        {
+            try
+            {
+                var args = new Dictionary<string, object>();
+                args["_request"] = new Dictionary<string, object>();
+                object rawValue = dsh.Rpc("session/list", args);
+                var value = rawValue as Dictionary<string, object>;
+                if (value == null)
+                {
+                    StartupLog.Write("session/list 返回了非对象：" + (rawValue == null ? "null" : rawValue.GetType().Name));
+                    lock (sharedGate) { sharedRefreshing = false; }
+                    return;
+                }
+                if (!value.ContainsKey("items"))
+                {
+                    StartupLog.Write("session/list 返回的字段：" + string.Join(", ", new List<string>(value.Keys).ToArray()));
+                }
+                List<object> items = ListField(value, "items");
+                lock (sharedGate)
+                {
+                    sharedItems = items ?? new List<object>();
+                    sharedAt = NowMs();
+                    sharedRefreshing = false;
+                }
+                // 列表一变，running 缓存立刻作废：否则手表会看到过期状态。
+                lock (runningGate)
+                {
+                    runningCache = new Dictionary<string, bool>();
+                    runningCheckedAt = 0;
+                }
+            }
+            catch (Exception error)
+            {
+                StartupLog.Write("刷新 session/list 失败（继续用旧数据）：" + error.Message);
+                lock (sharedGate)
+                {
+                    sharedRefreshing = false;
+                    // 退避：5 秒内不再重试，避免 DSH 重启期间疯狂重试。
+                    sharedAt = NowMs() - SharedFreshMs + 5000;
+                }
+            }
+        }
+
+        /// <summary>启动预热：DSH 首次拉列表要 2~5 秒，等设备连上来才拉就是白屏。</summary>
+        public void Warmup()
+        {
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            {
+                try
+                {
+                    SharedItems();
+                    StartupLog.Write("会话索引已预热");
+                }
+                catch (Exception error)
+                {
+                    StartupLog.Write("预热会话索引失败：" + error.Message);
+                }
+            });
+        }
+
         /// <summary>中继的身份信息（无需令牌）：手表用它确认连的是哪台电脑。</summary>
         private Http.Response Identity()
         {
@@ -1432,11 +1551,74 @@ namespace DshRelay
             return last;
         }
 
+        /// <summary>
+        /// 会话响应的短时缓存。
+        ///
+        /// 手表会话页每 4 秒刷新一次，一次刷新会打两次 DSH RPC（projections + page），
+        /// 实测单次 0.7~7 秒。短时间内重复请求同一页时直接给缓存，
+        /// 既降延迟也少压 DSH。命中条件里带 through，翻页请求不会串味。
+        /// </summary>
+        private readonly Dictionary<string, CachedSession> sessionCache = new Dictionary<string, CachedSession>();
+        private readonly object sessionCacheGate = new object();
+        private const long SessionCacheMs = 3000;
+
+        private class CachedSession
+        {
+            public long At;
+            public Http.Response Response;
+        }
+
+        /// <summary>会话内发生了写操作（发消息、答题）后清掉缓存，避免看到旧内容。</summary>
+        private void InvalidateSession(string sessionId)
+        {
+            if (string.IsNullOrEmpty(sessionId)) return;
+            lock (sessionCacheGate)
+            {
+                var dead = new List<string>();
+                foreach (var key in sessionCache.Keys)
+                {
+                    if (key.StartsWith(sessionId + "|", StringComparison.Ordinal)) dead.Add(key);
+                }
+                foreach (string key in dead) sessionCache.Remove(key);
+            }
+        }
+
         private Http.Response Session(Http.Request request)
         {
             string id = request.Query.ContainsKey("id") ? request.Query["id"] : "";
             if (string.IsNullOrEmpty(id)) return Http.Json(400, Simple("缺少 id 参数"));
 
+            string throughText = request.Query.ContainsKey("through") ? request.Query["through"] : "";
+            string cacheKey = id + "|" + throughText;
+            lock (sessionCacheGate)
+            {
+                CachedSession cached;
+                if (sessionCache.TryGetValue(cacheKey, out cached) && NowMs() - cached.At < SessionCacheMs)
+                {
+                    return cached.Response;
+                }
+            }
+
+            Http.Response built = BuildSession(id, throughText);
+
+            // 只缓存成功的响应：错误要立刻重试才有意义。
+            if (built.Status == 200)
+            {
+                lock (sessionCacheGate)
+                {
+                    // 键数量设上限：长期运行不该无限增长。
+                    if (sessionCache.Count > 64) sessionCache.Clear();
+                    var entry = new CachedSession();
+                    entry.At = NowMs();
+                    entry.Response = built;
+                    sessionCache[cacheKey] = entry;
+                }
+            }
+            return built;
+        }
+
+        private Http.Response BuildSession(string id, string throughText)
+        {
             var projectionArgs = new Dictionary<string, object>();
             var projectionRequest = new Dictionary<string, object>();
             projectionRequest["sessionId"] = id;
@@ -1445,10 +1627,10 @@ namespace DshRelay
 
             long asOfSeq = projection != null ? GetLong(projection, "asOfSeq") : 0;
             long through = asOfSeq;
-            if (request.Query.ContainsKey("through"))
+            if (!string.IsNullOrEmpty(throughText))
             {
                 long parsed;
-                if (long.TryParse(request.Query["through"], out parsed) && parsed > 0) through = Math.Min(parsed, asOfSeq);
+                if (long.TryParse(throughText, out parsed) && parsed > 0) through = Math.Min(parsed, asOfSeq);
             }
 
             var pageArgs = new Dictionary<string, object>();
@@ -1872,6 +2054,8 @@ namespace DshRelay
             {
                 return Http.Json(400, Simple("缺少 sessionId 或 text"));
             }
+            // 马上要让手表看到这条消息，缓存必须立刻失效。
+            InvalidateSession(sessionId);
 
             var content = new Dictionary<string, object>();
             content["type"] = "text";
@@ -2036,6 +2220,7 @@ namespace DshRelay
             {
                 return Http.Json(400, Simple("缺少 sessionId、callId 或 answers"));
             }
+            InvalidateSession(sessionId);
 
             var normalized = new List<object>();
             foreach (var raw in answers)
