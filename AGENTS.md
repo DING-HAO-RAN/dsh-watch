@@ -2,7 +2,8 @@
 
 ## 构成
 
-- 三个部件：[桌面程序](<desktop/>)（C#，装在电脑上，日常用这个）、[手表端应用](<app/>)（原生 Java）、[命令行中继](<relay/>)（Node，无界面，供脚本或服务器环境使用）。中继负责 DSH 鉴权与数据裁剪，手表只调用中继自己的简单接口。
+- 四个部件：[桌面程序](<desktop/>)（C#，装在电脑上，日常用这个）、[手表端应用](<app/>)（原生 Java）、[手机端应用](<phone/>)（原生 Java，四个标签：会话/文件/终端/我的）、[命令行中继](<relay/>)（Node，无界面，供脚本或服务器环境使用）。中继负责 DSH 鉴权与数据裁剪，手表与手机只调用中继自己的简单接口。
+- **手机端是独立构建的**（`scripts/build-phone.ps1` → `dist/DSH手机.apk`，包名 `cn.dsh.phone`），源码在 `phone/`，与手表端共享设计语言但不共享代码——手表是圆屏 466×466 的排版，硬套到矩形屏上四角会被裁掉，两边各写一套更省事。
 - **桌面程序是主推形态**：一个 exe 拷到任何 Windows 10/11 上双击即用，自动找到本机 DSH 并显示配对码与地址。
 - 中继**不修改 DSH 配置、不依赖任何 DSH 插件**，这是需求方明确要求的前提，改动方案时不得破坏。
 - 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**。
@@ -62,6 +63,28 @@
 - 窗口尺寸由 `MainForm.ApplyDisplaySize()` 按**当前显示器工作区的比例**算，夹在 940×660 到 1480×1040 之间，**不要写死像素**：写死时小屏会超出屏幕、高缩放屏会显得又小又挤。
 - 改 `panel.html` 后验证视觉：开发时 `Embedded.ReadText` 优先读程序目录下的同名文件，把 `panel.html` 拷进 `dist/DSH中继/` 再刷新即可，不必重编 exe。核对渲染用无头 Edge（`msedge --headless=new --remote-debugging-port`）截图，注意 **`fetch` 有缓存**时页面会显示旧结果。
 - `NativePanel` 的卡片是**从 `TableLayoutPanel` 派生的**，不是 `Panel`：卡片要「宽度撑满、高度随内容」，只有 TableLayoutPanel 的 AutoSize 能稳妥做到，用 Panel + Dock 会被压成内容固有宽度。地址行同理改用 TableLayoutPanel，**不要用 `FlowLayoutPanel` + 手算像素宽度**，否则换窗口尺寸后行宽不跟随。
+
+## 中继性能（两端必须保持一致）
+
+- **`session/list` 是唯一的性能瓶颈**：实测一次返回约 1MB（748 个会话里 534 个是子代理）、耗时 **2.4~4.8 秒**，且 `limit` / `includeSubagents` 参数几乎压不下来——开销在 DSH 侧，不在返回体。任何「每个请求都调一次 `session/list`」的写法都会让 4 秒/10 秒轮询跑不动，表现就是用户说的「转圈很久然后超时」。
+- 因此两端都有一份**共享缓存**（node：`RelayServer.sessionIndex()`；C#：`SharedItems()`），策略是 **stale-while-revalidate**：有旧数据立刻返回、后台刷新，只有完全没有时才同步等。新鲜期 6 秒——比手表列表页 10 秒轮询短、比会话页 4 秒刷新长。
+- **消费 `session/list` 的接口必须共用这一份缓存**：会话列表、子任务、工作区、运行状态判断、文件页（要 cwd）。C# 版曾经是 `Sessions()` 和 `IsRunning()` 各拉一次，一次页面刷新就是两趟 1MB 往返。
+- **会话内容缓存必须按 `asOfSeq` 做键，不能按「是否 running」猜 TTL**：会话刚发完消息、DSH 还没把 running 翻过来时，会命中「空闲」长缓存，用户看不到自己刚发的那句话（实测踩过）。projections 只需 5ms 且永远反映最新状态，真正昂贵的是 `session/page`（一次拉回 300KB~1.5MB）。做法是：便宜的每次问，昂贵的按 asOfSeq 命中。
+- **发送/取消/答题/重命名后必须同时做三件事**：让列表缓存失效、清掉该会话的内容缓存、在接下来几秒内把该会话当作运行中（乐观更新）。少任何一件，用户都会看到「发完消息界面没反应」。
+- **启动时必须预热**（node：`relay.warmup()`；C#：`relay.Warmup()`）：否则中继刚启动时第一次打开列表要等 3 秒以上。预热前冷启动首请求 3.5 秒，预热后 4 毫秒。
+- 刷新失败时**保留旧数据并退避 5 秒**，不要清空：DSH 重启的瞬间列表会报错，清空会让手表看到一片空白。
+
+## 手机端（phone/）
+
+- 构建：[scripts/build-phone.ps1](<scripts/build-phone.ps1>)，与手表端同一套手写工具链（aapt2 + javac + d8 + apksigner），产物 `dist/DSH手机.apk`，包名 `cn.dsh.phone`。类清单同样要随新增顶层类同步更新，否则漏编只在手机上表现为 `NoClassDefFoundError`。
+- **安全区靠量系统栏高度，不要用 `setOnApplyWindowInsetsListener`**：实测在 `Theme.DeviceDefault.NoActionBar` + 手写根布局的组合下监听不会被触发，标题被状态栏压住、底部标签被导航栏压住。`Ui.applyWindowInsets` 直接读 `status_bar_height` / `navigation_bar_height` 加 padding。
+- **未配对时隐藏底部标签栏**，并把内容区的 `bottomMargin` 收回 0：这时点任何标签都只会回到连接页，留着让人以为可以切换。
+- **页面实例要复用**（`SessionsPage.cachedView`、`MinePage.cachedView`）：切标签时重建会先白屏再等一次网络请求，用户看到的就是「点了没反应」。文件页与终端页有内部导航状态，每次重建更稳，不复用。
+- **会话页只渲染最近 60 步**：一个会话常有上百步、四万多字，全量建 View 实测要十几秒才出画面。超出部分提示去电脑上看，翻页能力由中继的 `through` 参数保留。
+- **发送后必须 `composer.clearFocus()`**：只置 `editing = false` 不够，输入框仍持有焦点时 `onFocusChange` 会把它设回 true，自动刷新被永久暂停，用户看不到自己的消息和回复。
+- 终端是 **HTTP 轮询**（300ms 拉增量），不是 WebSocket：中继把 DSH 的 attach 流缓存在内存里（`relay/src/terminals.mjs`），`reset` 帧代表整屏重绘、`output` 帧追加，ANSI 转义在客户端剥掉（`TerminalPage.clean`），不做完整终端模拟。
+- 文件页的安全边界在中继侧（`withinRoot` 限定会话工作目录），手机端不需要再做白名单。
+- 支持启动参数预填与自动配对（`--es host --ei port --es code --ez autopair true`），与手表端同名，方便同一份脚本部署两种设备。
 
 ## 中继打包（命令行版，SEA）
 

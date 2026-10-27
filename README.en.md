@@ -1,22 +1,24 @@
 [English](README.en.md) | [中文](README.md)
 
-# DSH Watch
+# DSH Watch & Phone
 
-Read and drive [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) sessions running on your computer, from a smartwatch.
+Read and drive [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) sessions running on your computer, from a smartwatch or a phone.
 
-With DSH running on your PC and the watch connected to it, you can glance at your wrist any time to see how far the AI has got:
+With DSH running on your PC and the watch or phone connected to it, you can look any time to see how far the AI has got:
 
 - Browse every **session** by **project**, tap in to read the conversation
 - Expand **tool calls** to see which files each step read, which commands it ran, and what came back
+- Expand **thinking** to see what the model reasoned before answering
 - **Send messages**, stop generation, scroll back through history
-- Answer the AI's questions (single choice, multiple choice, or typed)
+- Answer the AI's questions (single choice, multiple choice, or typed), and approve tool calls that need authorization
 - Switch **model** and reasoning effort, check **token** usage and context occupancy
 - Watch **subagents**: who was sent out to work, whether they are still running or done, how long they took — and tap through to read their full conversation
 - Watch the **plan and tasks**: how far the todo list has got, who owns what on the team board, and how the current goal is progressing
+- The phone build also has **file browsing** (read files and images in the session's working directory) and an **interactive terminal** (run commands on your PC from the phone)
 
 No server on the internet to set up, no changes to any DSH configuration, no DSH plugins.
 
-> Developed on an OPPO Watch (Android 11, 466×466 round screen). The app needs Android 8.0 or later; other Wear OS / Android watches should work in theory, but the UI is designed for a round screen.
+> The watch build was developed on an OPPO Watch (Android 11, 466×466 round screen) and needs Android 8.0 or later. The phone build ships separately as `DSH手机.apk`: same palette and information structure, laid out for a rectangular screen, plus file and terminal pages.
 
 ## How it works
 
@@ -94,7 +96,24 @@ adb shell am start -n cn.dsh.watch/.MainActivity `
 
 `autopair` starts pairing as soon as the fields are filled, so you don't tap anything on the watch.
 
-### 3. Pairing
+### 3. On the phone (optional)
+
+The phone build is a separate package from the watch build; both talk to the same relay.
+
+```powershell
+adb install -r "DSH手机.apk"
+```
+
+You can also hand it the address and pairing code up front:
+
+```powershell
+adb shell am start -n cn.dsh.phone/.MainActivity `
+  --es host 192.168.1.100 --ei port 19390 --es code 123456 --ez autopair true
+```
+
+The phone build has four tabs: **sessions** (projects, sessions, conversation, thinking, tool calls), **files** (browse the session's working directory, read code and images), **terminal** (run commands on the PC from the phone), and **profile** (device management, theme, connection status).
+
+### 4. Pairing
 
 Two ways; the first is recommended.
 
@@ -110,11 +129,11 @@ Two ways; the first is recommended.
 
 Once paired, the watch remembers it and opens straight to the session list from then on. **Both the pairing code and the token are stored on the computer**, so restarting the relay or even upgrading the program won't change them and you won't have to pair again. To change the code, tap "New pairing code" in the window.
 
-### 4. Switching between devices
+### 5. Switching between devices
 
 The watch remembers every device it has connected to (computer name and address). In "Settings" → "Saved devices", tap an entry to switch to it without pairing again. Public tunnel when you're out, LAN at home, another computer — all in this list.
 
-### 5. Autostart and following DSH on the computer
+### 6. Autostart and following DSH on the computer
 
 The desktop app's "Settings" card has two switches you can enable together:
 
@@ -131,7 +150,7 @@ Enabling both does not conflict: after login the app waits in the tray, and star
 
 **Can't find the tray icon on Windows 11?** The system files new tray icons under the taskbar's "^" overflow area by default — the app is running. Click "^" to find "DSH 中继" and drag it onto the taskbar to pin it. When started automatically, the app shows one tray balloon so you know it is running in the background.
 
-### 6. Reading files from a session
+### 7. Reading files from a session
 
 When a session touches md, txt or code files, the session's left-swipe menu gains "View files": it lists the files that session touched and opens the full content. Markdown renders as headings, lists and code blocks; code gets line numbers and keyword highlighting.
 
