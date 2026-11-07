@@ -109,7 +109,9 @@ try {
     if ($code -ne 0) { Read-Log 'aapt2-link'; throw "aapt2 link 失败（退出码 $code）" }
 
     Write-Host '3/6 编译 Java'
-    $sources = @(Get-ChildItem (Join-Path $main 'java'), (Join-Path $build 'gen') -Recurse -Filter *.java | ForEach-Object FullName)
+    # 共享的远程通道代码（common/src）与手表自有代码一起编译，产出同一个 dex。
+    $common = Join-Path $WorkRoot 'common/src/main/java'
+    $sources = @(Get-ChildItem (Join-Path $main 'java'), $common, (Join-Path $build 'gen') -Recurse -Filter *.java | ForEach-Object FullName)
     $sourceList = Join-Path $build 'sources.txt'
     [IO.File]::WriteAllLines($sourceList, $sources, $utf8)
     $code = Invoke-Step $javac @('--release', '8', '-encoding', 'UTF-8', '-nowarn',
@@ -118,7 +120,7 @@ try {
 
     # 逐类核对：缺一个都会在手表上变成 NoClassDefFoundError，必须在这里挡住。
     $expected = @('MainActivity', 'WatchUi', 'WatchUi$Page', 'Store', 'Api', 'Discovery', 
-                      'Theme', 'CodeView')
+                      'Theme', 'CodeView', 'RemoteBridge')
     $classesDir = Join-Path $build 'classes'
     foreach ($name in $expected) {
         $file = Join-Path $classesDir ('cn/dsh/watch/' + $name + '.class')

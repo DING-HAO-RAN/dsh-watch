@@ -101,7 +101,9 @@ try {
     if ($code -ne 0) { Read-Log 'aapt2-link'; throw "aapt2 link 失败（退出码 $code）" }
 
     Write-Host '3/6 编译 Java'
-    $sources = @(Get-ChildItem (Join-Path $main 'java'), (Join-Path $build 'gen') -Recurse -Filter *.java | ForEach-Object FullName)
+    # 共享的远程通道代码（common/src）与手机自有代码一起编译。
+    $common = Join-Path $WorkRoot 'common/src/main/java'
+    $sources = @(Get-ChildItem (Join-Path $main 'java'), $common, (Join-Path $build 'gen') -Recurse -Filter *.java | ForEach-Object FullName)
     $sourceList = Join-Path $build 'sources.txt'
     [IO.File]::WriteAllLines($sourceList, $sources, $utf8)
     $code = Invoke-Step $javac @('--release', '8', '-encoding', 'UTF-8', '-nowarn',
@@ -112,7 +114,7 @@ try {
     # 新增顶层类时同步加进这份清单。
     $expected = @('MainActivity', 'Ui', 'Theme', 'Store', 'Api', 'Discovery',
                   'Markdown', 'CodeView', 'ConnectPage', 'SessionsPage', 'ChatPage',
-                  'FilesPage', 'TerminalPage', 'MinePage')
+                  'FilesPage', 'TerminalPage', 'MinePage', 'RemoteBridge')
     $classesDir = Join-Path $build 'classes'
     foreach ($name in $expected) {
         $file = Join-Path $classesDir ('cn/dsh/phone/' + $name + '.class')

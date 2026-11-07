@@ -51,12 +51,48 @@ final class Store {
         /** 这台设备对应的中继给过我们的设备标识（用于「常用设备」自动同意）。 */
         String deviceId = "";
 
+        /**
+         * 设备类型：空 = 局域网中继（原有形态），"remote" = 经 ds-harness-remote 插件的远程主机。
+         *
+         * 两种形态的差别只在「怎么把请求送到 DSH」，界面与业务逻辑完全一样，
+         * 因此用同一个 Device 结构承载，避免再引入一套并行状态。
+         */
+        String kind = "";
+
+        /** 远程主机的公钥（Noise 握手用）；中继形态不用。 */
+        String hostPublicKey = "";
+
+        /** 远程服务器地址（如 https://dsh.r2049.cn）；中继形态不用。 */
+        String remoteServer = "";
+
+        boolean isRemote() {
+            return "remote".equals(kind);
+        }
+
+        /**
+         * 远程设备的 base 统一写成 `remote://<hostDeviceId>`。
+         *
+         * 沿用 base 作为「当前设备」的标识，是为了让三十余处调用点、
+         * current()/paired() 等既有逻辑一行都不用改；真正的连接参数
+         * （服务器地址、主机公钥）另外存在 remoteServer / hostPublicKey。
+         */
+        static String remoteBase(String hostDeviceId) {
+            return "remote://" + hostDeviceId;
+        }
+
         boolean valid() {
+            if (isRemote()) {
+                return base != null && !base.isEmpty()
+                        && deviceId != null && !deviceId.isEmpty()
+                        && hostPublicKey != null && !hostPublicKey.isEmpty()
+                        && remoteServer != null && !remoteServer.isEmpty();
+            }
             return base != null && !base.isEmpty() && token != null && !token.isEmpty();
         }
 
         /** 地址里是否带 https（公网）。 */
         boolean isPublic() {
+            if (isRemote()) return true;
             return base != null && base.startsWith("https://");
         }
         JSONObject toJson() {
@@ -68,6 +104,9 @@ final class Store {
                 object.put("lastUsed", lastUsed);
                 object.put("alternateBase", alternateBase == null ? "" : alternateBase);
                 object.put("deviceId", deviceId == null ? "" : deviceId);
+                object.put("kind", kind == null ? "" : kind);
+                object.put("hostPublicKey", hostPublicKey == null ? "" : hostPublicKey);
+                object.put("remoteServer", remoteServer == null ? "" : remoteServer);
             } catch (Exception ignored) {
                 // 值都是字符串与数字，不会失败。
             }
@@ -83,6 +122,9 @@ final class Store {
             device.lastUsed = object.optLong("lastUsed", 0L);
             device.alternateBase = Api.text(object, "alternateBase");
             device.deviceId = Api.text(object, "deviceId");
+            device.kind = Api.text(object, "kind");
+            device.hostPublicKey = Api.text(object, "hostPublicKey");
+            device.remoteServer = Api.text(object, "remoteServer");
             return device.valid() ? device : null;
         }
     }
@@ -154,6 +196,44 @@ final class Store {
             if (device.base.equals(base())) return device;
         }
         return null;
+    }
+
+    /**
+     * 记住一台远程主机并切换过去。
+     *
+     * 同一 hostDeviceId 视为同一台；重复登录只更新服务器地址与公钥，不会堆记录。
+     */
+    void rememberRemoteHost(String hostDeviceId, String hostName, String serverUrl,
+                            String hostPublicKey, String label) {
+        if (hostDeviceId == null || hostDeviceId.trim().isEmpty()) return;
+        String base = Device.remoteBase(hostDeviceId.trim());
+        List<Device> list = devices();
+        Device target = null;
+        for (Device device : list) {
+            if (base.equals(device.base)) {
+                target = device;
+                break;
+            }
+        }
+        if (target == null) {
+            target = new Device();
+            target.base = base;
+            list.add(target);
+        }
+        target.kind = "remote";
+        target.deviceId = hostDeviceId.trim();
+        target.remoteServer = serverUrl == null ? "" : serverUrl.trim();
+        target.hostPublicKey = hostPublicKey == null ? "" : hostPublicKey.trim();
+        target.label = label != null && !label.trim().isEmpty()
+                ? label.trim()
+                : (hostName == null || hostName.trim().isEmpty() ? hostDeviceId : hostName.trim());
+        target.lastUsed = System.currentTimeMillis();
+
+        saveDevices(list);
+        prefs.edit()
+                .putString(KEY_BASE, target.base)
+                .putString(KEY_TOKEN, "")
+                .apply();
     }
 
     /**
@@ -355,7 +435,35 @@ final class Store {
     }
 
     boolean paired() {
+        Device device = current();
+        if (device != null && device.isRemote()) return device.valid();
         return !base().isEmpty() && !token().isEmpty();
+    }
+
+    // ------------------------------------------------------------ 远程账号
+
+    private static final String KEY_REMOTE_ACCOUNT = "remoteAccount";
+
+    /**
+     * 远程账号凭据（一个账号下可有多台主机）。
+     *
+     * 令牌必须跨启动保留：服务端会轮换 refresh token，丢了就得重新登录，
+     * 与项目里「配对码默认沿用」的要求是同一个道理。
+     */
+    String remoteAccountJson() {
+        String value = prefs.getString(KEY_REMOTE_ACCOUNT, "");
+        return value == null ? "" : value;
+    }
+
+    void setRemoteAccountJson(String json) {
+        if (json == null || json.isEmpty()) prefs.edit().remove(KEY_REMOTE_ACCOUNT).apply();
+        else prefs.edit().putString(KEY_REMOTE_ACCOUNT, json).apply();
+    }
+
+    /** 是否已登录远程账号。 */
+    boolean hasRemoteAccount() {
+        String json = remoteAccountJson();
+        return json != null && !json.isEmpty();
     }
 
     // ------------------------------------------------------------ 外观偏好

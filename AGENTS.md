@@ -5,9 +5,9 @@
 - 四个部件：[桌面程序](<desktop/>)（C#，装在电脑上，日常用这个）、[手表端应用](<app/>)（原生 Java）、[手机端应用](<phone/>)（原生 Java，四个标签：会话/文件/终端/我的）、[命令行中继](<relay/>)（Node，无界面，供脚本或服务器环境使用）。中继负责 DSH 鉴权与数据裁剪，手表与手机只调用中继自己的简单接口。
 - **手机端是独立构建的**（`scripts/build-phone.ps1` → `dist/DSH手机.apk`，包名 `cn.dsh.phone`），源码在 `phone/`，与手表端共享设计语言但不共享代码——手表是圆屏 466×466 的排版，硬套到矩形屏上四角会被裁掉，两边各写一套更省事。
 - **桌面程序是主推形态**：一个 exe 拷到任何 Windows 10/11 上双击即用，自动找到本机 DSH 并显示配对码与地址。
-- 中继**不修改 DSH 配置、不依赖任何 DSH 插件**，这是需求方明确要求的前提，改动方案时不得破坏。
-- 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**。
-- 需求方明确要求「**默认沿用同一端口与密钥，除非用户主动更改**」：配对码与令牌必须跨启动、跨升级保留，不要改回每次都随机生成。
+- **两条连接通道并存，中继仍是默认与前提**：局域网/公网走中继（不需要任何 DSH 插件、不需要账号）；跨网络另有一条经 `ds-harness-remote` 插件转发的远程通道（见「远程通道」一节）。**中继自身不修改 DSH 配置、不依赖任何 DSH 插件**这条依然成立，远程通道是独立加在上面的第二条路，删掉它中继与局域网配对完全不受影响。
+- 地址统一存在 `Store.base` 字段（`host:port` 或 `https://域名`），由 `Store.parse` 解析。**不要再引入第二套地址存取逻辑**；远程设备的 base 是 `remote://<hostDeviceId>`，由 `Api` 按前缀分流，不经过 `Store.parse`。
+- 需求方明确要求「**默认沿用同一端口与密钥，除非用户主动更改**」：配对码与令牌必须跨启动、跨升级保留，不要改回每次都随机生成。远程账号的令牌同理（服务端会轮换 refresh token，丢了就得重新登录）。
 
 ## 配对与多设备
 
@@ -22,6 +22,26 @@
 - **一次配对交付两个入口**：`/api/pair` 的响应带 `lanBase`（本次请求实际到达的那条，来源是 loopback 时退回第一条局域网地址）与 `publicUrl`；手表把两条都存进同一台设备的 `base` 与 `alternateBase`，共用同一个令牌。**公网地址每次重启都会变**，所以手表每次进列表页都用无需鉴权的 `/api/identity`（已带 `publicUrl`）同步一次，不这么做中继一重启手表就再也连不上。
 - 手表端 [Store](<app/src/main/java/cn/dsh/watch/Store.java>) 存的是**设备列表**（地址 + 令牌 + 备注 + 最后使用时间 + 备用地址 + 设备 id），`base()`/`token()` 语义不变仍指「当前设备」，因此三十余处调用点不用改。切换设备时必须清空会话、`steps`、`openGroups`、`openRows` 与 `lastListSignature`，否则上一台设备的状态会套到新界面上。`rememberDevice` 命中 `base` 或 `alternateBase` 都算同一台，否则一次配对会堆出两条并互相顶掉令牌。
 - 局域网发现是**双向**的：中继既周期广播也响应手表的查询，且要按网段算定向广播地址（部分路由器丢弃 `255.255.255.255`）。**收发必须用两个独立 socket**——共用一个时，bind 到固定端口后再 Send 在部分 Windows 配置下会静默失败。
+
+## 远程通道（ds-harness-remote 插件）
+
+- **这是第二条独立通道，不是中继的替代**。中继仍负责局域网/公网直连且不需要插件与账号；远程通道用于「电脑不在同一网络」的场景，走 `https://dsh.r2049.cn` 账号服务器转发。两条路在设备列表里并列，用户自己选。
+- 共享实现在 [common/src/main/java/cn/dsh/remote](<common/src/main/java/cn/dsh/remote/>)，手表与手机各自编译时把它一起纳入（`build.ps1` / `build-phone.ps1` 都已把 `common/src/main/java` 加进源码清单）。**两边共用一份，不要复制出第二套加密实现**。
+- **加密必须自己实现，不能用第三方库**：三端是手写工具链，没有依赖管理。已实现的部件：`X25519`（RFC 7748 Montgomery ladder）、`ChaCha20Poly1305`（RFC 8439）、`Sha256`（含 HMAC/HKDF）、`NoiseIK`、`WebSocketClient`（RFC 6455 最小实现）、`FragmentAssembler`（DSHF 分片）。
+- **Noise IK 必须与上游逐字节一致**，验证方法是用上游 `fixtures/crypto/v1/noise-ik.json` 跑一遍（`message1` / `message2` / `transport` 三条都要对）。三个必须踩准的点：
+  1. **响应方静态公钥要在握手前就 `mixHash` 进 transcript**（`<- s` 预共享），漏了会导致第一条消息就错；
+  2. **`se` 的 DH 两个方向用的密钥不同**：发起方是 `静态私钥 × 响应方临时公钥`，响应方是 `临时私钥 × 发起方静态公钥`；
+  3. 测试要能注入固定临时私钥（`setEphemeralPrivateForTest`），否则无法复现夹具。
+- **ChaCha20-Poly1305 的 Poly1305 输入要补零对齐**：AEAD 里 aad 与密文各自补零到 16 字节再按「满块 + 2^128」吸收，最后追加 16 字节长度块。不补零时密文仍然正确、只有 tag 错，表现为「解密永远认证失败」，极难定位。Poly1305 用 BigInteger 实现，正确性优先。
+- **大响应必须走分块传输**：`harness.remote.call` 返回 `RESPONSE_TOO_LARGE` 时改用 `harness.remote.transfer.open/chunk/commit/read/close`（每块 512 KiB，标准 Base64）。`session/page` 一个会话常有几百步，必然触发。**`RemoteBridge.harnessCall` 必须转调 `RemoteConnection.harnessCall`**，不要自己组 `harness.remote.call`——那样会绕过分块逻辑，表现为「打开会话一片空白」。
+- **接口翻译层是 `RemoteBridge`**：把中继那套 `/api/sessions`、`/api/session`、`/api/models` 等语义翻译成 DSH 原生 RPC，并复刻中继的整形逻辑（`normalizeSessionList` / `normalizeSteps` / `groupByProject` / `normalizeQueue`），这样界面代码三十余处调用一行都不用改。改中继的整形规则时必须同步改 `RemoteBridge`。
+- **参数形态与中继不同，新增端点前先核对**：`session/list` 用 `_request`；`session/page` 用 `{address:{kind,...}, throughSeq, maxMessages}`，子代理必须用 `{kind:'subagent', parentSessionId, childSessionId, mode}`；`session/modelCatalog` 返回的是 `groups` 而非 `providers`，且 `routing` 在 `routableProviders` 里过滤；`session/updateQueue` 是**按 itemId 操作单条**（`{sessionId, itemId, action:{kind}}`），不是整体替换。
+- **排队消息从 `projections.values.inbox` 读**：`next-step` 是插话、`next-turn` 是下一轮。会话内容（`session/page`）里没有队列字段，只能从投影拿。
+- **远程设备的 `base` 是 `remote://<hostDeviceId>`**。`Api` 按这个前缀分流到远程通道；`MainActivity.baseUrl()` **必须在交给 `Store.parse` 之前原样返回它**——否则解析成空串，请求走不到远程分支，表现是「已连接但列表永远空白」。
+- **`onRemotePage` 必须在离开远程页时清掉**（`showSessionList()` 里统一清），否则 `onListPage()` 恒为 false，所有列表回调都被丢弃。这个坑实际踩过一次。
+- **远程连接的建立顺序不能变**：`hello` → `hello.ack` → `connect.request` → `connect.accepted` → `secure.handshake`（step 1/2）→ Noise 完成 → 业务 RPC。Noise 未完成前发业务消息会被 Host 丢弃。
+- **令牌必须跨启动保留，且轮换后立刻写回**：服务端每次 refresh 都换新 refresh token，旧的不再可用。`Store` 里存 `{serverUrl, deviceId, accessToken, refreshToken, 两个过期时间, account, privateKey, publicKey}`。**测试时反复调用 refresh 会把令牌链走乱**，真机验证前先用 `register-owned-role` 用 host 凭据重新注册一个 client 角色。
+- 桌面面板新增「远程访问」区块（`FillRemoteState`）：只读 `~/.dsh/remote/servers/*/host/{device,server-credentials}.json`，**不调用插件接口**（插件没有对外查询端口）。读不到就当未安装，中继照常工作。
 
 ## 思考内容
 

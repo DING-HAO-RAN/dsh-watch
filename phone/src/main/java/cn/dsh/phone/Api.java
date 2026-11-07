@@ -74,6 +74,11 @@ final class Api {
      */
     static void request(final String method, final String base, final String alternateBase, final String path,
                         final String token, final JSONObject body, final Callback callback) {
+        // 远程主机（base 形如 remote://<hostDeviceId>）走账号服务器转发的加密隧道。
+        if (base != null && base.startsWith("remote://")) {
+            dispatchRemote(method, path, body, callback);
+            return;
+        }
         POOL.execute(new Runnable() {
             @Override public void run() {
                 String error = null;
@@ -100,6 +105,43 @@ final class Api {
                 }
                 // 两条地址都失败时，报告第一条的错（通常是用户当前所在网络那条）。
                 deliver(callback, value, value == null ? (firstError == null ? error : firstError) : null);
+            }
+        });
+    }
+
+    /** 远程通道：与中继形态共用同一套 JSON 结果结构，界面不必区分。 */
+    private static RemoteBridge remoteBridge;
+
+    static void setRemoteBridge(RemoteBridge bridge) {
+        remoteBridge = bridge;
+    }
+
+    static boolean remoteAvailable() {
+        return remoteBridge != null && remoteBridge.isAvailable();
+    }
+
+    private static void dispatchRemote(final String method, final String path,
+                                       final JSONObject body, final Callback callback) {
+        final RemoteBridge bridge = remoteBridge;
+        if (bridge == null || !bridge.isAvailable()) {
+            deliver(callback, null, "尚未连接远程主机");
+            return;
+        }
+        POOL.execute(new Runnable() {
+            @Override public void run() {
+                String route = path;
+                String query = "";
+                int question = path.indexOf('?');
+                if (question >= 0) {
+                    route = path.substring(0, question);
+                    query = path.substring(question + 1);
+                }
+                try {
+                    JSONObject value = bridge.request(method, route, query, body);
+                    deliver(callback, value, null);
+                } catch (Exception error) {
+                    deliver(callback, null, friendly(error));
+                }
             }
         });
     }
@@ -231,6 +273,25 @@ final class Api {
         request("POST", store.base(), store.alternateBase(), "/api/cancel", store.token(), body, callback);
     }
 
+    /** 往当前会话工作目录上传一个文件（body 含 id/name/base64）。 */
+    static void upload(Store store, JSONObject body, Callback callback) {
+        request("POST", store.base(), store.alternateBase(), "/api/upload", store.token(), body, callback);
+    }
+
+    /** 对一条排队消息执行 remove / steer / edit。 */
+    static void queueAction(Store store, String sessionId, String itemId, String kind,
+                            String text, Callback callback) {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("id", sessionId);
+            body.put("itemId", itemId);
+            body.put("kind", kind);
+            if (text != null && text.length() > 0) body.put("text", text);
+        } catch (Exception ignored) { }
+        request("POST", store.base(), store.alternateBase(), "/api/session/queue",
+                store.token(), body, callback);
+    }
+
     static void answer(Store store, String sessionId, String callId, String eventId, JSONArray answers, Callback callback) {
         JSONObject body = new JSONObject();
         try {
@@ -331,6 +392,33 @@ final class Api {
     }
 
     // ===== 数据模型 =====
+
+    /** 一条排队中的消息（运行中会话里还没发出的指令）。 */
+    static final class QueuedMessage {
+        String id = "";
+        String text = "";
+        /** next-step 表示插话，next-turn 表示下一轮。 */
+        String bucket = "";
+    }
+
+    /** 解析会话里排队中的消息。 */
+    static List<QueuedMessage> parseQueue(JSONObject value) {
+        List<QueuedMessage> out = new ArrayList<>();
+        if (value == null) return out;
+        JSONArray array = value.optJSONArray("queue");
+        if (array == null) return out;
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item == null) continue;
+            QueuedMessage message = new QueuedMessage();
+            message.id = text(item, "id");
+            message.text = text(item, "text");
+            message.bucket = text(item, "bucket");
+            if (message.id.isEmpty()) continue;
+            out.add(message);
+        }
+        return out;
+    }
 
     static final class Session {
         String id = "";

@@ -19,6 +19,8 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
+import cn.dsh.remote.RemoteAccount;
+
 import org.json.JSONArray;
 import org.json.JSONObject;
 
@@ -193,12 +195,43 @@ public class MainActivity extends Activity {
             return;
         }
         if (store.paired()) {
+            prepareCurrentDevice();
             currentSessionId = store.lastSession();
             if (currentSessionId.isEmpty()) showSessionList();
             else showSession(currentSessionId);
         } else {
             showConnect();
         }
+    }
+
+    /**
+     * 启动时按当前设备类型准备好通道。
+     *
+     * 远程设备没有局域网地址，必须先把 RemoteBridge 挂到 Api 上，
+     * 否则第一屏的会话列表会走 HTTP 而必然失败。
+     */
+    private void prepareCurrentDevice() {
+        Store.Device device = store.current();
+        if (device == null || !device.isRemote()) {
+            api.setRemoteBridge(null);
+            return;
+        }
+        RemoteBridge bridge = bridgeFor(device);
+        if (bridge == null) return;
+        new Thread(() -> {
+            try {
+                bridge.connect();
+                runOnUiThread(() -> {
+                    if (destroyed) return;
+                    showToast("已连接 " + device.label);
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    if (destroyed) return;
+                    showToast("远程连接失败：" + friendlyRemote(error));
+                });
+            }
+        }).start();
     }
 
     /**
@@ -372,7 +405,11 @@ public class MainActivity extends Activity {
 
     /** 当前配置对应的请求根地址（形如 http://192.168.1.121:19390 或 https://host）。 */
     private String baseUrl() {
-        Store.Endpoint endpoint = Store.parse(store.base(), DEFAULT_RELAY_PORT);
+        // 远程设备的 base 是 `remote://<hostDeviceId>`，不是可解析的 host:port，
+        // 必须原样交给 Api（它按前缀分流到远程通道）。
+        String raw = store.base();
+        if (raw != null && raw.startsWith("remote://")) return raw;
+        Store.Endpoint endpoint = Store.parse(raw, DEFAULT_RELAY_PORT);
         if (endpoint == null) return "";
         // url("") 会拼出以 / 结尾的根地址，供 Api 直接拼接路径。
         return endpoint.url("/").replaceAll("/$", "");
@@ -391,11 +428,29 @@ public class MainActivity extends Activity {
         if (store.paired()) {
             LinearLayout current = ui.card();
             current.addView(ui.text("当前连接", 11, WatchUi.ACCENT));
-            TextView address = ui.text(store.base(), 12, WatchUi.FG);
+            // 远程设备的 base 是内部标识（remote://…），给用户看名字更有意义。
+            Store.Device active = store.current();
+            String shown = active == null ? store.base()
+                    : (active.isRemote() ? ("远程 · " + active.label) : store.base());
+            TextView address = ui.text(shown, 12, WatchUi.FG);
             address.setPadding(0, ui.dp(5), 0, 0);
             current.addView(address);
             ui.add(page, current, 0, 10);
         }
+
+        // ---- 远程主机：经 ds-harness-remote 插件，不依赖局域网 ----
+        ui.divider(page);
+        ui.add(page, ui.text("远程连接", 11, WatchUi.MUTED), 0, 6);
+        if (store.hasRemoteAccount()) {
+            String accountName = remoteAccountName();
+            ui.add(page, ui.row("远程账号", accountName.isEmpty() ? "已登录" : accountName,
+                    this::showRemoteHosts), 0, 6);
+        } else {
+            ui.add(page, ui.row("登录远程账号", "不在同一网络时用这个",
+                    this::showRemoteLogin), 0, 6);
+        }
+        ui.add(page, ui.text("远程连接经账号服务器转发，电脑不在局域网也能用；"
+                + "需要在电脑上安装并登录 ds-harness-remote 插件。", 10, WatchUi.MUTED), 0, 10);
 
         // ---- 已记住的设备：直接切换，不必重新配对 ----
         final List<Store.Device> remembered = store.devices();
@@ -404,10 +459,17 @@ public class MainActivity extends Activity {
             String currentBase = store.base();
             for (final Store.Device device : remembered) {
                 boolean active = device.base.equals(currentBase);
-                String kind = device.isPublic() ? "公网" : "局域网";
+                String kind;
+                String subtitle;
+                if (device.isRemote()) {
+                    kind = "远程";
+                    subtitle = kind + " · " + device.remoteServer;
+                } else {
+                    kind = device.isPublic() ? "公网" : "局域网";
+                    subtitle = kind + " · " + device.base;
+                }
                 String title = device.label.isEmpty() ? device.base : device.label;
-                ui.add(page, ui.row(title, kind + " · " + device.base,
-                        () -> switchToDevice(device)), 0, active ? 8 : 6);
+                ui.add(page, ui.row(title, subtitle, () -> switchToDevice(device)), 0, active ? 8 : 6);
             }
             ui.add(page, ui.text("点一条可直接切过去，不用重新配对。", 10, WatchUi.MUTED), 0, 10);
         }
@@ -515,12 +577,25 @@ public class MainActivity extends Activity {
     /** 切换到一台已记住的设备。 */
     private void switchToDevice(final Store.Device device) {
         if (device == null || !device.valid()) {
-            showToast("这台设备的令牌已失效，请重新配对");
+            showToast(device != null && device.isRemote()
+                    ? "远程主机信息不完整，请重新选择一次" : "这台设备的令牌已失效，请重新配对");
             return;
         }
         store.useDevice(device);
         // 换设备等同于换了一个世界：会话、展开状态、列表指纹全部要清，
         // 否则会上一条设备的展开卡片套在新设备的内容上。
+        clearSessionState();
+        if (device.isRemote()) {
+            prepareCurrentDevice();
+        } else {
+            api.setRemoteBridge(null);
+        }
+        showToast("已切换到 " + (device.label.isEmpty() ? device.base : device.label));
+        showSessionList();
+    }
+
+    /** 清空与「当前这台设备」绑定的会话状态。 */
+    private void clearSessionState() {
         currentSessionId = "";
         currentSessionTitle = "";
         currentAsk = null;
@@ -532,8 +607,6 @@ public class MainActivity extends Activity {
         openGroups.clear();
         openRows.clear();
         lastListSignature = 0;
-        showToast("已切换到 " + (device.label.isEmpty() ? device.base : device.label));
-        showSessionList();
     }
 
     /** 手表上弹一个短提示（没有 Toast 时降级为日志）。 */
@@ -543,6 +616,284 @@ public class MainActivity extends Activity {
         } catch (Exception ignored) {
             // 某些手表系统禁用了 Toast，忽略即可。
         }
+    }
+
+    // ------------------------------------------------------------ 远程账号
+
+    /** 远程账号凭据（存在 Store 里，跨启动保留）。 */
+    private RemoteAccount remoteAccount;
+    private RemoteBridge remoteBridge;
+    /** 远程主机列表页的临时状态。 */
+    private boolean onRemotePage;
+
+    /** 从存档恢复远程账号；没有存档时返回 null。 */
+    private RemoteAccount loadRemoteAccount() {
+        if (remoteAccount != null) return remoteAccount;
+        String json = store.remoteAccountJson();
+        if (json == null || json.isEmpty()) return null;
+        try {
+            JSONObject saved = new JSONObject(json);
+            RemoteAccount account = new RemoteAccount(
+                    saved.optString("serverUrl", RemoteAccount.DEFAULT_SERVER));
+            account.restore(saved.optString("deviceId", ""), saved.optString("accessToken", ""),
+                    saved.optString("refreshToken", ""),
+                    saved.optLong("accessTokenExpiresAt", 0L),
+                    saved.optLong("refreshTokenExpiresAt", 0L),
+                    saved.optString("account", ""));
+            String privateKey = saved.optString("privateKey", "");
+            String publicKey = saved.optString("publicKey", "");
+            if (!privateKey.isEmpty() && !publicKey.isEmpty()) {
+                account.setLocalKeys(cn.dsh.remote.Bytes.unb64u(privateKey), publicKey);
+            }
+            remoteAccount = account;
+            return account;
+        } catch (Exception error) {
+            return null;
+        }
+    }
+
+    /** 保存远程账号（含本机密钥，令牌轮换后必须立刻写回）。 */
+    private void saveRemoteAccount(RemoteAccount account) {
+        if (account == null) return;
+        JSONObject saved = new JSONObject();
+        try {
+            saved.put("serverUrl", account.serverUrl());
+            saved.put("deviceId", account.deviceId());
+            saved.put("accessToken", account.accessToken());
+            saved.put("refreshToken", account.refreshTokenValue());
+            saved.put("accessTokenExpiresAt", account.accessTokenExpiresAt());
+            saved.put("refreshTokenExpiresAt", account.refreshTokenExpiresAt());
+            saved.put("account", account.account());
+            saved.put("privateKey", account.localPrivateKey() == null
+                    ? "" : cn.dsh.remote.Bytes.b64u(account.localPrivateKey()));
+            saved.put("publicKey", account.localPublicKey() == null ? "" : account.localPublicKey());
+        } catch (Exception ignored) {
+            // 字段都是字符串与数字。
+        }
+        store.setRemoteAccountJson(saved.toString());
+    }
+
+    private String remoteAccountName() {
+        RemoteAccount account = loadRemoteAccount();
+        if (account == null) return "";
+        String name = account.account();
+        return name == null ? "" : name;
+    }
+
+    /** 为当前远程设备准备通道。 */
+    private RemoteBridge bridgeFor(Store.Device device) {
+        RemoteAccount account = loadRemoteAccount();
+        if (account == null || device == null || !device.isRemote()) return null;
+        if (remoteBridge != null && device.base.equals(remoteDeviceBase)) return remoteBridge;
+        if (remoteBridge != null) remoteBridge.closeQuietly();
+        remoteBridge = new RemoteBridge(account, device.deviceId, device.hostPublicKey,
+                device.remoteServer, device.label, "1.0.0");
+        remoteDeviceBase = device.base;
+        api.setRemoteBridge(remoteBridge);
+        return remoteBridge;
+    }
+
+    private String remoteDeviceBase = "";
+
+    /** 远程账号登录页。 */
+    private void showRemoteLogin() {
+        onRemotePage = true;
+        onSessionPage = false;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "远程账号", "登录后可连不在局域网的主机");
+
+        final EditText serverField = new EditText(this);
+        serverField.setHint("服务器地址（默认 dsh.r2049.cn）");
+        serverField.setText(RemoteAccount.DEFAULT_SERVER);
+        serverField.setTextSize(12);
+        serverField.setTextColor(WatchUi.FG);
+        serverField.setHintTextColor(WatchUi.MUTED);
+        serverField.setSingleLine(true);
+        serverField.setBackground(ui.surface(WatchUi.SURFACE, 14));
+        serverField.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
+        ui.add(page, serverField, 0, 8);
+
+        final EditText emailField = new EditText(this);
+        emailField.setHint("账号（邮箱）");
+        emailField.setTextSize(12);
+        emailField.setTextColor(WatchUi.FG);
+        emailField.setHintTextColor(WatchUi.MUTED);
+        emailField.setSingleLine(true);
+        emailField.setBackground(ui.surface(WatchUi.SURFACE, 14));
+        emailField.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
+        ui.add(page, emailField, 0, 8);
+
+        final EditText passwordField = new EditText(this);
+        passwordField.setHint("密码");
+        passwordField.setTextSize(12);
+        passwordField.setTextColor(WatchUi.FG);
+        passwordField.setHintTextColor(WatchUi.MUTED);
+        passwordField.setSingleLine(true);
+        passwordField.setInputType(android.text.InputType.TYPE_CLASS_TEXT
+                | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passwordField.setBackground(ui.surface(WatchUi.SURFACE, 14));
+        passwordField.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
+        ui.add(page, passwordField, 0, 8);
+
+        final TextView status = ui.text("", 11, WatchUi.MUTED);
+        status.setPadding(ui.dp(2), ui.dp(4), ui.dp(2), ui.dp(4));
+        ui.add(page, status, 0, 6);
+
+        ui.add(page, ui.button("登录", true, () -> {
+            final String server = serverField.getText().toString().trim();
+            final String email = emailField.getText().toString().trim();
+            final String password = passwordField.getText().toString();
+            if (email.isEmpty() || password.isEmpty()) {
+                status.setTextColor(WatchUi.WARN);
+                status.setText("请填写账号与密码");
+                return;
+            }
+            status.setTextColor(WatchUi.MUTED);
+            status.setText("正在登录…");
+            new Thread(() -> {
+                try {
+                    RemoteAccount account = new RemoteAccount(
+                            server.isEmpty() ? RemoteAccount.DEFAULT_SERVER : server);
+                    account.loginWithPassword(email, password);
+                    saveRemoteAccount(account);
+                    runOnUiThread(() -> {
+                        if (destroyed) return;
+                        remoteAccount = account;
+                        showRemoteHosts();
+                    });
+                } catch (Exception error) {
+                    runOnUiThread(() -> {
+                        if (destroyed) return;
+                        status.setTextColor(WatchUi.WARN);
+                        status.setText("登录失败：" + friendlyRemote(error));
+                    });
+                }
+            }).start();
+        }), 0, 8);
+
+        ui.add(page, ui.button("返回设置", false, this::showConnect), 0, 0);
+        ui.add(page, ui.text("账号密码只用于登录本机设备；令牌保存在手表本地，不会写进日志。"
+                + "自建服务器请填写完整地址。", 10, WatchUi.MUTED), 0, 8);
+        render(page);
+    }
+
+    /** 远程主机列表页。 */
+    private void showRemoteHosts() {
+        onRemotePage = true;
+        onSessionPage = false;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "远程主机", "选择要连接的那台电脑");
+
+        final RemoteAccount account = loadRemoteAccount();
+        if (account == null) {
+            ui.add(page, ui.text("尚未登录远程账号", 12, WatchUi.WARN), 0, 10);
+            ui.add(page, ui.button("去登录", true, this::showRemoteLogin), 0, 0);
+            render(page);
+            return;
+        }
+
+        final LinearLayout listCard = ui.card();
+        listCard.addView(ui.text("正在读取主机列表…", 11, WatchUi.MUTED));
+        ui.add(page, listCard, 0, 8);
+
+        ui.add(page, ui.button("刷新", false, this::showRemoteHosts), 0, 8);
+        ui.add(page, ui.button("退出远程账号", false, () -> {
+            store.setRemoteAccountJson("");
+            remoteAccount = null;
+            if (remoteBridge != null) remoteBridge.closeQuietly();
+            remoteBridge = null;
+            api.setRemoteBridge(null);
+            showConnect();
+        }), 0, 8);
+        ui.add(page, ui.button("返回设置", false, this::showConnect), 0, 0);
+        render(page);
+
+        new Thread(() -> {
+            try {
+                account.ensureAccessToken();
+                final List<RemoteAccount.HostDevice> hosts = account.listHosts();
+                saveRemoteAccount(account);
+                runOnUiThread(() -> {
+                    if (destroyed || !onRemotePage) return;
+                    listCard.removeAllViews();
+                    if (hosts.isEmpty()) {
+                        listCard.addView(ui.text("账号下还没有主机。请在电脑上安装并登录 ds-harness-remote 插件。",
+                                11, WatchUi.MUTED));
+                        return;
+                    }
+                    listCard.addView(ui.text("共 " + hosts.size() + " 台", 11, WatchUi.ACCENT));
+                    for (final RemoteAccount.HostDevice host : hosts) {
+                        LinearLayout row = new LinearLayout(MainActivity.this);
+                        row.setOrientation(LinearLayout.VERTICAL);
+                        row.setPadding(0, ui.dp(6), 0, ui.dp(6));
+                        TextView title = ui.text(host.name, 12, WatchUi.FG);
+                        row.addView(title);
+                        String subtitle = host.platform;
+                        if (!host.harnessVersion.isEmpty()) subtitle += " · DSH " + host.harnessVersion;
+                        row.addView(ui.text(subtitle, 10, WatchUi.MUTED));
+                        row.setOnClickListener(v -> connectRemoteHost(host));
+                        listCard.addView(row);
+                    }
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    if (destroyed) return;
+                    listCard.removeAllViews();
+                    listCard.addView(ui.text("读取失败：" + friendlyRemote(error), 11, WatchUi.WARN));
+                });
+            }
+        }).start();
+    }
+
+    /** 连接一台远程主机：取公钥、记住、切过去。 */
+    private void connectRemoteHost(final RemoteAccount.HostDevice host) {
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "连接中", host.name);
+        ui.add(page, ui.text("正在获取主机公钥并建立加密通道…", 11, WatchUi.MUTED), 0, 10);
+        render(page);
+
+        final RemoteAccount account = loadRemoteAccount();
+        new Thread(() -> {
+            try {
+                String publicKey = account.hostIdentityKey(host.deviceId);
+                saveRemoteAccount(account);
+                // 先把设备记下来并建好通道，再切界面；否则第一屏列表会因通道未就绪而空白。
+                store.rememberRemoteHost(host.deviceId, host.name, account.serverUrl(),
+                        publicKey, host.name);
+                Store.Device device = store.current();
+                RemoteBridge bridge = device == null ? null : bridgeFor(device);
+                if (bridge != null) bridge.connect();
+                runOnUiThread(() -> {
+                    if (destroyed) return;
+                    // 离开远程页必须清掉标记，否则 onListPage() 恒为 false，
+                    // 列表回调会被当成「已离开」而整片丢弃（表现为一直空白）。
+                    onRemotePage = false;
+                    clearSessionState();
+                    showSessionList();
+                });
+            } catch (Exception error) {
+                runOnUiThread(() -> {
+                    if (destroyed) return;
+                    WatchUi.Page fail = ui.page();
+                    ui.heading(fail, "连接失败", host.name);
+                    ui.add(fail, ui.text(friendlyRemote(error), 12, WatchUi.WARN), 0, 10);
+                    ui.add(fail, ui.button("重试", true, () -> connectRemoteHost(host)), 0, 8);
+                    ui.add(fail, ui.button("返回", false, this::showRemoteHosts), 0, 0);
+                    render(fail);
+                });
+            }
+        }).start();
+    }
+
+    /** 把远程异常翻成用户能看懂的话。 */
+    private static String friendlyRemote(Exception error) {
+        String message = error.getMessage() == null ? error.getClass().getSimpleName() : error.getMessage();
+        if (error instanceof java.net.UnknownHostException) return "找不到服务器地址";
+        if (error instanceof java.net.SocketTimeoutException) return "连接超时，请检查网络";
+        if (message.contains("AUTH_INVALID")) return "登录已过期，请重新登录";
+        if (message.contains("HOST_OFFLINE")) return "这台电脑不在线";
+        if (message.contains("MEMBERSHIP_REQUIRED")) return "这个账号无权连接该主机";
+        return message;
     }
 
     /**
@@ -761,6 +1112,9 @@ public class MainActivity extends Activity {
      */
     private void showSessionList() {
         onSessionPage = false;
+        // 列表页是「远程页 / 连接页」之外的正常主界面，进来就把这些标记清掉，
+        // 否则 onListPage() 恒为 false，所有列表回调都会被丢弃。
+        onRemotePage = false;
         // 从会话页返回时回到列表顶部；列表自身的定时刷新则由 render() 保持位置。
         if (returningFromSession) {
             resetScroll();
@@ -1105,6 +1459,7 @@ public class MainActivity extends Activity {
         currentSessionTitle = titleOf(sessionId);
         store.setLastSession(sessionId, currentSessionTitle);
         onSessionPage = true;
+        onRemotePage = false;
         editing = false;
         // 从项目列表正常进入时，返回目标是列表；子任务入口会在本方法返回后覆盖它。
         sessionReturnTo = "";
@@ -1141,6 +1496,8 @@ public class MainActivity extends Activity {
             Api.Usage loadedUsage = Api.parseUsage(result.value);
             currentRunning = result.value.optBoolean("running", false);
             currentAsk = Api.parseQuestion(result.value.optJSONObject("question"), sessionId, currentSessionTitle);
+            currentQueue.clear();
+            currentQueue.addAll(Api.parseQueue(result.value));
             currentBeforeSeq = result.value.optLong("beforeSeq", 0L);
             currentHasMore = result.value.optBoolean("hasMore", false);
             String title = result.value.optString("title", "");
@@ -1313,6 +1670,205 @@ public class MainActivity extends Activity {
     /** 下一次重建会话页时是否自动滚到末尾。 */
     private boolean autoScrollToBottom;
 
+    /**
+     * 排队消息页：列出还没发出的消息，可逐条删除或「立即发送」。
+     *
+     * 数据来自会话投影的 inbox（next-step 是插话、next-turn 是下一轮），
+     * 每次操作后用 session/updateQueue 按 itemId 处理那一条。
+     */
+    private void showQueue() {
+        onSessionPage = false;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "排队消息", currentSessionTitle);
+        final LinearLayout list = ui.card();
+        ui.add(page, list, 0, 8);
+        renderQueuePage(page, list);
+    }
+
+    /** 用当前会话数据里的队列渲染这一页。 */
+    private void renderQueuePage(WatchUi.Page page, LinearLayout list) {
+        list.removeAllViews();
+        if (currentQueue.isEmpty()) {
+            list.addView(ui.text("没有排队中的消息", 11, WatchUi.MUTED));
+            ui.add(page, ui.button("返回会话", true, () -> showSession(currentSessionId)), 0, 8);
+            render(page);
+            return;
+        }
+        list.addView(ui.text("共 " + currentQueue.size() + " 条", 11, WatchUi.ACCENT));
+        for (int i = 0; i < currentQueue.size(); i++) {
+            final Api.QueuedMessage item = currentQueue.get(i);
+            String shown = item.text.trim().isEmpty() ? "（空消息）" : clipLine(item.text, 18);
+            ui.add(page, ui.row(shown, "点一下：立即发送这条",
+                    () -> queueAction(item, "steer")), 0, 6);
+            ui.add(page, ui.row("删除这条", "不再发送", () -> queueAction(item, "remove")), 0, 4);
+        }
+        ui.add(page, ui.button("返回会话", true, () -> showSession(currentSessionId)), 0, 8);
+        render(page);
+    }
+
+    /** 对一条排队消息执行 remove / steer。 */
+    private void queueAction(Api.QueuedMessage item, String kind) {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("id", currentSessionId);
+            body.put("itemId", item.id);
+            body.put("kind", kind);
+        } catch (Exception ignored) { }
+        api.post(baseUrl(), "/api/session/queue", store.token(), body, result -> {
+            if (destroyed) return;
+            if (!result.ok) {
+                showToast("操作失败：" + result.error);
+                return;
+            }
+            showToast("steer".equals(kind) ? "已要求立即发送" : "已删除");
+            loadSession(currentSessionId, false);
+            showQueue();
+        });
+    }
+
+    /** 当前会话排队中的消息（每次会话刷新后更新）。 */
+    private final List<Api.QueuedMessage> currentQueue = new ArrayList<>();
+
+    // -------------------------------------------------------------- 终端
+
+    /** 当前终端 id；空表示还没创建。 */
+    private String terminalId = "";
+    /** 已读到的输出序号。 */
+    private int terminalSince;
+    /** 终端屏幕缓冲（已剥掉 ANSI 转义）。 */
+    private final StringBuilder terminalScreen = new StringBuilder();
+    private TextView terminalView;
+    private boolean terminalPolling;
+
+    /**
+     * 手表上的精简终端：显示输出 + 输入命令。
+     *
+     * 手表屏幕只有三百多像素高，做完整终端模拟没有意义；这里只保留
+     * 「看输出、敲命令」两件事，输出靠 HTTP 轮询增量拉取。
+     */
+    private void showTerminal() {
+        onSessionPage = false;
+        WatchUi.Page page = ui.page();
+        ui.heading(page, "终端", currentSessionTitle);
+
+        final EditText command = new EditText(this);
+        command.setHint("输入命令，如 ls");
+        command.setTextSize(12);
+        command.setTextColor(WatchUi.FG);
+        command.setHintTextColor(WatchUi.MUTED);
+        command.setSingleLine(true);
+        command.setBackground(ui.surface(WatchUi.SURFACE, 14));
+        command.setPadding(ui.dp(10), ui.dp(8), ui.dp(10), ui.dp(8));
+        ui.add(page, command, 0, 8);
+
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.addView(ui.button("发送", true, () -> {
+            String text = command.getText().toString();
+            if (text.trim().isEmpty()) return;
+            command.setText("");
+            terminalInput(text + "\n");
+        }), weighted(0));
+        actions.addView(ui.button("Ctrl+C", false, () -> terminalInput("\u0003")), weighted(0));
+        ui.add(page, actions, 0, 6);
+
+        terminalView = ui.text(terminalScreen.length() == 0 ? "（还没有输出）" : terminalScreen.toString(),
+                10, WatchUi.FG);
+        terminalView.setTypeface(android.graphics.Typeface.MONOSPACE);
+        LinearLayout screen = ui.card();
+        screen.addView(terminalView);
+        ui.add(page, screen, 0, 8);
+
+        ui.add(page, ui.button("返回会话", false, () -> showSession(currentSessionId)), 0, 0);
+        render(page);
+
+        if (terminalId.isEmpty()) createTerminal();
+        else pollTerminal();
+    }
+
+    private void createTerminal() {
+        JSONObject body = new JSONObject();
+        try {
+            body.put("action", "create");
+            body.put("id", currentSessionId);
+            // 圆屏可视宽度约 320px，按等宽字符约 24 列起步。
+            body.put("cols", 40);
+            body.put("rows", 20);
+        } catch (Exception ignored) { }
+        api.post(baseUrl(), "/api/terminal", store.token(), body, result -> {
+            if (destroyed) return;
+            if (!result.ok) {
+                showToast("创建终端失败：" + result.error);
+                return;
+            }
+            JSONObject terminal = result.value.optJSONObject("terminal");
+            terminalId = terminal == null ? "" : Api.text(terminal, "id");
+            terminalSince = 0;
+            terminalScreen.setLength(0);
+            if (terminalId.isEmpty()) {
+                showToast("创建终端失败：没有返回 id");
+                return;
+            }
+            pollTerminal();
+        });
+    }
+
+    private void terminalInput(String data) {
+        if (terminalId.isEmpty()) {
+            showToast("终端还没准备好");
+            return;
+        }
+        JSONObject body = new JSONObject();
+        try {
+            body.put("action", "input");
+            body.put("terminalId", terminalId);
+            body.put("data", data);
+        } catch (Exception ignored) { }
+        api.post(baseUrl(), "/api/terminal", store.token(), body, result -> {
+            if (destroyed) return;
+            if (!result.ok) showToast(result.error);
+            else pollTerminal();
+        });
+    }
+
+    private void pollTerminal() {
+        if (terminalPolling || terminalId.isEmpty() || destroyed) return;
+        terminalPolling = true;
+        api.get(baseUrl(), "/api/terminal/output?id=" + Api.urlEncode(terminalId)
+                + "&since=" + terminalSince, store.token(), result -> {
+            terminalPolling = false;
+            if (destroyed || !result.ok) return;
+            int next = result.value.optInt("next", terminalSince);
+            JSONArray frames = result.value.optJSONArray("frames");
+            if (frames != null && frames.length() > 0) {
+                for (int i = 0; i < frames.length(); i++) {
+                    JSONObject frame = frames.optJSONObject(i);
+                    if (frame == null) continue;
+                    String kind = Api.text(frame, "kind");
+                    String data = Api.text(frame, "data");
+                    if ("reset".equals(kind)) terminalScreen.setLength(0);
+                    terminalScreen.append(cleanAnsi(data));
+                }
+                // 只保留最后 4000 字符：手表显示不了更多，留着只会越来越慢。
+                if (terminalScreen.length() > 4000) {
+                    terminalScreen.delete(0, terminalScreen.length() - 4000);
+                }
+                if (terminalView != null) terminalView.setText(terminalScreen.toString());
+            }
+            terminalSince = next;
+            // 300ms 拉一次增量，与手机端保持一致。
+            postDelayed(this::pollTerminal, 300);
+        });
+    }
+
+    /** 剥掉 ANSI 转义序列，手表上不需要颜色。 */
+    private static String cleanAnsi(String text) {
+        if (text == null) return "";
+        return text.replaceAll("\u001b\\[[0-9;?]*[a-zA-Z]", "")
+                .replaceAll("\u001b\\][^\u0007]*\u0007", "")
+                .replaceAll("\r", "");
+    }
+
     /** 菜单项：标题、说明与动作。 */
     static final class MenuItem {
         final String title;
@@ -1332,6 +1888,7 @@ public class MainActivity extends Activity {
         items.add(new MenuItem("发消息", "给这个会话发一条", this::showCompose));
         if (currentRunning) {
             items.add(new MenuItem("停止生成", "让 AI 立即停下", this::cancelRun));
+            items.add(new MenuItem("排队消息", "查看 / 清空还没发出的消息", this::showQueue));
         }
         if (currentAsk != null) {
             items.add(new MenuItem("回答问题", "AI 正在等你", () -> showQuestion(currentAsk)));
@@ -1356,6 +1913,7 @@ public class MainActivity extends Activity {
         // 之前按 sessionFiles 是否为空来决定显示，而菜单在会话数据回来之前就建好了，
         // 结果入口根本不出现（点了也永远看不到文件）。
         items.add(new MenuItem("查看文件", "会话里出现的 md / 代码文件", this::showFileList));
+        items.add(new MenuItem("终端", "在这个会话的目录里执行命令", this::showTerminal));
         if (currentHasMore) {
             items.add(new MenuItem("看更早的内容", "往前翻历史", this::loadOlder));
         }
@@ -2037,7 +2595,7 @@ public class MainActivity extends Activity {
      * 文件页整屏覆盖掉。子任务页与计划页同样不能被覆盖，因此统一走这里。
      */
     private boolean onListPage() {
-        return !onSessionPage && !onFilePage && !onSubagentPage && !onPlanPage;
+        return !onSessionPage && !onFilePage && !onSubagentPage && !onPlanPage && !onRemotePage;
     }
 
     /** 菜单入口：用当前会话作父会话，进入子任务列表。 */
@@ -2947,10 +3505,13 @@ public class MainActivity extends Activity {
         try {
             body.put("sessionId", currentSessionId);
             body.put("text", text);
+            // 会话正在跑时发消息就是「插话」：DSH 用 steer 让新指令立刻生效，
+            // 而不是排队等这一轮结束。空闲时用默认排队即可。
+            body.put("mode", currentRunning ? "steer" : "queue");
         } catch (Exception ignored) {
             // 字符串不会失败
         }
-        renderSession("正在发送…");
+        renderSession(currentRunning ? "正在插话…" : "正在发送…");
         api.post(baseUrl(), "/api/send", store.token(), body, result -> {
             if (destroyed || !onSessionPage) return;
             if (!result.ok) {

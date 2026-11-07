@@ -13,12 +13,12 @@ import { createServer } from 'node:http'
 import { createSocket } from 'node:dgram'
 import { networkInterfaces } from 'node:os'
 import { readFileSync, writeFileSync, existsSync } from 'node:fs'
-import { readFile, readdir, stat } from 'node:fs/promises'
+import { readFile, readdir, stat, writeFile } from 'node:fs/promises'
 import { basename, extname, join, resolve, sep } from 'node:path'
 import { randomBytes, randomInt, randomUUID, timingSafeEqual } from 'node:crypto'
 import { moduleDirectory } from './paths.mjs'
 import { TerminalHub } from './terminals.mjs'
-import { MAX_MESSAGES, MAX_SESSIONS, groupByProject, normalizeMessages, normalizeModelCatalog, normalizePlan, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession, subagentsOf } from './state.mjs'
+import { MAX_MESSAGES, MAX_SESSIONS, groupByProject, normalizeMessages, normalizeModelCatalog, normalizePlan, normalizeQueue, normalizeSessionList, normalizeSteps, normalizeUsage, questionOfSession, subagentsOf } from './state.mjs'
 
 /**
  * 控制面板静态文件所在目录。
@@ -179,6 +179,36 @@ async function mapLimit(items, limit, worker) {
 const MAX_FILE_BYTES = 512 * 1024
 /** 一个目录最多返回的条目数。 */
 const MAX_DIR_ENTRIES = 600
+/** 单次上传上限：手机端把文件整段 base64 传过来，太大会把内存撑爆。 */
+const MAX_UPLOAD_BYTES = 32 * 1024 * 1024
+
+/** 只接受单个文件名，不允许任何路径成分。 */
+function isSafeFileName(name) {
+  if (typeof name !== 'string' || name.length === 0 || name.length > 220) return false
+  if (name === '.' || name === '..') return false
+  if (/[/\\]/.test(name)) return false
+  // ASCII 控制字符与 Windows 保留字符。
+  if (/[\u0000-\u001f\u007f<>:"|?*]/.test(name)) return false
+  if (/[. ]$/.test(name)) return false
+  return true
+}
+
+/** 同名文件不覆盖，依次尝试 `name (1).ext` 等候选。 */
+async function pickAvailableName(root, name) {
+  const dot = name.lastIndexOf('.')
+  const stem = dot > 0 ? name.slice(0, dot) : name
+  const ext = dot > 0 ? name.slice(dot) : ''
+  for (let index = 0; index < 100; index += 1) {
+    const candidate = index === 0 ? name : `${stem} (${index})${ext}`
+    const fullPath = resolve(root, candidate)
+    try {
+      await stat(fullPath)
+    } catch {
+      return { name: candidate, fullPath, relative: candidate }
+    }
+  }
+  throw new Error('同名文件过多，无法生成可用文件名')
+}
 
 /**
  * 目标路径必须落在工作区根目录内。
@@ -664,6 +694,8 @@ export class RelayServer {
       usage: normalizeUsage(projection?.values),
       // 计划与任务：待办清单、计划模式开关、团队任务板、长目标。
       plan: normalizePlan(projection?.values),
+      // 排队中的消息：运行中又发的那几条，手机/手表用 session/updateQueue 操作。
+      queue: normalizeQueue(projection?.values),
       ...(question === undefined ? {} : { question }),
     }
     this.rememberSessionPage(cacheKey, result)
@@ -1124,6 +1156,56 @@ export class RelayServer {
       return
     }
 
+    if (path === '/api/upload' && req.method === 'POST') {
+      // 往当前会话工作目录里写一个文件。
+      // 安全边界与只读浏览一致：路径必须落在该会话的 cwd 之内，且只接受单个文件名，
+      // 不允许 ../、绝对路径或子目录——否则等于把整台电脑的写入权限交出去。
+      const body = await readJsonBody(req)
+      const sessionId = String(body.id ?? '')
+      const name = String(body.name ?? '').trim()
+      const base64 = String(body.base64 ?? '')
+      if (sessionId === '' || name === '' || base64 === '') {
+        json(res, 400, { ok: false, error: '缺少 id、name 或 base64' })
+        return
+      }
+      if (!isSafeFileName(name)) {
+        json(res, 400, { ok: false, error: '文件名不合法：只能是单个文件名，不能含路径分隔符' })
+        return
+      }
+      const listed = await this.sessionIndex()
+      const session = listed.find((item) => item.id === sessionId)
+      const root = session?.projectPath ?? ''
+      if (root === '') {
+        json(res, 409, { ok: false, error: '这个会话没有工作目录，无法上传' })
+        return
+      }
+      let bytes
+      try {
+        bytes = Buffer.from(base64, 'base64')
+      } catch {
+        json(res, 400, { ok: false, error: 'base64 内容无法解码' })
+        return
+      }
+      if (bytes.byteLength > MAX_UPLOAD_BYTES) {
+        json(res, 413, { ok: false, error: `文件超过 ${Math.round(MAX_UPLOAD_BYTES / 1024 / 1024)}MB 上限` })
+        return
+      }
+      try {
+        // 不覆盖已有文件：同名时依次试 name (1).ext 等，最多 100 个候选。
+        const target = await pickAvailableName(root, name)
+        await writeFile(target.fullPath, bytes)
+        json(res, 200, {
+          ok: true,
+          name: target.name,
+          path: target.relative,
+          bytes: bytes.byteLength,
+        })
+      } catch (error) {
+        json(res, 500, { ok: false, error: `写入失败：${String(error.message)}` })
+      }
+      return
+    }
+
     if (path === '/api/terminals' && req.method === 'GET') {
       const sessionId = url.searchParams.get('id') ?? ''
       if (sessionId === '') {
@@ -1214,17 +1296,35 @@ export class RelayServer {
     }
 
     if (path === '/api/session/queue' && req.method === 'POST') {
-      // 运行中会话的排队消息：手机端在「正在回答时又发一条」时用它查看队列。
+      // 运行中会话的排队消息：对某一条做编辑 / 删除 / 立即发送。
+      // DSH 的 session/updateQueue 是「按 itemId 操作」，不是整体替换队列。
       const body = await readJsonBody(req)
       const sessionId = String(body.id ?? '')
+      const itemId = String(body.itemId ?? '')
       if (sessionId === '') {
         json(res, 400, { ok: false, error: '缺少 id' })
         return
       }
+      if (itemId === '') {
+        json(res, 400, { ok: false, error: '缺少 itemId' })
+        return
+      }
+      // action 只允许协议定义的三种；其他值一律按编辑处理会悄悄改坏队列。
+      const kind = String(body.kind ?? 'remove')
+      let action
+      if (kind === 'remove') action = { kind: 'remove' }
+      else if (kind === 'steer') action = { kind: 'steer' }
+      else if (kind === 'edit') {
+        action = { kind: 'edit', content: [{ type: 'text', text: String(body.text ?? '') }] }
+      } else {
+        json(res, 400, { ok: false, error: `未知的队列操作：${kind}` })
+        return
+      }
       try {
         const value = await this.link.rpc('session/updateQueue', {
-          request: { sessionId, entries: Array.isArray(body.entries) ? body.entries : [] },
+          request: { sessionId, itemId, action },
         })
+        this.forgetSessionPage(sessionId)
         json(res, 200, { ok: true, value })
       } catch (error) {
         json(res, 409, { ok: false, error: `更新队列失败：${String(error.message)}` })

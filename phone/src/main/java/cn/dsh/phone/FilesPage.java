@@ -160,6 +160,13 @@ final class FilesPage {
 
         LinearLayout header = Ui.row(host);
         header.addView(Ui.title(host, "文件", 26f), new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        TextView upload = Ui.ghostButton(host, "上传");
+        upload.setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                uploadFile();
+            }
+        });
+        header.addView(upload);
         TextView pick = Ui.ghostButton(host, "换会话");
         pick.setOnClickListener(new View.OnClickListener() {
             @Override public void onClick(View view) {
@@ -231,6 +238,108 @@ final class FilesPage {
             }
         });
         return row;
+    }
+
+    /** 选一个本地文件上传到当前会话的工作目录。 */
+    private void uploadFile() {
+        if (sessionId.length() == 0) {
+            host.toast("先选一个会话");
+            return;
+        }
+        android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_GET_CONTENT);
+        intent.setType("*/*");
+        try {
+            host.startActivityForResult(android.content.Intent.createChooser(intent, "选择要上传的文件"),
+                    MainActivity.REQUEST_UPLOAD_FILE);
+        } catch (Exception error) {
+            host.toast("打不开文件选择器：" + error.getMessage());
+        }
+    }
+
+    /** 由 MainActivity 在选好文件后回调。 */
+    void onFilePicked(android.net.Uri uri) {
+        if (uri == null) return;
+        String name = queryDisplayName(uri);
+        if (name.length() == 0) name = "上传文件";
+        final String fileName = name;
+        host.toast("正在读取 " + fileName + "…");
+        new Thread(new Runnable() {
+            @Override public void run() {
+                try {
+                    byte[] bytes = readAll(uri);
+                    if (bytes == null) {
+                        host.toast("读不到这个文件");
+                        return;
+                    }
+                    if (bytes.length > 32 * 1024 * 1024) {
+                        host.toast("文件超过 32MB 上限");
+                        return;
+                    }
+                    final String base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
+                    host.runOnUiThread(new Runnable() {
+                        @Override public void run() {
+                            doUpload(fileName, base64);
+                        }
+                    });
+                } catch (Exception error) {
+                    host.toast("读取失败：" + error.getMessage());
+                }
+            }
+        }).start();
+    }
+
+    private void doUpload(String name, String base64) {
+        org.json.JSONObject body = new org.json.JSONObject();
+        try {
+            body.put("id", sessionId);
+            body.put("name", name);
+            body.put("base64", base64);
+        } catch (Exception ignored) { }
+        Api.upload(host.store, body, new Api.Callback() {
+            @Override public void onResult(org.json.JSONObject value, String error) {
+                if (error != null) {
+                    host.toast("上传失败：" + error);
+                    return;
+                }
+                host.toast("已上传：" + (value == null ? name : Api.text(value, "name")));
+                loadDirectory(currentPath);
+            }
+        });
+    }
+
+    private String queryDisplayName(android.net.Uri uri) {
+        android.database.Cursor cursor = null;
+        try {
+            cursor = host.getContentResolver().query(uri, null, null, null, null);
+            if (cursor != null && cursor.moveToFirst()) {
+                int index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME);
+                if (index >= 0) return cursor.getString(index);
+            }
+        } catch (Exception ignored) {
+            // 取不到名字时退回默认名。
+        } finally {
+            if (cursor != null) cursor.close();
+        }
+        return "";
+    }
+
+    private byte[] readAll(android.net.Uri uri) {
+        java.io.InputStream stream = null;
+        try {
+            stream = host.getContentResolver().openInputStream(uri);
+            if (stream == null) return null;
+            java.io.ByteArrayOutputStream buffer = new java.io.ByteArrayOutputStream();
+            byte[] chunk = new byte[8192];
+            int read;
+            while ((read = stream.read(chunk)) >= 0) buffer.write(chunk, 0, read);
+            return buffer.toByteArray();
+        } catch (Exception error) {
+            return null;
+        } finally {
+            if (stream != null) {
+                try { stream.close(); } catch (Exception ignored) { }
+            }
+        }
     }
 
     private void openFile(final String path) {

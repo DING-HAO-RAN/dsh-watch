@@ -100,11 +100,77 @@ final class Api {
     }
 
     void get(String base, String path, String token, Callback callback) {
+        if (isRemoteBase(base)) {
+            dispatchRemote("GET", path, null, callback);
+            return;
+        }
         request("GET", base, path, token, null, callback);
     }
 
     void post(String base, String path, String token, JSONObject body, Callback callback) {
+        if (isRemoteBase(base)) {
+            dispatchRemote("POST", path, body, callback);
+            return;
+        }
         request("POST", base, path, token, body, callback);
+    }
+
+    /** base 形如 `remote://<hostDeviceId>` 时走远程通道。 */
+    private static boolean isRemoteBase(String base) {
+        return base != null && base.startsWith("remote://");
+    }
+
+    /** 把中继风格路径拆成「路径 + 查询串」再交给 RemoteBridge。 */
+    private void dispatchRemote(String method, String path, JSONObject body, Callback callback) {
+        String route = path;
+        String query = "";
+        int question = path.indexOf('?');
+        if (question >= 0) {
+            route = path.substring(0, question);
+            query = path.substring(question + 1);
+        }
+        remoteRequest(method, route, query, body, callback);
+    }
+
+    /**
+     * 远程主机的请求通道。
+     *
+     * 与中继形态的差别只在「怎么把请求送到 DSH」：中继是一台本机 HTTP 服务，
+     * 远程是经账号服务器转发的 Noise 加密隧道。上层看到的仍是同一个
+     * JSON 结果结构，所以界面代码不需要区分。
+     */
+    private RemoteBridge remoteBridge;
+
+    void setRemoteBridge(RemoteBridge bridge) {
+        this.remoteBridge = bridge;
+    }
+
+    /** 远程通道是否可用（已登录且有当前主机）。 */
+    boolean remoteAvailable() {
+        return remoteBridge != null && remoteBridge.isAvailable();
+    }
+
+    /**
+     * 远程通道上执行一次「中继接口等价」的调用。
+     *
+     * 参数是中继的接口路径与查询串，由 RemoteBridge 翻译成 DSH 原生 RPC。
+     */
+    void remoteRequest(String method, String path, String query, JSONObject body, Callback callback) {
+        RemoteBridge bridge = remoteBridge;
+        if (bridge == null) {
+            deliver(callback, Result.failure("尚未连接远程主机"));
+            return;
+        }
+        pool.execute(() -> {
+            try {
+                // 首次请求时通道可能还没建立，这里补一次连接（幂等）。
+                if (!bridge.isAvailable()) bridge.connect();
+                JSONObject value = bridge.request(method, path, query, body);
+                deliver(callback, Result.success(value));
+            } catch (Exception error) {
+                deliver(callback, Result.failure(friendly(error)));
+            }
+        });
     }
 
     private void request(String method, String base, String path, String token,
@@ -198,6 +264,14 @@ final class Api {
     // ---------- 下面是把 JSON 转成界面模型的解析 ----------
 
     /** 会话摘要。 */
+    /** 一条排队中的消息（运行中会话里还没发出的指令）。 */
+    static final class QueuedMessage {
+        String id = "";
+        String text = "";
+        /** next-step 表示插话，next-turn 表示下一轮。 */
+        String bucket = "";
+    }
+
     static final class Session {
         String id = "";
         String title = "";
@@ -922,6 +996,25 @@ final class Api {
     }
 
     /** 把待答问题（详情接口返回的单个 question 对象）解析成 Ask。 */
+    /** 解析会话里排队中的消息（运行中又发的那几条）。 */
+    static List<QueuedMessage> parseQueue(JSONObject value) {
+        List<QueuedMessage> out = new ArrayList<>();
+        if (value == null) return out;
+        JSONArray array = value.optJSONArray("queue");
+        if (array == null) return out;
+        for (int i = 0; i < array.length(); i++) {
+            JSONObject item = array.optJSONObject(i);
+            if (item == null) continue;
+            QueuedMessage message = new QueuedMessage();
+            message.id = text(item, "id");
+            message.text = text(item, "text");
+            message.bucket = text(item, "bucket");
+            if (message.id.isEmpty()) continue;
+            out.add(message);
+        }
+        return out;
+    }
+
     static Ask parseQuestion(JSONObject item, String sessionId, String title) {
         if (item == null) return null;
         Ask ask = new Ask();

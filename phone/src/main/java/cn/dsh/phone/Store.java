@@ -32,6 +32,27 @@ final class Store {
         long lastUsed = 0;
         String deviceId = "";
 
+        /** 空 = 局域网中继（原有形态）；"remote" = 经插件转发的远程主机。 */
+        String kind = "";
+        String hostPublicKey = "";
+        String remoteServer = "";
+
+        boolean isRemote() {
+            return "remote".equals(kind);
+        }
+
+        static String remoteBase(String hostDeviceId) {
+            return "remote://" + hostDeviceId;
+        }
+
+        boolean valid() {
+            if (isRemote()) {
+                return base.length() > 0 && deviceId.length() > 0
+                        && hostPublicKey.length() > 0 && remoteServer.length() > 0;
+            }
+            return base.length() > 0 && token.length() > 0;
+        }
+
         JSONObject toJson() {
             JSONObject object = new JSONObject();
             try {
@@ -41,6 +62,9 @@ final class Store {
                 object.put("note", note);
                 object.put("lastUsed", lastUsed);
                 object.put("deviceId", deviceId);
+                object.put("kind", kind);
+                object.put("hostPublicKey", hostPublicKey);
+                object.put("remoteServer", remoteServer);
             } catch (Exception ignored) { }
             return object;
         }
@@ -53,11 +77,15 @@ final class Store {
             device.note = object.optString("note", "");
             device.lastUsed = object.optLong("lastUsed", 0);
             device.deviceId = object.optString("deviceId", "");
+            device.kind = object.optString("kind", "");
+            device.hostPublicKey = object.optString("hostPublicKey", "");
+            device.remoteServer = object.optString("remoteServer", "");
             return device;
         }
 
         String label() {
             if (note != null && note.trim().length() > 0) return note.trim();
+            if (isRemote()) return "远程主机";
             String value = base.replace("http://", "").replace("https://", "");
             int colon = value.indexOf(':');
             return colon > 0 ? value.substring(0, colon) : value;
@@ -141,6 +169,55 @@ final class Store {
     String base() {
         Device device = current();
         return device == null ? "" : device.base;
+    }
+
+    /** 记住一台远程主机并切过去。 */
+    void rememberRemoteHost(String hostDeviceId, String hostName, String serverUrl,
+                            String hostPublicKey, String note) {
+        if (hostDeviceId == null || hostDeviceId.trim().length() == 0) return;
+        String base = Device.remoteBase(hostDeviceId.trim());
+        for (int i = 0; i < devices.size(); i += 1) {
+            Device device = devices.get(i);
+            if (device.base.equals(base)) {
+                device.kind = "remote";
+                device.deviceId = hostDeviceId.trim();
+                device.remoteServer = serverUrl == null ? "" : serverUrl.trim();
+                device.hostPublicKey = hostPublicKey == null ? "" : hostPublicKey.trim();
+                device.note = note == null || note.trim().length() == 0
+                        ? (hostName == null ? hostDeviceId : hostName) : note.trim();
+                device.token = "";
+                device.lastUsed = System.currentTimeMillis();
+                currentIndex = i;
+                save();
+                return;
+            }
+        }
+        Device device = new Device();
+        device.base = base;
+        device.kind = "remote";
+        device.deviceId = hostDeviceId.trim();
+        device.remoteServer = serverUrl == null ? "" : serverUrl.trim();
+        device.hostPublicKey = hostPublicKey == null ? "" : hostPublicKey.trim();
+        device.note = note == null || note.trim().length() == 0
+                ? (hostName == null ? hostDeviceId : hostName) : note.trim();
+        device.lastUsed = System.currentTimeMillis();
+        devices.add(device);
+        currentIndex = devices.size() - 1;
+        save();
+    }
+
+    /** 远程账号凭据（跨启动保留）。 */
+    String remoteAccountJson() {
+        return preferences.getString("remoteAccount", "");
+    }
+
+    void setRemoteAccountJson(String json) {
+        preferences.edit().putString("remoteAccount", json == null ? "" : json).apply();
+    }
+
+    boolean hasRemoteAccount() {
+        String json = remoteAccountJson();
+        return json != null && json.length() > 0;
     }
 
     String alternateBase() {

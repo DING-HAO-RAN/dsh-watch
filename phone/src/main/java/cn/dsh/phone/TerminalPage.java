@@ -238,6 +238,9 @@ final class TerminalPage {
         terminalId = id;
         since = 0;
         ended = false;
+        // 创建时给的 60x24 只是初值；按屏幕实际能显示的字符数再校正一次，
+        // 否则命令输出会折行错位（表格类输出尤其明显）。
+        syncSize();
         screen.setLength(0);
         buildTerminalView();
         poll();
@@ -345,6 +348,29 @@ final class TerminalPage {
             screen.setLength(0);
             updateScreen();
         }
+    }
+
+    /** 按屏幕实际尺寸校正 PTY 的列数行数。 */
+    private void syncSize() {
+        if (terminalId.length() == 0) return;
+        int width = host.getResources().getDisplayMetrics().widthPixels;
+        // 终端用等宽字体，单字符宽度约为 8dp；留出左右各 8dp 的边距。
+        float density = host.getResources().getDisplayMetrics().density;
+        int usable = Math.max(1, width - (int) (16 * density));
+        int cols = Math.max(20, Math.min(200, (int) (usable / (8 * density))));
+        int rows = 24;
+        JSONObject body = new JSONObject();
+        try {
+            body.put("action", "resize");
+            body.put("terminalId", terminalId);
+            body.put("cols", cols);
+            body.put("rows", rows);
+        } catch (Exception ignored) { }
+        Api.terminal(host.store, body, new Api.Callback() {
+            @Override public void onResult(JSONObject value, String error) {
+                // 尺寸同步失败不影响使用，PTY 会沿用旧尺寸。
+            }
+        });
     }
 
     private void write(String data) {

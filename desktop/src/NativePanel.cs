@@ -829,5 +829,19 @@ namespace DshRelay
         public int DshPort;
         /// <summary>已发放且仍有效的配对令牌。</summary>
         public List<string> Tokens = new List<string>();
+
+        // ---- 远程访问（ds-harness-remote 插件）----
+        /// <summary>本机是否装并初始化过该插件。</summary>
+        public bool RemoteInstalled;
+        /// <summary>插件是否已登录远程账号。</summary>
+        public bool RemoteLoggedIn;
+        public string RemoteAccount = "";
+        public string RemoteServer = "";
+        /// <summary>本机作为 Host 的设备名与 id（手机/手表选主机时看到的就是它）。</summary>
+        public string RemoteDeviceName = "";
+        public string RemoteHostId = "";
+        public string RemoteHostPublicKey = "";
+        /// <summary>这台电脑作为客户端接入过的服务器数。</summary>
+        public int RemoteDeviceCount;
     }
 }

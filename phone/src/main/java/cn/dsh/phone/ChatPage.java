@@ -48,6 +48,8 @@ final class ChatPage {
     private Api.Ask question;
     private Api.Approval approval;
     private boolean running;
+    /** 排队中的消息（运行中又发的那几条）。 */
+    private final java.util.List<Api.QueuedMessage> queue = new java.util.ArrayList<>();
     private boolean visible;
     private boolean editing;
     private boolean loading;
@@ -197,6 +199,8 @@ final class ChatPage {
                 title = Api.text(value, "title");
                 if (title.length() == 0) title = host.activeSessionTitle;
                 running = value.optBoolean("running", false);
+                queue.clear();
+                queue.addAll(Api.parseQueue(value));
                 steps = Api.parseSteps(value);
                 lastSeq = value.optLong("asOfSeq", 0);
                 String previousCallId = question == null ? "" : question.callId;
@@ -490,7 +494,8 @@ final class ChatPage {
         composer.clearFocus();
         editing = false;
         sendButton.setEnabled(false);
-        Api.send(host.store, sessionId, text, false, new Api.Callback() {
+        // 会话正在跑时发消息就是「插话」：用 steer 让新指令立刻生效。
+        Api.send(host.store, sessionId, text, running, new Api.Callback() {
             @Override public void onResult(JSONObject value, String error) {
                 sendButton.setEnabled(true);
                 if (error != null) {
@@ -543,15 +548,83 @@ final class ChatPage {
     }
 
     private void showMenu() {
-        final String[] items = running ? new String[]{"停止回答", "重命名会话"} : new String[]{"重命名会话"};
+        final String[] items = running
+                ? new String[]{"停止回答", "排队消息", "重命名会话"}
+                : new String[]{"重命名会话"};
         new android.app.AlertDialog.Builder(host)
                 .setItems(items, new android.content.DialogInterface.OnClickListener() {
                     @Override public void onClick(android.content.DialogInterface dialog, int which) {
                         if (items[which].equals("停止回答")) cancel();
+                        else if (items[which].equals("排队消息")) showQueue();
                         else renameDialog();
                     }
                 })
                 .show();
+    }
+
+    /** 排队消息：列出运行中还没发出的消息，可立即发送或删除。 */
+    private void showQueue() {
+        if (queue.isEmpty()) {
+            host.toast("没有排队中的消息");
+            return;
+        }
+        final String[] items = new String[queue.size()];
+        for (int i = 0; i < queue.size(); i += 1) {
+            String text = queue.get(i).text.trim();
+            items[i] = (text.length() == 0 ? "（空消息）" : clip(text, 30))
+                    + ("next-step".equals(queue.get(i).bucket) ? " · 插话" : " · 下一轮");
+        }
+        new android.app.AlertDialog.Builder(host)
+                .setTitle("排队消息（点一条立即发送）")
+                .setItems(items, new android.content.DialogInterface.OnClickListener() {
+                    @Override public void onClick(android.content.DialogInterface dialog, int which) {
+                        queueAction(queue.get(which), "steer");
+                    }
+                })
+                .setNegativeButton("关闭", null)
+                .setNeutralButton("全部清空", new android.content.DialogInterface.OnClickListener() {
+                    @Override public void onClick(android.content.DialogInterface dialog, int which) {
+                        clearQueue();
+                    }
+                })
+                .show();
+    }
+
+    private void queueAction(Api.QueuedMessage item, String kind) {
+        Api.queueAction(host.store, sessionId, item.id, kind, "", new Api.Callback() {
+            @Override public void onResult(JSONObject value, String error) {
+                if (error != null) {
+                    host.toast("操作失败：" + error);
+                    return;
+                }
+                host.toast("steer".equals(kind) ? "已要求立即发送" : "已删除");
+                fingerprint = "";
+                load(true);
+            }
+        });
+    }
+
+    private void clearQueue() {
+        if (queue.isEmpty()) return;
+        // 逐条删除：DSH 的队列是按 itemId 操作的，没有「整队清空」端点。
+        final java.util.List<Api.QueuedMessage> pending = new java.util.ArrayList<>(queue);
+        final int[] remaining = {pending.size()};
+        for (final Api.QueuedMessage item : pending) {
+            Api.queueAction(host.store, sessionId, item.id, "remove", "", new Api.Callback() {
+                @Override public void onResult(JSONObject value, String error) {
+                    remaining[0] -= 1;
+                    if (remaining[0] == 0) {
+                        fingerprint = "";
+                        load(true);
+                    }
+                }
+            });
+        }
+    }
+
+    private static String clip(String text, int limit) {
+        String value = text.replaceAll("\\s+", " ").trim();
+        return value.length() <= limit ? value : value.substring(0, limit) + "…";
     }
 
     // ===== 审批与答题 =====

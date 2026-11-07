@@ -38,6 +38,24 @@ No server on the internet to set up, no changes to any DSH configuration, no DSH
 
 The relay absorbs both: it derives a valid ticket from the local DSH credentials to authenticate, then trims the data down to what the watch actually uses, exposing only a small set of REST endpoints. **It only reads credentials — it changes no configuration and installs no plugins.**
 
+## Two connection paths
+
+| Path | When it fits | What it needs |
+| --- | --- | --- |
+| LAN / public relay | At home on the same Wi-Fi, or via a temporary `trycloudflare` URL | The relay running on the computer; no account, no plugin |
+| Remote path (`ds-harness-remote` plugin) | The computer is elsewhere, or on a different network | The `ds-harness-remote` plugin installed and signed in; an account |
+
+Both paths coexist and appear side by side under "remembered devices" on the watch and phone — switch with one tap. **The relay works without the plugin**; the remote path is an additional second route, so LAN pairing keeps working when the plugin is absent.
+
+### Using the remote path
+
+1. On the computer, install `ds-harness-remote` from DSH's Extensions / Plugin management, sign in, and confirm it reports "signed in".
+2. Watch: Settings → Remote → sign in with your account and password. The host list for that account appears.
+3. Phone: Mine → Remote → sign in, then pick a host.
+4. Selecting a host establishes an end-to-end encrypted connection. Sessions, files, terminals, and model switching then behave exactly as they do over LAN.
+
+The remote path is protected by two layers: account membership checks and Noise IK end-to-end encryption (`Noise_IK_25519_ChaChaPoly_SHA256`). The account server in the middle only forwards ciphertext and cannot read session content.
+
 ## Download and install
 
 ### 1. On the computer (pick one)

@@ -101,6 +101,30 @@ final class MinePage {
         });
         body.addView(addDevice, addParams);
 
+        // 远程连接：经 ds-harness-remote 插件，电脑不在同一网络时用
+        body.addView(sectionTitle("远程连接"));
+        LinearLayout remoteCard = Ui.card(host);
+        if (host.store.hasRemoteAccount()) {
+            remoteCard.addView(Ui.title(host, "已登录远程账号", 15f));
+            remoteCard.addView(Ui.muted(host, "点这里选择要连接的远程主机", 12f));
+            remoteCard.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View view) {
+                    host.showRemoteHosts();
+                }
+            });
+        } else {
+            remoteCard.addView(Ui.title(host, "登录远程账号", 15f));
+            remoteCard.addView(Ui.muted(host, "不在同一网络时，经账号服务器连电脑上的 DSH", 12f));
+            remoteCard.setOnClickListener(new View.OnClickListener() {
+                @Override public void onClick(View view) {
+                    host.showRemoteLogin();
+                }
+            });
+        }
+        LinearLayout.LayoutParams remoteParams = Ui.matchParams();
+        remoteParams.bottomMargin = Ui.dp(16f);
+        body.addView(remoteCard, remoteParams);
+
         // 外观
         body.addView(sectionTitle("外观"));
         LinearLayout themeRow = Ui.listRow(host);

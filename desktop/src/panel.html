@@ -953,6 +953,19 @@
 
       <section class="card">
         <div class="card-head">
+          <h2 class="card-title">远程访问</h2>
+          <span class="count" id="remoteBadge">—</span>
+        </div>
+        <div class="card-body">
+          <div class="list" id="remoteState">
+            <div class="empty">正在读取…</div>
+          </div>
+          <p class="hint" style="margin-top:14px">手机和手表除了局域网直连，还可以经账号服务器连这台电脑，电脑不在同一网络也能用。这条通道由 <b>ds-harness-remote</b> 插件提供，与上面的中继互不影响：没装插件时局域网照常可用。</p>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
           <h2 class="card-title">设置</h2>
         </div>
         <div class="card-body">
@@ -1356,8 +1369,50 @@
     renderAddresses();
     renderTokens();
     renderTrustedFromState();
+    renderRemote();
     renderSettings();
     updateTunnelUi();
+  }
+
+  /** 远程访问区块：显示插件是否就绪、登录的账号与本机主机名。 */
+  function renderRemote() {
+    var box = $('remoteState');
+    var badge = $('remoteBadge');
+    if (!box) return;
+    var remote = state.remote || {};
+    var rows = [];
+
+    if (!remote.installed) {
+      if (badge) { badge.textContent = '未安装'; badge.className = 'count'; }
+      rows.push('<div class="empty">这台电脑还没装 ds-harness-remote 插件。局域网直连不受影响，装好插件并登录后这里会显示状态。</div>');
+    } else {
+      var loggedIn = !!remote.loggedIn;
+      if (badge) {
+        badge.textContent = loggedIn ? '已登录' : '未登录';
+        badge.className = 'count' + (loggedIn ? '' : '');
+      }
+      rows.push('<div class="kv"><span>状态</span><b>' + (loggedIn ? '已登录，可被远程连接' : '已安装，尚未登录') + '</b></div>');
+      if (remote.account) rows.push('<div class="kv"><span>账号</span><b>' + escapeHtml(remote.account) + '</b></div>');
+      if (remote.server) rows.push('<div class="kv"><span>服务器</span><b>' + escapeHtml(remote.server) + '</b></div>');
+      if (remote.deviceName) rows.push('<div class="kv"><span>本机主机名</span><b>' + escapeHtml(remote.deviceName) + '</b></div>');
+      if (remote.hostId) rows.push('<div class="kv"><span>主机 ID</span><b class="mono">' + escapeHtml(shortId(remote.hostId)) + '</b></div>');
+      if (!loggedIn) {
+        rows.push('<div class="empty" style="margin-top:8px">在 DSH 的「扩展 / 插件管理」里登录该插件后，手机和手表就能远程连这台电脑。</div>');
+      }
+    }
+    box.innerHTML = rows.join('');
+  }
+
+  function shortId(value) {
+    if (!value) return '';
+    var text = String(value);
+    return text.length > 12 ? text.slice(0, 8) + '…' : text;
+  }
+
+  function escapeHtml(value) {
+    return String(value === null || value === undefined ? '' : value)
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
   }
 
   function markOffline() {

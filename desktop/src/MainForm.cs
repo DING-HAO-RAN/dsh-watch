@@ -514,7 +514,161 @@ namespace DshRelay
             {
                 foreach (TokenInfo info in relay.IssuedTokens()) state.Tokens.Add(info.Token);
             }
+            FillRemoteState(state);
             return state;
+        }
+
+        /// <summary>
+        /// 读 ds-harness-remote 插件的本机状态，填进面板的「远程访问」区块。
+        ///
+        /// 只读 ~/.dsh/remote 下的设备与凭据文件，不调用插件接口：
+        /// 插件没有对外暴露查询端口，而这些文件本身就是它落盘的权威状态。
+        /// 任何异常都吞掉并标记为「未安装」——中继本身不依赖插件，缺了照常工作。
+        /// </summary>
+        private void FillRemoteState(PanelState state)
+        {
+            state.RemoteInstalled = false;
+            state.RemoteLoggedIn = false;
+            state.RemoteAccount = "";
+            state.RemoteServer = "";
+            state.RemoteDeviceName = "";
+            state.RemoteHostId = "";
+            state.RemoteHostPublicKey = "";
+            state.RemoteDeviceCount = 0;
+
+            try
+            {
+                string home = Environment.GetEnvironmentVariable("DSH_HOME");
+                if (string.IsNullOrEmpty(home))
+                {
+                    home = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".dsh");
+                }
+                string servers = Path.Combine(home, "remote", "servers");
+                if (!Directory.Exists(servers)) return;
+                state.RemoteInstalled = true;
+
+                // 一个账号一台服务器一个目录；取最近修改的那个。
+                string newest = "";
+                DateTime newestAt = DateTime.MinValue;
+                foreach (string directory in Directory.GetDirectories(servers))
+                {
+                    DateTime at = Directory.GetLastWriteTimeUtc(directory);
+                    if (at > newestAt) { newestAt = at; newest = directory; }
+                }
+                if (newest.Length == 0) return;
+
+                string hostDevice = Path.Combine(newest, "host", "device.json");
+                string hostCred = Path.Combine(newest, "host", "server-credentials.json");
+                if (!File.Exists(hostDevice)) return;
+
+                Dictionary<string, object> device = ReadJsonObject(hostDevice);
+                if (device != null)
+                {
+                    state.RemoteDeviceName = GetText(device, "name");
+                    state.RemoteHostId = GetText(device, "deviceId");
+                    state.RemoteHostPublicKey = GetText(device, "publicKey");
+                }
+                if (File.Exists(hostCred))
+                {
+                    Dictionary<string, object> cred = ReadJsonObject(hostCred);
+                    if (cred != null)
+                    {
+                        string access = GetText(cred, "accessToken");
+                        state.RemoteLoggedIn = access.Length > 0;
+                        state.RemoteAccount = GetText(cred, "account");
+                        state.RemoteServer = GetText(cred, "serverUrl");
+                    }
+                }
+
+                // 有 client 凭据说明这台电脑也能当客户端连别的机器，统计一下数量。
+                int count = 0;
+                foreach (string directory in Directory.GetDirectories(servers))
+                {
+                    if (File.Exists(Path.Combine(directory, "client", "server-credentials.json"))) count++;
+                }
+                state.RemoteDeviceCount = count;
+            }
+            catch (Exception error)
+            {
+                StartupLog.Write("读取远程插件状态失败：" + error.Message);
+            }
+        }
+
+        /// <summary>极简 JSON 读取：面板只需要几个字符串字段，不值得引入解析库。</summary>
+        private static Dictionary<string, object> ReadJsonObject(string path)
+        {
+            try
+            {
+                string text = File.ReadAllText(path, Encoding.UTF8);
+                return ParseFlatJson(text);
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        /// <summary>解析「对象里只有字符串/数字/布尔」的扁平 JSON。</summary>
+        private static Dictionary<string, object> ParseFlatJson(string text)
+        {
+            var result = new Dictionary<string, object>();
+            int index = 0;
+            int depth = 0;
+            while (index < text.Length)
+            {
+                char c = text[index];
+                if (c == '{') { depth++; index++; continue; }
+                if (c == '}') { depth--; index++; if (depth <= 0) break; continue; }
+                if (c != '"') { index++; continue; }
+                int keyEnd = FindStringEnd(text, index);
+                if (keyEnd < 0) break;
+                string key = Unescape(text.Substring(index + 1, keyEnd - index - 1));
+                int cursor = keyEnd + 1;
+                while (cursor < text.Length && (text[cursor] == ' ' || text[cursor] == ':')) cursor++;
+                if (cursor >= text.Length) break;
+                if (text[cursor] == '"')
+                {
+                    int valueEnd = FindStringEnd(text, cursor);
+                    if (valueEnd < 0) break;
+                    result[key] = Unescape(text.Substring(cursor + 1, valueEnd - cursor - 1));
+                    index = valueEnd + 1;
+                }
+                else
+                {
+                    int valueEnd = cursor;
+                    while (valueEnd < text.Length && text[valueEnd] != ',' && text[valueEnd] != '}') valueEnd++;
+                    result[key] = text.Substring(cursor, valueEnd - cursor).Trim();
+                    index = valueEnd;
+                }
+            }
+            return result;
+        }
+
+        private static int FindStringEnd(string text, int start)
+        {
+            for (int i = start + 1; i < text.Length; i++)
+            {
+                if (text[i] == '\\') { i++; continue; }
+                if (text[i] == '"') return i;
+            }
+            return -1;
+        }
+
+        private static string Unescape(string value)
+        {
+            return value.Replace("\\\"", "\"").Replace("\\\\", "\\")
+                .Replace("\\n", "\n").Replace("\\r", "\r").Replace("\\t", "\t");
+        }
+
+        private static string GetText(Dictionary<string, object> source, string key)
+        {
+            object value;
+            if (source != null && source.TryGetValue(key, out value) && value != null)
+            {
+                return value.ToString();
+            }
+            return "";
         }
 
         /// <summary>更换配对码（原生界面按钮用）。</summary>
@@ -1025,6 +1179,17 @@ namespace DshRelay
             state["trustedCount"] = relay == null ? 0 : relay.TrustedCount;
             state["paused"] = followingPaused;
             state["theme"] = relay == null ? "dark" : relay.Theme;
+            // 远程访问：面板上显示插件状态，方便用户确认手机/手表能不能走公网。
+            var remote = new Dictionary<string, object>();
+            PanelState snapshot = GetState();
+            remote["installed"] = snapshot.RemoteInstalled;
+            remote["loggedIn"] = snapshot.RemoteLoggedIn;
+            remote["account"] = snapshot.RemoteAccount;
+            remote["server"] = snapshot.RemoteServer;
+            remote["deviceName"] = snapshot.RemoteDeviceName;
+            remote["hostId"] = snapshot.RemoteHostId;
+            remote["clientCount"] = snapshot.RemoteDeviceCount;
+            state["remote"] = remote;
             var trustedList = new List<object>();
             if (relay != null)
             {

@@ -319,6 +319,28 @@ function stateOf(session) {
  * - goal：长目标（objective + phase），只在有目标时存在。
  * @param {object} values `session/projections` 的 values
  */
+/**
+ * 排队中的消息：运行中的会话里还没发出的指令。
+ *
+ * DSH 把它们放在 projections.values.inbox 的两个桶里：
+ * `next-step` 是「插话」（下一段就发），`next-turn` 是「下一轮」。
+ * 手表/手机用它们显示队列，并用 session/updateQueue 按 id 操作。
+ */
+export function normalizeQueue(values) {
+  const inbox = values?.inbox
+  if (inbox === null || typeof inbox !== 'object') return []
+  const out = []
+  for (const bucket of ['next-step', 'next-turn']) {
+    const items = Array.isArray(inbox[bucket]) ? inbox[bucket] : []
+    for (const item of items) {
+      const id = typeof item?.id === 'string' ? item.id : ''
+      if (id === '') continue
+      out.push({ id, text: textOfContent(item?.content), bucket })
+    }
+  }
+  return out
+}
+
 export function normalizePlan(values) {
   const todos = (Array.isArray(values?.todos) ? values.todos : [])
     .map((item) => ({
